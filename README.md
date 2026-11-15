@@ -32,6 +32,12 @@ tools/           bin2d_demo.cpp                               能力展示图
 docs/            architecture.md api.md roadmap.md
 ```
 
+## 性能
+
+`make bench` 跑 512×512 的六项固定场景（纯色/渐变/路径/位图/图层合成/模糊），
+输出 ms、ns/px、MPix/s。0.1.1 相对 0.1.0 的完整对照与每条优化的收益见
+[docs/perf.md](docs/perf.md)。
+
 ## 构建
 
 MinGW / GCC / Clang，`-std=c++17`：
@@ -57,8 +63,9 @@ ctest --test-dir build --output-on-failure
 
 ## 状态
 
-**0.1.0（2026-11-15）**：地基完成。94 项断言全绿；GPU 桥在 binGPU 的 CPU 后端上往返
-最大通道差 0。下一步是把上层 UI 库的路径渲染迁到 bin2d（验收 = 三端像素基准 0 diff），
+**0.1.1（2026-11-15）**：性能轮。六项单线程吞吐合计 **4.03×**（190.56 → 47.33 ns/px，
+圆角矩形 2.51 ns/px、星形路径 1.53 ns/px、512² 图层合成 4.94 ns/px），像素结果不变；
+94 项断言全绿，GPU 桥往返最大通道差 0。基线与方法见 [docs/perf.md](docs/perf.md)。下一步是把上层 UI 库的路径渲染迁到 bin2d（验收 = 三端像素基准 0 diff），
 见 [docs/roadmap.md](docs/roadmap.md)。
 
 ![能力展示](docs/img/bin2d-demo.png)

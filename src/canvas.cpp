@@ -22,8 +22,7 @@ namespace bin2d {
 Canvas::Canvas(Surface& target) : target_(&target), baseTarget_(&target) {
     State s;
     s.clipRect = target.bounds();
-    s.mask.assign(static_cast<size_t>(target.width()) * static_cast<size_t>(target.height()),
-                  0.0f);
+    // 遮罩惰性分配：没有路径裁剪时不要 1MB 的 memset（每次 save/pushLayer 都会付）
     s.hasMask = false;
     stack_.push_back(std::move(s));
 }
@@ -57,8 +56,8 @@ void Canvas::clipRect(const Rect& r) {
 void Canvas::resetClip() {
     state().clipRect = target_->bounds();
     state().hasMask = false;
-    state().mask.assign(static_cast<size_t>(target_->width()) *
-                            static_cast<size_t>(target_->height()), 0.0f);
+    state().mask.clear();
+    state().mask.shrink_to_fit();
 }
 
 void Canvas::clipPath(const Path& path, FillRule rule) {
@@ -228,8 +227,7 @@ bool Canvas::pushLayer(const Rect& localBounds, float opacity, BlendMode blend) 
     s.xf = state().xf;            // 变换不动：几何代码在层内层外同一套
     s.clipRect = target_->bounds();
     s.blend = BlendMode::SrcOver; // 层内默认正常混合（层的合成模式在 pop 时生效）
-    s.mask.assign(static_cast<size_t>(target_->width()) *
-                      static_cast<size_t>(target_->height()), 0.0f);
+    // 遮罩惰性分配：没有路径裁剪就不申请（否则每次入层都要 memset 一份整层大小）
     s.hasMask = false;
     stack_.push_back(std::move(s));
     return true;

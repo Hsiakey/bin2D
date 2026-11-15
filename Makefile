@@ -57,10 +57,11 @@ TESTS := $(TEST_DIR)/test_geometry$(EXT) $(TEST_DIR)/test_raster$(EXT) \
          $(TEST_DIR)/test_composite$(EXT) $(TEST_DIR)/test_scene$(EXT) \
          $(TEST_DIR)/test_png$(EXT) $(GPU_TEST)
 DEMO  := $(OUT_DIR)/bin2d-demo$(EXT)
+BENCH := $(OUT_DIR)/bin2d-bench$(EXT)
 
-.PHONY: all lib test demo layers clean gpu-syntax
+.PHONY: all lib test demo bench layers clean gpu-syntax
 
-all: $(LIB_A) $(TESTS) $(DEMO)
+all: $(LIB_A) $(TESTS) $(DEMO) $(BENCH)
 	@echo "[bin2d] all: 库 + 测试 + 演示 就绪"
 
 lib: $(LIB_A)
@@ -110,6 +111,15 @@ demo: $(DEMO)
 	@mkdir -p $(OUT_DIR)
 	./$(DEMO) $(OUT_DIR)/bin2d-demo.png
 	@echo "[bin2d] 演示图: $(OUT_DIR)/bin2d-demo.png"
+
+# ---- 吞吐基准 ----
+$(BENCH): tools/bin2d_bench.cpp $(LIB_A)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INC) $< $(LIB_A) $(RTLINK) $(LDFLAGS) -o $@
+
+bench: $(BENCH)
+	@echo "[bin2d] 512x512 目标，六项单线程吞吐（取最好一次）"
+	./$(BENCH)
 
 # ---- 层边界 ----
 # bin2d 是"上层 UI 库下面"的一层：出现上层概念就说明抽错了。

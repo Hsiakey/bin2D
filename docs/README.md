@@ -4,6 +4,7 @@
 |---|---|
 | [architecture.md](architecture.md) | 分层、职责划分、一次填充的完整数据流、关键技术决定（为什么预乘 / 为什么覆盖率 AA / 为什么描边走并集） |
 | [api.md](api.md) | 每个头的关键类型 + 可直接抄的代码片段 |
+| [perf.md](perf.md) | 吞吐基线：怎么测、0.1.0 → 0.1.1 的同机数字对照、每条优化对应哪一步、没做的项与原因 |
 | [roadmap.md](roadmap.md) | 五个阶段：地基 → 上层 UI 库迁移（0 diff 验收） → GPU 合成 → 滤镜/mip → 缓存与脏区；每阶段写开工条件 |
 
 测试说明见 [`../tests/README.md`](../tests/README.md)。
@@ -34,4 +35,5 @@ make all      # 库 + 测试 + 演示，零警告是验收线
 make test     # 全部测试（失败非 0 退出）
 make demo     # 出图 build-mingw/out/bin2d-demo.png
 make layers   # 层边界检查：不许出现上层词汇/依赖
+make bench    # 单线程吞吐：512x512 六项场景（ms / ns/px / MPix/s）
 ```
