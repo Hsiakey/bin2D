@@ -1,0 +1,16 @@
+# 构建产物
+build-mingw/
+build/
+*.o
+*.a
+*.d
+*.exe
+
+# 测试/演示的临时图
+*.png
+!docs/**/*.png
+
+# 编辑器
+.vscode/
+.cache/
+compile_commands.json

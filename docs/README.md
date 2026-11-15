@@ -1,0 +1,37 @@
+# bin2d 文档索引
+
+| 文档 | 内容 |
+|---|---|
+| [architecture.md](architecture.md) | 分层、职责划分、一次填充的完整数据流、关键技术决定（为什么预乘 / 为什么覆盖率 AA / 为什么描边走并集） |
+| [api.md](api.md) | 每个头的关键类型 + 可直接抄的代码片段 |
+| [roadmap.md](roadmap.md) | 五个阶段：地基 → 上层 UI 库迁移（0 diff 验收） → GPU 合成 → 滤镜/mip → 缓存与脏区；每阶段写开工条件 |
+
+测试说明见 [`../tests/README.md`](../tests/README.md)。
+
+## 一分钟上手
+
+```cpp
+#include "bin2d/canvas.h"
+#include "bin2d/png.h"
+using namespace bin2d;
+
+Surface canvas(320, 200);
+Canvas c(canvas);
+c.clear(Color::argb(0xFF10141A));
+
+Path star;
+star.addStar(160, 100, 70, 28, 5);
+c.fillPath(star, Paint::linearAngle(Rect(90, 30, 140, 140), 90.0f,
+                                    0xFF3E8BFF, 0xFFF2B544));
+
+writePng(canvas, "star.png");
+```
+
+## 构建 / 验证
+
+```sh
+make all      # 库 + 测试 + 演示，零警告是验收线
+make test     # 全部测试（失败非 0 退出）
+make demo     # 出图 build-mingw/out/bin2d-demo.png
+make layers   # 层边界检查：不许出现上层词汇/依赖
+```
