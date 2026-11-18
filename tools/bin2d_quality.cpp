@@ -8,6 +8,10 @@
 //      理想盒式平均的偏差 / 1px 描边的亚像素覆盖率 / GPU 与 CPU 的最大通道差；
 //   ② **图**：写到 build-mingw/out/quality/，放大到能直接看。
 //
+// 输出分流（0.9.1）：**计时的行全部走 stderr**，stdout 只留确定性内容。原因：宿主
+// （binUI）把 `make quality` 的 stdout 原文记进它的画质台账并逐字比较，而 ms/µs 每跑
+// 一次都不一样 —— 那会让宿主的门禁天天红，红到最后被人关掉。
+//
 // 用法：make quality
 //   有 binGPU（-DBIN2D_QUALITY_GPU）时额外跑 GPU 一致性那一项，否则打印跳过。
 //   每一项都是"固定场景 + 固定尺寸"，所以两次运行的数字可以直接对比。
@@ -367,7 +371,7 @@ void MeasureFiltersShadowNine()
         const auto t1 = std::chrono::steady_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         totalMs += ms;
-        std::printf("[滤镜] %-9s 1 MP 单张 %6.2f ms（%.2f ns/像素）\n", names[i], ms,
+        std::fprintf(stderr, "[滤镜] %-9s 1 MP 单张 %6.2f ms（%.2f ns/像素）\n", names[i], ms,
                     ms * 1e6 / (1000.0 * 1000.0));
     }
     // 灰度解析值：纯红 → 0.213 × 255 = 54.3 → 54
@@ -382,7 +386,7 @@ void MeasureFiltersShadowNine()
         for (int y = 0; y < big.height() && identical; ++y)
             identical = std::memcmp(big.row(y), same.row(y),
                                     static_cast<size_t>(big.width()) * 4) == 0;
-        std::printf("[滤镜] 灰度(纯红)=%d（解析 54）  identity 逐位不变=%s  六张合计 %.2f ms\n", g,
+        std::fprintf(stderr, "[滤镜] 灰度(纯红)=%d（解析 54）  identity 逐位不变=%s  六张合计 %.2f ms\n", g,
                     identical ? "是" : "否", totalMs);
     }
     // 图：同一张底图依次套六个滤镜（人眼看色相与对比度的方向对不对）
@@ -422,7 +426,7 @@ void MeasureFiltersShadowNine()
         const auto t2 = std::chrono::steady_clock::now();
         const double rgbaMs = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
         const double maskMs = std::chrono::duration<double, std::milli>(t2 - t1).count() / iters;
-        std::printf("[投影] %dx%d 模糊 r=12：RGBA 图层 %zu KB / %.3f ms  vs  alpha 罩 %zu KB / %.3f ms"
+        std::fprintf(stderr, "[投影] %dx%d 模糊 r=12：RGBA 图层 %zu KB / %.3f ms  vs  alpha 罩 %zu KB / %.3f ms"
                     "（内存 %.1f×，耗时 %.1f×）\n",
                     lw, lh, rgbaBytes / 1024, rgbaMs, maskBytes / 1024, maskMs,
                     static_cast<double>(rgbaBytes) / static_cast<double>(maskBytes),
@@ -442,7 +446,7 @@ void MeasureFiltersShadowNine()
         for (int i = 0; i < 1000; ++i) ins = DetectNineSliceInsets(img);
         const auto t1 = std::chrono::steady_clock::now();
         const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / 1000.0;
-        std::printf("[九宫格] 48x36 圆角 12 → l=%.0f t=%.0f r=%.0f b=%.0f（应 = 12，±1）  %.1f µs/次\n",
+        std::fprintf(stderr, "[九宫格] 48x36 圆角 12 → l=%.0f t=%.0f r=%.0f b=%.0f（应 = 12，±1）  %.1f µs/次\n",
                     ins.l, ins.t, ins.r, ins.b, us);
 
         // 图：原图 + 自动九宫格拉到 240×72（四角不该被拉成斜边）
@@ -512,9 +516,9 @@ void MeasureSceneCache() {
     const double uncached = bench([&] { scene.draw(target); });
     SceneCache cache;
     const double cached = bench([&] { scene.drawCached(target, cache); });
-    std::printf("[缓存] 1280x720 / 40 组 / 200 个图元：全量 %.2f ms（%.0f fps） → 缓存命中 %.2f ms（%.0f fps） = %.1f×\n",
+    std::fprintf(stderr, "[缓存] 1280x720 / 40 组 / 200 个图元：全量 %.2f ms（%.0f fps） → 缓存命中 %.2f ms（%.0f fps） = %.1f×\n",
                 uncached, 1000.0 / uncached, cached, 1000.0 / cached, uncached / cached);
-    std::printf("[缓存] 命中 %d/%d，常驻 %zu KB（%d 条）\n", cache.stats().hits,
+    std::fprintf(stderr, "[缓存] 命中 %d/%d，常驻 %zu KB（%d 条）\n", cache.stats().hits,
                 cache.stats().groups_total, cache.stats().bytes / 1024, cache.stats().entries);
     Save(target, "quality_cache.png");
 }
