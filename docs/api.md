@@ -161,7 +161,9 @@ FillRoundedRect(t, Rect(0, 0, 120, 40), 12.0f, Paint::solid(0xFFFFFFFF), xf);
 FillRect(t, Rect(0, 0, 10, 10), paint, xf);
 DrawImage(t, img, Rect(0, 0, 64, 64), Rect(0, 0, 1, 1), Color::white(), false, xf);
 DrawNineSlice(t, img, Rect(0, 0, 300, 90), 20, 20, 20, 20, Color::white(), false, xf);
-Blur(surface, 8.0f);   // 两次可分离盒式模糊
+Blur(surface, 8.0f);        // 两次可分离盒式模糊（RGBA）
+BlurMask(mask, w, h, 8.0f); // 同一套盒式，但只模糊 1 字节/像素的覆盖率（投影用）
+BlendCoverageMask(t, mask, w, h, dstX, dstY, Color::argb(0x77000000));  // 覆盖率 × 颜色，按 t 的 clip/mask/blend 合成
 ```
 
 `RasterTarget::mask`：设备空间覆盖率图（长 = w×h），路径裁剪就是往这里塞一张覆盖率。
@@ -192,6 +194,9 @@ if (c.pushLayer(Rect(20, 20, 200, 200), 0.6f)) {   // 组透明度：离屏 + �
     c.fillRect(Rect(80, 80, 120, 120), Color::white());
     c.popLayer();                                   // 重叠区不会叠深
 }
+
+c.drawNineSliceAuto(img, Rect(0, 0, 300, 90));   // 0.8.0：边界自动探测（探不到就退回普通拉伸）
+c.blendCoverageMask(mask, w, h, x, y, color);    // 设备空间：覆盖率罩合成（投影的第二半）
 ```
 
 混合模式与 bingpu 一一对应：`SrcOver`（预乘 over）、`Replace`、`Erase`、`Keep`、`Additive`。
@@ -236,6 +241,43 @@ img.mipLevelCount();   // 已经生成了几级（0 = 还没用到缩小）
 
 `drawImage` / `DrawImage` 自动做这件事，调用方一般不用管；`nearest` 不参与
 （最近邻的语义是"给我那一个纹素"）。副本惰性生成，`img.surface()` 非 const 取用时作废。
+
+mip 的显存上限（0.8.0，两个口径并用，哪个先到停哪个）：
+
+```cpp
+img.setMipLevelCap(4);        // 最多几级（0 = 不限制）
+img.setMipByteBudget(256*1024);  // 预缩小副本总字节上限（0 = 不限制）
+size_t used = img.mipBytes();    // 当前占了多少
+img.clearMips();
+```
+
+九宫格边界探测（0.8.0）：
+
+```cpp
+NineSliceInsets ins = DetectNineSliceInsets(img);   // 相邻列/行逐像素相等 = 可拉伸
+if (ins.detected) c.drawNineSlice(img, dst, ins.l, ins.t, ins.r, ins.b);
+```
+
+## filter.h —— 颜色矩阵滤镜（0.8.0）
+
+```cpp
+Surface s = ...;
+ApplyColorMatrix(s, ColorMatrix::grayscale(1.0f));
+ApplyColorMatrix(s, ColorMatrix::hueRotate(30.0f));
+ApplyColorMatrix(s, ColorMatrix::saturate(1.6f));
+ApplyColorMatrix(s, ColorMatrix::brightness(0.8f));
+ApplyColorMatrix(s, ColorMatrix::contrast(1.3f));
+ApplyColorMatrix(s, ColorMatrix::invert(0.5f));
+
+// 组合：先把降饱和折进去，再一次性作用（省一遍反预乘/预乘）
+ColorMatrix m = ColorMatrix::concat(ColorMatrix::contrast(1.4f),
+                                    ColorMatrix::saturate(0.4f));
+ApplyColorMatrix(s, m);
+```
+
+口径：矩阵作用在**直通**（非预乘）RGBA 0..1 上（系数与 CSS/SVG 同一套），
+identity 逐位不变；半透明像素 1 级精度；六个滤镜都不动 alpha，结果始终满足预乘约束。
+1 MP 单张约 **5.8 ms**（5.83 ns/像素）。
 
 ## gpu.h —— binGPU 桥（可选）
 

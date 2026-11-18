@@ -196,6 +196,27 @@ void Canvas::drawNineSlice(const Image& image, const Rect& dstLocal, float inset
                   filter == ImageFilter::Nearest, deviceTransform());
 }
 
+void Canvas::drawNineSliceAuto(const Image& image, const Rect& dstLocal, const Color& tint,
+                               ImageFilter filter) {
+    if (!target_ || image.empty()) return;
+    const NineSliceInsets ins = DetectNineSliceInsets(image);
+    // 探测不到"可拉伸带"就退回普通拉伸：拿 0 当边界画九宫格等于把图画成 9 个拉伸块，
+    // 那比"没有九宫格"更糟（圆角会被拉成斜边）。
+    if (!ins.detected) {
+        drawImage(image, dstLocal, Rect(0, 0, 1, 1), tint, filter);
+        return;
+    }
+    drawNineSlice(image, dstLocal, ins.l, ins.t, ins.r, ins.b, tint, filter);
+}
+
+void Canvas::blendCoverageMask(const uint8_t* mask, int w, int h, int dstX, int dstY,
+                               const Color& color) {
+    if (!target_ || !mask || w <= 0 || h <= 0) return;
+    RasterTarget rt = makeTarget();
+    if (rt.clip.empty()) return;
+    BlendCoverageMask(rt, mask, w, h, dstX, dstY, color);
+}
+
 // ------------------------------------------------------------
 // 图层
 // ------------------------------------------------------------

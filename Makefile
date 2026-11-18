@@ -40,7 +40,8 @@ endif
 
 INC      := -I$(INC_DIR)
 LIB_A    := $(BUILD_DIR)/libbin2d.a
-LIB_OBJS := $(OBJ_DIR)/raster.o $(OBJ_DIR)/canvas.o $(OBJ_DIR)/scene.o $(OBJ_DIR)/image.o
+LIB_OBJS := $(OBJ_DIR)/raster.o $(OBJ_DIR)/canvas.o $(OBJ_DIR)/scene.o $(OBJ_DIR)/image.o \
+            $(OBJ_DIR)/filter.o
 
 # GPU 桥：只有 binGPU 已经构建过（有 libbingpu.a）才进库。
 # 没构建时 gpu.cpp 仍做一遍语法检查（gpu-syntax），保证它不会悄悄腐烂。
@@ -55,6 +56,7 @@ endif
 
 TESTS := $(TEST_DIR)/test_geometry$(EXT) $(TEST_DIR)/test_raster$(EXT) \
          $(TEST_DIR)/test_composite$(EXT) $(TEST_DIR)/test_scene$(EXT) \
+         $(TEST_DIR)/test_filter$(EXT) $(TEST_DIR)/test_image$(EXT) \
          $(TEST_DIR)/test_png$(EXT) $(GPU_TEST)
 DEMO  := $(OUT_DIR)/bin2d-demo$(EXT)
 BENCH := $(OUT_DIR)/bin2d-bench$(EXT)

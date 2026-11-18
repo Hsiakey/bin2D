@@ -1604,4 +1604,100 @@ void Blur(Surface& s, float radius) {
     BoxBlurCols(s, rad);
 }
 
+// ------------------------------------------------------------
+// 覆盖率遮罩的模糊 / 合成（0.8.0：投影走这条）
+//
+// 单通道版的前缀和盒式：与 BoxBlurRows/Cols 逐行对应（同样的 padded 填充 + 前缀和 +
+// (sum + win/2)/win），只是每像素 1 个通道而不是 4 个。刻意不做"两次盒式"：
+// 现有 Blur 就是"行一遍 + 列一遍"= 一个方形核，投影的观感与它一致才好换。
+// ------------------------------------------------------------
+void BlurMask(uint8_t* mask, int w, int h, float radius) {
+    if (!mask || w <= 0 || h <= 0 || radius <= 0.0f) return;
+    const int rad = static_cast<int>(std::lround(radius));
+    if (rad < 1) return;
+    const int win = rad * 2 + 1;
+
+    // 行方向
+    {
+        const int padded = w + rad * 2;
+        std::vector<uint8_t> pad(static_cast<size_t>(padded));
+        std::vector<uint32_t> pre(static_cast<size_t>(padded + 1));
+        for (int y = 0; y < h; ++y) {
+            uint8_t* row = mask + static_cast<size_t>(y) * static_cast<size_t>(w);
+            for (int i = 0; i < padded; ++i) {
+                int x = i - rad;
+                x = x < 0 ? 0 : (x >= w ? w - 1 : x);
+                pad[static_cast<size_t>(i)] = row[x];
+            }
+            pre[0] = 0;
+            for (int i = 0; i < padded; ++i)
+                pre[static_cast<size_t>(i + 1)] = pre[static_cast<size_t>(i)] + pad[static_cast<size_t>(i)];
+            for (int x = 0; x < w; ++x) {
+                const uint32_t sum = pre[static_cast<size_t>(x + win)] - pre[static_cast<size_t>(x)];
+                row[x] = static_cast<uint8_t>((sum + static_cast<uint32_t>(win / 2)) /
+                                              static_cast<uint32_t>(win));
+            }
+        }
+    }
+    // 列方向
+    {
+        const int padded = h + rad * 2;
+        std::vector<uint8_t> pad(static_cast<size_t>(padded));
+        std::vector<uint32_t> pre(static_cast<size_t>(padded + 1));
+        for (int x = 0; x < w; ++x) {
+            for (int i = 0; i < padded; ++i) {
+                int y = i - rad;
+                y = y < 0 ? 0 : (y >= h ? h - 1 : y);
+                pad[static_cast<size_t>(i)] =
+                    mask[static_cast<size_t>(y) * static_cast<size_t>(w) + x];
+            }
+            pre[0] = 0;
+            for (int i = 0; i < padded; ++i)
+                pre[static_cast<size_t>(i + 1)] = pre[static_cast<size_t>(i)] + pad[static_cast<size_t>(i)];
+            for (int y = 0; y < h; ++y) {
+                const uint32_t sum = pre[static_cast<size_t>(y + win)] - pre[static_cast<size_t>(y)];
+                mask[static_cast<size_t>(y) * static_cast<size_t>(w) + x] =
+                    static_cast<uint8_t>((sum + static_cast<uint32_t>(win / 2)) /
+                                         static_cast<uint32_t>(win));
+            }
+        }
+    }
+}
+
+void BlendCoverageMask(const RasterTarget& t, const uint8_t* mask, int mw, int mh, int dstX,
+                       int dstY, const Color& color) {
+    if (!t.valid() || !mask || mw <= 0 || mh <= 0 || color.a == 0) return;
+    Surface& dst = *t.surface;
+    const Rect area = Rect::intersect(t.clip, dst.bounds());
+    if (area.empty()) return;
+
+    const int x0 = std::max(dstX, static_cast<int>(std::floor(area.x)));
+    const int y0 = std::max(dstY, static_cast<int>(std::floor(area.y)));
+    const int x1 = std::min(dstX + mw, static_cast<int>(std::ceil(area.right())));
+    const int y1 = std::min(dstY + mh, static_cast<int>(std::ceil(area.bottom())));
+    if (x1 <= x0 || y1 <= y0) return;
+    const int sw = dst.width();
+    for (int y = y0; y < y1; ++y) {
+        const uint8_t* mrow = mask + static_cast<size_t>(y - dstY) * static_cast<size_t>(mw);
+        uint8_t* drow = dst.row(y);
+        for (int x = x0; x < x1; ++x) {
+            float k = static_cast<float>(mrow[x - dstX]) * (1.0f / 255.0f);
+            if (k <= 0.0f) continue;
+            if (t.mask) {
+                k *= t.mask[static_cast<size_t>(y) * static_cast<size_t>(sw) +
+                            static_cast<size_t>(x)];
+                if (k <= 0.0f) continue;
+            }
+            const Color src = color * k;   // 预乘空间逐通道乘（含 alpha）
+            if (src.a == 0) continue;
+            uint8_t* p = drow + static_cast<size_t>(x) * 4;
+            const Color out = BlendPixel(Color(p[0], p[1], p[2], p[3]), src, t.blend);
+            p[0] = out.r;
+            p[1] = out.g;
+            p[2] = out.b;
+            p[3] = out.a;
+        }
+    }
+}
+
 } // namespace bin2d

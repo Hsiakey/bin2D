@@ -14,12 +14,15 @@
 // ============================================================
 
 #include <algorithm>
+#include <chrono>
+#include <cstring>
 #include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
 
 #include "bin2d/canvas.h"
+#include "bin2d/filter.h"
 #include "bin2d/image.h"
 #include "bin2d/paint.h"
 #include "bin2d/png.h"
@@ -326,6 +329,147 @@ void MeasureGpuParity() {
 #endif
 }
 
+// ------------------------------------------------------------
+// 6) 0.8.0 的三件新东西：颜色矩阵滤镜 / 投影的 alpha 罩 / 九宫格自动边界 + mip 上限
+//
+// 每一项都给"数字"而不是"看着挺好"：
+//   · 滤镜：1 MP 的单张耗时 + 灰度解析值偏差 + identity 是否逐位不变；
+//   · 投影：同尺寸下 RGBA 图层 vs alpha 罩的内存与模糊耗时（4× 内存是本次改动的前提）；
+//   · 九宫格：探测到的边界与"应该等于圆角半径"的偏差；
+//   · mip：满链与受预算截断的级数 / 字节。
+// ------------------------------------------------------------
+void MeasureFiltersShadowNine()
+{
+    // ---- 滤镜：1 MP ----
+    Surface big(1000, 1000);
+    {
+        Canvas c(big);
+        c.clear(Color::argb(0xFF1A1F26));
+        for (int i = 0; i < 40; ++i)
+            c.fillRounded(Rect(10.0f + i * 24.0f, 10.0f + (i % 7) * 130.0f, 120, 110),
+                          18.0f, Paint::linearAngle(Rect(0, 0, 1000, 1000), 35.0f,
+                                                   0xFF3E8BFF, 0xFF2FBF9A));
+    }
+    const ColorMatrix filters[] = {
+        ColorMatrix::grayscale(1.0f),  ColorMatrix::saturate(1.6f),
+        ColorMatrix::hueRotate(30.0f), ColorMatrix::contrast(1.3f),
+        ColorMatrix::invert(1.0f),     ColorMatrix::brightness(0.8f),
+    };
+    const char* names[] = {"灰度", "饱和 1.6", "色相 30°", "对比度 1.3", "反相", "亮度 0.8"};
+    double totalMs = 0.0;
+    for (int i = 0; i < 6; ++i) {
+        Surface work = big;
+        const auto t0 = std::chrono::steady_clock::now();
+        ApplyColorMatrix(work, filters[i]);
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        totalMs += ms;
+        std::printf("[滤镜] %-9s 1 MP 单张 %6.2f ms（%.2f ns/像素）\n", names[i], ms,
+                    ms * 1e6 / (1000.0 * 1000.0));
+    }
+    // 灰度解析值：纯红 → 0.213 × 255 = 54.3 → 54
+    {
+        Surface s(1, 1);
+        s.set(0, 0, Color::argb(0xFFFF0000u));
+        ApplyColorMatrix(s, ColorMatrix::grayscale(1.0f));
+        const int g = s.get(0, 0).r;
+        Surface same = big;
+        ApplyColorMatrix(same, ColorMatrix::identity());
+        bool identical = true;
+        for (int y = 0; y < big.height() && identical; ++y)
+            identical = std::memcmp(big.row(y), same.row(y),
+                                    static_cast<size_t>(big.width()) * 4) == 0;
+        std::printf("[滤镜] 灰度(纯红)=%d（解析 54）  identity 逐位不变=%s  六张合计 %.2f ms\n", g,
+                    identical ? "是" : "否", totalMs);
+    }
+    // 图：同一张底图依次套六个滤镜（人眼看色相与对比度的方向对不对）
+    std::vector<Surface> panels;
+    {
+        Surface base(160, 90);
+        Canvas c(base);
+        c.fillRect(Rect(0, 0, 160, 90), Color::argb(0xFF202329));
+        c.fillRounded(Rect(8, 8, 60, 74), 10, Paint::linearAngle(Rect(8, 8, 60, 74), 30,
+                                                                 0xFF3E8BFF, 0xFF2FBF9A));
+        Path star;
+        star.addStar(100, 30, 24, 11, 5);
+        c.fillPath(star, Color::argb(0xFFFFC857));
+        c.fillRounded(Rect(78, 58, 74, 24), 8, Color::argb(0xFFE8EEF7));
+        panels.push_back(base);
+    }
+    for (int i = 0; i < 6; ++i) {
+        Surface p = panels.front();
+        ApplyColorMatrix(p, filters[i]);
+        panels.push_back(p);
+    }
+    SaveSheet(panels, "quality_filters.png");
+
+    // ---- 投影：RGBA 图层 vs alpha 罩 ----
+    {
+        // 一张 200×120 卡片、模糊 12px 的投影：旧实现开 (200+24)×(120+24) 的 RGBA 图层
+        const int lw = 224, lh = 144;
+        const size_t rgbaBytes = static_cast<size_t>(lw) * static_cast<size_t>(lh) * 4u;
+        const size_t maskBytes = static_cast<size_t>(lw) * static_cast<size_t>(lh);
+        Surface layer(lw, lh);
+        std::vector<uint8_t> mask(maskBytes, 200);
+        const int iters = 40;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) Blur(layer, 12.0f);
+        const auto t1 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) BlurMask(mask.data(), lw, lh, 12.0f);
+        const auto t2 = std::chrono::steady_clock::now();
+        const double rgbaMs = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
+        const double maskMs = std::chrono::duration<double, std::milli>(t2 - t1).count() / iters;
+        std::printf("[投影] %dx%d 模糊 r=12：RGBA 图层 %zu KB / %.3f ms  vs  alpha 罩 %zu KB / %.3f ms"
+                    "（内存 %.1f×，耗时 %.1f×）\n",
+                    lw, lh, rgbaBytes / 1024, rgbaMs, maskBytes / 1024, maskMs,
+                    static_cast<double>(rgbaBytes) / static_cast<double>(maskBytes),
+                    rgbaMs / maskMs);
+    }
+
+    // ---- 九宫格自动边界 ----
+    {
+        Surface src(48, 36);
+        {
+            Canvas c(src);
+            c.fillRounded(Rect(0, 0, 48, 36), 12.0f, Color::white());
+        }
+        const Image img(src);
+        const auto t0 = std::chrono::steady_clock::now();
+        NineSliceInsets ins;
+        for (int i = 0; i < 1000; ++i) ins = DetectNineSliceInsets(img);
+        const auto t1 = std::chrono::steady_clock::now();
+        const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / 1000.0;
+        std::printf("[九宫格] 48x36 圆角 12 → l=%.0f t=%.0f r=%.0f b=%.0f（应 = 12，±1）  %.1f µs/次\n",
+                    ins.l, ins.t, ins.r, ins.b, us);
+
+        // 图：原图 + 自动九宫格拉到 240×72（四角不该被拉成斜边）
+        Surface out(248, 80);
+        {
+            Canvas c(out);
+            c.clear(Color::argb(0xFF202329));
+            c.drawNineSliceAuto(img, Rect(4, 4, 240, 72), Color::white());
+        }
+        Save(out, "quality_nineslice.png");
+    }
+
+    // ---- mip 上限 ----
+    {
+        Image img(64, 64);
+        Surface& s = img.surface();
+        for (int y = 0; y < 64; ++y)
+            for (int x = 0; x < 64; ++x)
+                s.set(x, y, ((x / 8 + y / 8) % 2) ? Color::white() : Color::argb(0xFF202020));
+        img.sampleSurface(64.0f);
+        std::printf("[mip] 64x64 满链：%d 级 / %zu 字节\n", img.mipLevelCount(), img.mipBytes());
+        Image capped(64, 64);
+        capped.surface() = img.surface();
+        capped.setMipByteBudget(5000);
+        capped.sampleSurface(64.0f);
+        std::printf("[mip] 预算 5000 字节：%d 级 / %zu 字节（第一级 4096 已用掉大半）\n",
+                    capped.mipLevelCount(), capped.mipBytes());
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -335,6 +479,7 @@ int main(int argc, char** argv) {
     MeasureMinify();
     MeasureStroke();
     MeasureGpuParity();
+    MeasureFiltersShadowNine();
     std::printf("图已写到 %s\n", g_dir.c_str());
     return 0;
 }

@@ -120,37 +120,131 @@ static void TestGroupTransformAndOpacity() {
     (void)childPtr;
 }
 
-static void TestShadowDoesNotBreakOpaque() {
-    Surface s(160, 160);
+// ------------------------------------------------------------
+// 投影（0.8.0 改成"alpha 罩"时顺带修的 bug：旧实现的 dx/dy 只用来移动**源矩形**，
+// 没有作用到填充上 —— 结果是投影永远贴在形状正中（被形状盖住），只在四周漏一圈模糊）
+//
+// 所以这里不写"看起来像阴影"的软断言，而是三条硬性质：
+//   ① 形状+偏移的**落点**必须出现阴影色（按公式算出的精确值）；
+//   ② 反方向（形状-偏移）必须**一点都没有** —— 这条正是旧 bug 会红的断言；
+//   ③ 形状本体、裁剪、模糊半径各自的行为。
+// ------------------------------------------------------------
+static void TestShadowOffset() {
+    Surface s(140, 140);
     Canvas c(s);
-    c.clear(Color::argb(0xFF202020));
+    const Color bg = Color::argb(0xFF202020);
+    c.clear(bg);
 
     Shape shape;
-    shape.path.addRoundedRect(Rect(40, 40, 80, 60), 14.0f);
+    shape.path.addRect(Rect(40, 40, 60, 40));
     shape.paint = Paint::solid(Color::argb(0xFF3E8BFF));
-    shape.shadow.dx = 6.0f;
-    shape.shadow.dy = 8.0f;
-    shape.shadow.blur = 10.0f;
+    shape.shadow.dx = 12.0f;
+    shape.shadow.dy = 10.0f;
+    shape.shadow.blur = 0.0f;                       // 硬边：每个像素可预测
+    shape.shadow.color = Color::argb(0x99000000);   // a=153
+    shape.draw(c);
+
+    // ① 落点：形状 (40..100,40..80) 平移 (12,10) → (52..112, 50..90)。
+    //    取 (70,85)：在投影矩形内、在形状外（y>80）→ 纯阴影压在底色上。
+    //    预乘 src-over：r = (0 + 32*102 + 127)/255 = 13（bg 0x20 = 32）
+    const Color hit = s.get(70, 85);
+    CHECK(hit.r == 13 && hit.g == 13 && hit.b == 13,
+          "scene: 投影出现在形状+偏移的落点（精确值 source-over）");
+    std::printf("  hit(%d,%d)= (%d,%d,%d,%d)  rev=(%d,%d,%d,%d) shape=(%d,%d,%d,%d)\n", 70, 85, hit.r, hit.g, hit.b, hit.a, s.get(34,34).r, s.get(34,34).g, s.get(34,34).b, s.get(34,34).a, s.get(70,60).r, s.get(70,60).g, s.get(70,60).b, s.get(70,60).a);
+
+    // ② 反向落点（形状 - 偏移 ≈ (28..88, 30..70) 的形状外区域）必须与底色逐位相同
+    CHECK(s.get(34, 34).r == 32 && s.get(34, 34).g == 32,
+          "scene: 反方向没有投影（旧实现的 dx/dy 失效会在这里红）");
+    // 形状本体不受影响
+    CHECK(s.get(70, 60).r == 0x3E && s.get(70, 60).a == 255,
+          "scene: 投影不改变形状本体像素");
+}
+
+static void TestShadowBlurHalo() {
+    Surface s(180, 180);
+    Canvas c(s);
+    c.clear(Color::argb(0xFF202020));
+    Shape shape;
+    shape.path.addRect(Rect(50, 50, 60, 40));
+    shape.paint = Paint::solid(Color::argb(0xFFFFFFFF));
+    shape.shadow.dx = 14.0f;
+    shape.shadow.dy = 14.0f;
+    shape.shadow.blur = 12.0f;
     shape.shadow.color = Color::argb(0x80000000);
     shape.draw(c);
 
-    CHECK(s.get(80, 70).r > 40, "scene: 投影之上的形状本体正常绘制");
-    // 投影方向（右下）的平均亮度必须低于远处背景 —— 模糊很大，单点比较会被量化吃掉
+    // 模糊后投影是"形状(偏移后) → 半径 12 的方形核"。
+    // ① 偏移侧形状右缘外仍有一块**实心**投影（偏移 14 > 0 才看得见；旧实现里它不存在）
     double nearSum = 0.0, farSum = 0.0;
     int nearN = 0, farN = 0;
-    for (int y = 40; y < 110; ++y) {
-        for (int x = 122; x < 140; ++x) { nearSum += s.get(x, y).r; ++nearN; }
-        for (int x = 4; x < 22; ++x) { farSum += s.get(x, y).r; ++farN; }
+    int farMin = 255;
+    for (int y = 55; y < 85; ++y) {
+        for (int x = 112; x < 124; ++x) { nearSum += s.get(x, y).r; ++nearN; }   // 形状(110)右侧
+        for (int x = 24; x < 36; ++x) {
+            const int v = s.get(x, y).r;
+            farSum += v; ++farN;
+            if (v < farMin) farMin = v;
+        }
     }
     const double nearAvg = nearSum / static_cast<double>(nearN);
     const double farAvg = farSum / static_cast<double>(farN);
-    CHECK(nearAvg < farAvg - 0.5, "scene: 投影落在偏移方向并压暗底色（区域平均）");
-    std::printf("  （投影侧平均 %.2f vs 背景平均 %.2f）\n", nearAvg, farAvg);
+    CHECK(nearAvg < farAvg - 5.0, "scene: 偏移侧形状外有实心投影（反向没有）");
+    // 比"平均值低"更硬：反方向**一个像素**都不许被投影碰到
+    CHECK(farMin == 32, "scene: 反方向区域逐点等于背景（投影完全不泄漏）");
+    std::printf("  （偏移侧 %.2f vs 反向 %.2f）\n", nearAvg, farAvg);
+
+    // ② 投影外缘必须是渐弱的（模糊生效），而不是一刀切
+    const int atShadowEdge = s.get(126, 70).r;
+    const int atHalo = s.get(132, 70).r;
+    const int atBg = s.get(146, 70).r;
+    CHECK(atShadowEdge < atHalo && atHalo <= atBg,
+          "scene: 模糊投影向外逐渐衰减到背景");
+
+    // 形状本体仍是纯白（模糊的罩不能反过来压暗本体）
+    CHECK(s.get(80, 70).r == 255, "scene: 模糊投影之上本体仍是白色");
+}
+
+static void TestShadowRespectsClip() {
+    Surface s(160, 160);
+    Canvas c(s);
+    c.clear(Color::argb(0xFF202020));
+    c.clipRect(Rect(0, 0, 80, 160));   // 右半边被裁掉
+
+    Shape shape;
+    shape.path.addRect(Rect(60, 40, 60, 40));
+    shape.paint = Paint::solid(Color::argb(0xFFFFFFFF));
+    shape.shadow.dx = 10.0f;
+    shape.shadow.dy = 10.0f;
+    shape.shadow.blur = 0.0f;
+    shape.shadow.color = Color::argb(0x99000000);
+    shape.draw(c);
+
+    // 裁剪内（x<80）的投影落点被画上；裁剪外（x>=80）原样
+    CHECK(s.get(78, 80).r == 13, "scene: 投影在裁剪内正常合成");
+    CHECK(s.get(100, 80).r == 32, "scene: 投影不越过画布裁剪矩形");
+}
+
+// 覆盖率遮罩合成：裁剪 + 源 alpha + 混合模式各一条（投影之外的直接调用者也用得到）
+static void TestCoverageMaskComposite() {
+    Surface s(8, 8);
+    Canvas c(s);
+    c.clear(Color::argb(0xFF000000));
+    std::vector<uint8_t> mask(16, 255);
+    c.blendCoverageMask(mask.data(), 4, 4, 2, 2, Color::argb(0xFFFFFFFF));
+    CHECK(s.get(2, 2).r == 255 && s.get(5, 5).r == 255, "mask: 整块遮罩按颜色铺满");
+    CHECK(s.get(1, 1).r == 0 && s.get(6, 6).r == 0, "mask: 遮罩外不动");
+
+    std::vector<uint8_t> half(4, 128);
+    c.blendCoverageMask(half.data(), 2, 2, 0, 0, Color::argb(0xFFFFFFFF));
+    CHECK(s.get(0, 0).r == 128, "mask: 覆盖率 128 → 50% 混合（四舍五入）");
 }
 
 int main() {
     TestSceneEqualsCanvas();
     TestGroupTransformAndOpacity();
-    TestShadowDoesNotBreakOpaque();
+    TestShadowOffset();
+    TestShadowBlurHalo();
+    TestShadowRespectsClip();
+    TestCoverageMaskComposite();
     return Bin2dTestSummary("test_scene");
 }

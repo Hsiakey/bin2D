@@ -59,6 +59,28 @@ public:
     // 已生成几级预缩小副本（0 = 还没生成；诊断/测试用）
     int mipLevelCount() const { return static_cast<int>(mips_.size()); }
 
+    // 预缩小副本占的字节数（诊断 / 显存预算用）
+    size_t mipBytes() const {
+        size_t total = 0;
+        for (const Surface& m : mips_) total += m.byteSize();
+        return total;
+    }
+
+    // ---- mip 的显存上限（0.8.0）----
+    // 两个口径可以并用，哪个先到就停在哪个：
+    //   · levelCap：最多生成几级（0 = 不限制；1 = 只到 1/2）；
+    //   · byteBudget：预缩小副本总字节上限（0 = 不限制）。
+    // 为什么需要：一张 4096×4096 的图满链是 ~22 MB 的额外拷贝，而 9 宫格/图标这类
+    // 素材根本用不到第 8 级。调用方按"这张图在界面上最大能放大到多少"设上限即可。
+    // 上限定小了的代价是"极小缩放时退回更糙的一级"（会糊一点，不会摩尔纹更重）。
+    void setMipLevelCap(int levels) {
+        mipLevelCap_ = levels < 0 ? 0 : levels;
+    }
+    void setMipByteBudget(size_t bytes) { mipByteBudget_ = bytes; }
+    int mipLevelCap() const { return mipLevelCap_; }
+    size_t mipByteBudget() const { return mipByteBudget_; }
+    void clearMips() { mips_.clear(); }
+
     // 直接按像素坐标取（越界钳制）；实现在 src/image.cpp
     Color at(int x, int y) const;
 
@@ -87,6 +109,31 @@ private:
     // 拷贝 Image 会连副本一起拷 —— 素材本来就是"小图"（图标/九宫格），不值得为省这份
     // 内存引入 shared_ptr 与生命周期规则。
     mutable std::vector<Surface> mips_;
+    int mipLevelCap_ = 0;          // 0 = 不限制
+    size_t mipByteBudget_ = 0;     // 0 = 不限制
 };
+
+// ------------------------------------------------------------
+// 九宫格的自动边界（0.8.0）
+//
+// 为什么放在 bin2d：九宫格的 (l,t,r,b) 是**素材的属性**（哪几行/列可以拉伸），
+// 不是绘制参数。让每个调用点各自写死 12/16/12/16，换个皮肤就错一个角。
+//
+// 判别式（刻意简单，且只认"能拉伸"这一件事）：
+//   相邻两列（或两行）在容差内**完全相同**，说明这两列之间没有信息，可以被拉伸。
+//   取最长的一段连续"可拉伸列"，它的左右边界就是 l 与 r；行同理。
+// 适用：圆角卡片、气泡、按钮、滚动条 —— 它们的直边段一定是列/行完全重复的。
+// 不适用：整张图都是渐变的"没有边"的图（那种图本来也不需要九宫格），检测会返回
+//   detected=false，调用方应当退回普通拉伸（而不是拿 0 当边界去画）。
+//
+// tolerance 是逐通道最大绝对差（8 位）。默认 1：容忍 AA/压缩噪声，又不至于把
+// "相邻两列差 2 级"的细节当可拉伸区。
+// ------------------------------------------------------------
+struct NineSliceInsets {
+    float l = 0.0f, t = 0.0f, r = 0.0f, b = 0.0f;
+    bool detected = false;   // false = 没找到可靠的拉伸带（l/t/r/b 全 0）
+};
+
+NineSliceInsets DetectNineSliceInsets(const Image& image, int tolerance = 1);
 
 } // namespace bin2d

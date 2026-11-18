@@ -102,6 +102,18 @@ public:
                        float insetL, float insetT, float insetR, float insetB,
                        const Color& tint = Color::white(),
                        ImageFilter filter = ImageFilter::Linear);
+    // 九宫格：边界自动探测（详情见 image.h 的 DetectNineSliceInsets）。
+    // 探测每次调用都做一遍（对图标尺寸是几十微秒级）；固定边界还是用上面那个重载，
+    // 同一个图反复画时自己缓存结果。
+    void drawNineSliceAuto(const Image& image, const Rect& dstLocal,
+                           const Color& tint = Color::white(),
+                           ImageFilter filter = ImageFilter::Linear);
+
+    // ---- 覆盖率遮罩合成（设备空间，不经过当前变换）----
+    // 把一张 0..255 的覆盖率罩按 color 合成到当前目标；受当前裁剪 / 路径遮罩 / 混合模式
+    // 约束。投影的第二半（模糊后的 alpha 罩）走这里：1 字节/像素，不进颜色管线。
+    void blendCoverageMask(const uint8_t* mask, int w, int h, int dstX, int dstY,
+                           const Color& color);
 
     // ---- 图层 ----
     // 把接下来的绘制收进一张离屏（尺寸 = bounds 映射后的设备矩形），

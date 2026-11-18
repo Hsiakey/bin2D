@@ -112,6 +112,10 @@ public:
     ImageFilter filter = ImageFilter::Linear;
 
     bool nineSlice = false;
+    // 九宫格边界自动探测（0.8.0）：为 true 时忽略下面四个 inset，每次绘制按图内容
+    // 找"可拉伸带"。同一个图每帧重复画时建议自己缓存 DetectNineSliceInsets 的结果，
+    // 这个开关是给"素材会换、边界跟着变"的场合用的。
+    bool nineSliceAuto = false;
     float insetL = 0.0f, insetT = 0.0f, insetR = 0.0f, insetB = 0.0f;
 
     Rect localBounds() const override { return dst; }
@@ -122,7 +126,9 @@ public:
         applyState(canvas);
         const float k = opacity > 1.0f ? 1.0f : opacity;
         const Color t = tint * k;
-        if (nineSlice)
+        if (nineSliceAuto)
+            canvas.drawNineSliceAuto(*image, dst, t, filter);
+        else if (nineSlice)
             canvas.drawNineSlice(*image, dst, insetL, insetT, insetR, insetB, t, filter);
         else
             canvas.drawImage(*image, dst, srcUv, t, filter);

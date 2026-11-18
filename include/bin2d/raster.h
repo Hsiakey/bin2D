@@ -169,6 +169,24 @@ void DrawSurface(const RasterTarget& t, const Surface& src, const Rect& dstLocal
 // 只模糊当前像素矩形内、且按 srcAlpha 归一化（预乘空间直接模糊即可）。
 void Blur(Surface& s, float radius);
 
+// ------------------------------------------------------------
+// 覆盖率遮罩的模糊与合成（0.8.0：投影走这条，不再"画彩色图层再模糊"）
+//
+// 为什么单开一条：投影只需要 alpha —— 把形状栅成 1 字节/像素的覆盖率、模糊它、
+// 最后乘上阴影色合成，内存是原来（RGBA8 图层）的 1/4，且模糊的对象从
+// "颜色×alpha"变成"alpha"，语义更直接（模糊核是线性的，两种顺序在实数上等价，
+// 差的是两次 8 位取整的位置，实测 ≤1 级，见 tests/test_scene 的投影断言）。
+//
+// BlurMask 的口径与 Blur 完全相同（同一套前缀和盒式、同一 rad = lround(radius)、
+// 同样的"边缘复制"边界），所以两者的模糊半径不会一个算 3 一个算 4。
+// ------------------------------------------------------------
+void BlurMask(uint8_t* mask, int w, int h, float radius);
+
+// 把 mask（w×h，0..255 覆盖率）当成 alpha 乘到 color 上，按 t 的裁剪 / 遮罩 / 混合模式
+// 合成到目标。dstX/dstY 是 mask 左上角在设备空间的位置（整数像素）。
+void BlendCoverageMask(const RasterTarget& t, const uint8_t* mask, int w, int h, int dstX,
+                       int dstY, const Color& color);
+
 // 子采样数（竖直方向）。标准 8：覆盖率误差 ≤ 1/8 像素，成本约 8 次求交/行。
 constexpr int kSubSamples = 8;
 

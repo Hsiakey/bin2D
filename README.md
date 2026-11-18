@@ -25,10 +25,10 @@ binGPU 桥（往返验证 + **多图层 GPU 合成**）。
 ```
 include/bin2d/   core.h surface.h transform.h png.h           地基（类型/位图/矩阵/PNG）
                  paint.h path.h raster.h canvas.h scene.h      绘制
-                 image.h gpu.h                                 素材 / binGPU 桥（往返 + 合成器）
-src/             raster.cpp canvas.cpp scene.cpp gpu.cpp      实现
-tests/           test_geometry/raster/composite/scene/png[_gpu_bridge].cpp
-tools/           bin2d_demo.cpp bin2d_bench.cpp bin2d_bench_gpu.cpp  演示 / 基准
+                 filter.h image.h gpu.h                        滤镜 / 素材 / binGPU 桥
+src/             raster.cpp canvas.cpp scene.cpp image.cpp filter.cpp gpu.cpp   实现
+tests/           test_geometry/raster/composite/scene/filter/image/png[_gpu_bridge].cpp
+tools/           bin2d_demo.cpp bin2d_bench.cpp bin2d_bench_gpu.cpp bin2d_quality.cpp
 docs/            architecture.md api.md roadmap.md
 ```
 
@@ -103,6 +103,16 @@ ctest --test-dir build --output-on-failure
 **同一个光栅器**，所以宿主的像素和这里逐像素一致（binUI 侧实测：GDI 与 GL 在描边用例上
 从 1016~1284 个不同像素降到 **0**）。
 
+**0.7.0（2026-11-19）**：导出**圆角模板覆盖率**（`RasterizeRoundedTileCoverage`）——
+宿主三个 GPU 后端各自手写了一份一样的有符号距离循环，改一处就差一圈像素；现在
+三端共用 bin2d 这一份（binUI 0.23.0 接入，像素一位没动）。
+
+**0.8.0（2026-11-19）**：收尾路线图 ④。① **颜色矩阵滤镜**（灰度/饱和/色相/亮度/对比度/反相，
+5.83 ns/像素，identity 逐位不变）；② **投影改走 alpha 罩**（内存 4.0×、模糊 4.3× 更省；
+并修掉"dx/dy 从来没生效过"的老 bug —— 以前投影永远贴在形状正中）；③ **九宫格边界自动探测**
+（48×36 圆角 12 的卡片探出精确 12/12/12/12，3.1 µs/次）；④ **mip 显存上限**
+（级数 + 字节预算，大图不再悄悄多占几十 MB）。202 项断言全绿。
+
 ## 画质（`make quality` 的固定数字）
 
 | 指标 | 数值 | 口径 |
@@ -113,7 +123,11 @@ ctest --test-dir build --output-on-failure
 | 0.1 / 0.5 px 竖线的峰值覆盖率 | **26 / 128** | 再细的线也不会消失 |
 | 8× 缩小 vs 理想盒式平均 | **0.0 级** | 0.3.0 是 31.8 级（摩尔纹） |
 | 低 alpha 渐变可见级数 / 色带宽度 | **17 级 / 12 px** | 0.3.0 是 9 级 / 32 px |
+| 滤镜（六个，1 MP 单张） | **5.83 ns/像素** | 灰度纯红 = 54（解析 54） |
+| 投影模糊（224×144，r=12） | **31 KB / 0.11 ms** | 旧 RGBA 图层 126 KB / 0.41–0.50 ms（3.6–4.3×） |
+| 九宫格自动边界（48×36 圆角 12） | **12/12/12/12**，3.1 µs | 与逐像素相等列一致 |
 | GPU 细节场景 vs CPU | **0 / 98304 px 差** | 细网格 + 1.3px 弧 + 渐变 + 像素图标 |
 
 对应图：[AA](docs/img/quality-aa.png)、[阶调](docs/img/quality-gradient.png)、
-[缩小](docs/img/quality-minify.png)。
+[缩小](docs/img/quality-minify.png)；滤镜与九宫格的新图由 `make quality` 写到
+`build-mingw/out/quality/quality_filters.png` / `quality_nineslice.png`。
