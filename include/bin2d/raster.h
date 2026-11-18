@@ -28,6 +28,7 @@
 // ============================================================
 
 #include <cstdint>
+#include <vector>
 
 #include "bin2d/core.h"
 #include "bin2d/image.h"
@@ -170,5 +171,64 @@ void Blur(Surface& s, float radius);
 
 // 子采样数（竖直方向）。标准 8：覆盖率误差 ≤ 1/8 像素，成本约 8 次求交/行。
 constexpr int kSubSamples = 8;
+
+// ------------------------------------------------------------
+// 覆盖率查询（给"自己有条带 / 四边形管线"的宿主用）
+//
+// 背景：bin2d 内部的落像素路径是「覆盖率 → 乘颜料 → 混合」（见 FillPath）。但有些宿主
+// 不往 CPU 的 Surface 上落像素 —— 它们把覆盖率拼成**条带/四边形**下发给 GPU（binUI
+// 就是这样：AA 填充 = 逐行等覆盖率的连续像素合并成一条带）。这类宿主需要的不是像素，
+// 而是**同一份覆盖率**，否则两边各写一套扫描线，边缘必然对不上。
+//
+// 所以这里把覆盖率本身导出：设备空间折线 → 8bit 覆盖率矩形。数值口径与内部完全一致
+//（同一个光栅器、同一套水平解析求交），不同的只是出口。
+// ------------------------------------------------------------
+struct CoverageRect {
+    int x0 = 0, y0 = 0, w = 0, h = 0;   // 覆盖 [x0,x0+w) × [y0,y0+h) 这些设备像素
+    std::vector<uint8_t> v;             // w*h，行优先；0 = 没盖到，255 = 整像素
+
+    bool empty() const { return w <= 0 || h <= 0; }
+    uint8_t at(int x, int y) const {
+        return v[static_cast<size_t>(y - y0) * static_cast<size_t>(w) +
+                 static_cast<size_t>(x - x0)];
+    }
+    const uint8_t* row(int y) const {
+        return v.data() + static_cast<size_t>(y - y0) * static_cast<size_t>(w);
+    }
+};
+
+// 覆盖率风格：
+//   Fractional —— 边缘像素按重叠比例（0..255 连续），AA 用这个；
+//   HardEdge   —— 每个跨度的端点先四舍五入到整像素再累加，覆盖率只有 0 / 255
+//                 （SVG 的 shape-rendering="crispEdges" / optimizeSpeed 就是这个语义）。
+// 它必须落在光栅器里而不是"调用方自己把 0..255 二值化"：二值化会丢掉"亚像素宽的细条
+// 仍然占一整像素"这条语义（老的 binUI 硬边填充就是按 round(端点) 铺满整像素的）。
+enum class CoverageStyle : uint8_t { Fractional = 0, HardEdge = 1 };
+
+// 覆盖率请求。几何用**交错 float + 折线表**（和 binUI 的受控内存布局一致，免一次拷贝）：
+//   xy[2i], xy[2i+1] 是两个 float；第 c 条折线 = xy[first[c]*2 .. (first[c]+count[c])*2]，
+//   折线首尾自动闭合（填充语义）。
+// clip 是设备像素裁剪矩形；subSamples 是竖直子采样数（默认 kSubSamples）。
+//   传 1 = 硬边（覆盖率只有 0 / 1 两档，等价于"像素中心在形状内"）。
+struct CoverageRequest {
+    const float* xy = nullptr;
+    const uint32_t* first = nullptr;
+    const uint32_t* count = nullptr;
+    int contours = 0;
+    FillRule rule = FillRule::NonZero;
+    CoverageStyle style = CoverageStyle::Fractional;
+    Rect clip;
+    int subSamples = kSubSamples;
+
+    bool valid() const { return xy && first && count && contours > 0; }
+};
+
+// 折线批量版本（bin2d 自己的调用方 / 测试用）
+bool RasterizeCoverage(const std::vector<Polyline>& polys, FillRule rule, const Rect& clip,
+                       int subSamples, CoverageRect& out,
+                       CoverageStyle style = CoverageStyle::Fractional);
+
+// 交错数组版本（宿主免拷贝）
+bool RasterizeCoverage(const CoverageRequest& req, CoverageRect& out);
 
 } // namespace bin2d

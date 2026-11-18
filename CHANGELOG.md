@@ -3,6 +3,41 @@
 本文件记录 bin2d 的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.5.0] - 2026-11-18
+
+**新能力：覆盖率查询**（`bin2d::RasterizeCoverage`）。给"自己有条带/四边形管线"的宿主用 ——
+binUI 就是第一个：它的 AA 填充是"逐行等覆盖率的连续像素合并成一条带"，要有覆盖率才能拼，
+而不是要一张已经混好的像素。
+
+导出的口径与 `FillPath` **完全相同**（同一个光栅器），不同的只是出口：
+
+- `CoverageRect`：设备像素矩形 + `w*h` 的 8bit 覆盖率（0 = 没盖到，255 = 整像素）；
+- 两个入口：`std::vector<Polyline>` 批，或**交错 float + 折线表**（宿主免拷贝，binUI 走这条）；
+- `CoverageStyle::Fractional`（边缘按重叠比例，AA 用）/ `HardEdge`（跨度端点四舍五入到
+  整像素，覆盖率只有 0/255 —— SVG 的 `shape-rendering="crispEdges"`）；
+- `subSamples`：竖直子采样数，默认 `kSubSamples`（8）。参数化只为"宿主与自己的老管线
+  逐位对齐"（binUI 迁移期传 4）；bin2d 内部所有落像素路径一律用默认值，**"像素权威"没有
+  变成可调项**。
+
+### Changed
+
+- **光栅器拆成"建边 → 行循环（模板 sink）"两段**（`BuildEdges` / `BuildEdgesInterleaved` /
+  `RasterEdges`）：落覆盖率的出口从此只有一处，合成路径（float 缓冲）与导出的覆盖率 API
+  （直接写 uint8）走同一段行循环。没有这套重构，两边的边缘一定会慢慢漂。
+- 行循环的临时缓冲改成**每线程复用**，但**访问一律走裸指针**：直接在热循环里写
+  `rowAcc[k]` 会让每次访问都过一遍 TLS，实测慢 40%（1000 万个像素级操作）；
+  函数入口取一次 `.data()` 就恢复。这条是量出来的，不是猜的。
+
+### 新增测试（test_raster 23 → 30 项）
+
+覆盖率的四条硬约束：整像素矩形内部 255 / 外部 0；半像素偏移的边缘列 ≈50%；
+**与 FillPath 的 alpha 逐像素一致（≤1 级）**；`HardEdge` 只产生 0/255 且左边界 = round(x)；
+clip 决定导出块的位置与尺寸。
+
+### 版本
+
+- `BIN2D_VERSION_MINOR` 4 → 5（`BIN2D_VERSION_STRING` = "0.5.0"）。
+
 ## [0.4.2] - 2026-11-18
 
 **扫描线性能轮**：把 `binUI` 的迁移**开工条件**从不达标做到达标。口径不变（binUI

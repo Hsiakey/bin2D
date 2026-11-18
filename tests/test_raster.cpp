@@ -302,7 +302,120 @@ static void TestGradientDither() {
     }
 }
 
+// ------------------------------------------------------------
+// 覆盖率查询（RasterizeCoverage）：导出给"自己有条带/四边形管线"的宿主
+//
+// 这条测试的要点不是"覆盖率对不对"，而是**它与 FillPath 用的是同一份覆盖率** ——
+// 两边一旦各写一套扫描线，边缘就会漂（binUI 迁移时就靠这一条兜住）。
+// ------------------------------------------------------------
+static void TestCoverageQuery() {
+    // ① 整像素矩形：内部 255、外部 0，矩形原点/尺寸对得上
+    {
+        std::vector<float> xy = {4, 4, 20, 4, 20, 12, 4, 12};
+        std::vector<uint32_t> first = {0}, count = {4};
+        CoverageRequest req;
+        req.xy = xy.data();
+        req.first = first.data();
+        req.count = count.data();
+        req.contours = 1;
+        req.clip = Rect(0, 0, 64, 64);
+        CoverageRect cov;
+        const bool ok = RasterizeCoverage(req, cov);
+        CHECK(ok && cov.w == 16 && cov.h == 8 && cov.x0 == 4 && cov.y0 == 4,
+              "coverage: 整像素矩形的覆盖率矩形 = 形状包围盒");
+        bool insideFull = true, outsideZero = true;
+        for (int y = 0; y < 64; ++y)
+            for (int x = 0; x < 64; ++x) {
+                const bool in = (x >= 4 && x < 20 && y >= 4 && y < 12);
+                if (in) {
+                    if (!ok || cov.at(x, y) != 255) insideFull = false;
+                } else if (ok && x >= cov.x0 && x < cov.x0 + cov.w && y >= cov.y0 &&
+                           y < cov.y0 + cov.h && cov.at(x, y) != 0) {
+                    outsideZero = false;
+                }
+            }
+        CHECK(insideFull && outsideZero, "coverage: 整像素矩形内部 255、外部 0");
+    }
+
+    // ② 半像素偏移：边缘像素约一半，且与 FillPath 的 alpha 逐像素一致（±1）
+    {
+        std::vector<float> xy = {10.5f, 10.5f, 30.5f, 10.5f, 30.5f, 26.5f, 10.5f, 26.5f};
+        std::vector<uint32_t> first = {0}, count = {4};
+        CoverageRequest req;
+        req.xy = xy.data();
+        req.first = first.data();
+        req.count = count.data();
+        req.contours = 1;
+        req.clip = Rect(0, 0, 64, 64);
+        CoverageRect cov;
+        RasterizeCoverage(req, cov);
+        const int edge = cov.at(10, 15);   // 左边缘列
+        CHECK(edge >= 120 && edge <= 135, "coverage: 半像素偏移的左边缘列 ≈ 50%");
+
+        Surface s(64, 64);
+        RasterTarget t = MakeTarget(s);
+        Path p;
+        p.moveTo(10.5f, 10.5f);
+        p.lineTo(30.5f, 10.5f);
+        p.lineTo(30.5f, 26.5f);
+        p.lineTo(10.5f, 26.5f);
+        p.close();
+        FillPath(t, p, FillRule::NonZero, Paint::solid(Color::argb(0xFFFFFFFF)),
+                 Transform::identity());
+        int maxDelta = 0;
+        for (int y = cov.y0; y < cov.y0 + cov.h; ++y)
+            for (int x = cov.x0; x < cov.x0 + cov.w; ++x)
+                maxDelta = std::max(maxDelta, std::abs(int(cov.at(x, y)) - int(s.get(x, y).a)));
+        CHECK(maxDelta <= 1, "coverage: 与 FillPath 的覆盖率逐像素一致（≤1 级）");
+        std::printf("  （覆盖率 vs FillPath alpha 最大差 %d 级）\n", maxDelta);
+    }
+
+    // ③ subSamples=1：只有 0 / 255 两档（硬边），且左边界落在 round(x) 上
+    {
+        std::vector<float> xy = {10.6f, 10.2f, 30.4f, 10.2f, 30.4f, 26.8f, 10.6f, 26.8f};
+        std::vector<uint32_t> first = {0}, count = {4};
+        CoverageRequest req;
+        req.xy = xy.data();
+        req.first = first.data();
+        req.count = count.data();
+        req.contours = 1;
+        req.clip = Rect(0, 0, 64, 64);
+        req.subSamples = 1;
+        req.style = CoverageStyle::HardEdge;
+        CoverageRect cov;
+        RasterizeCoverage(req, cov);
+        bool binary = true;
+        int leftOn = -1;
+        for (int y = cov.y0; y < cov.y0 + cov.h; ++y) {
+            const uint8_t* r = cov.row(y);
+            for (int x = 0; x < cov.w; ++x) {
+                if (r[x] != 0 && r[x] != 255) binary = false;
+                if (r[x] == 255 && leftOn < 0) leftOn = cov.x0 + x;
+            }
+        }
+        CHECK(binary, "coverage: HardEdge 风格只产生 0/255（等价 crispEdges）");
+        CHECK(leftOn == 11, "coverage: 硬边左边界 = round(10.6) = 11");
+    }
+
+    // ④ clip 生效：clip 比形状小 → 只导 clip 内那块
+    {
+        std::vector<float> xy = {0, 0, 40, 0, 40, 40, 0, 40};
+        std::vector<uint32_t> first = {0}, count = {4};
+        CoverageRequest req;
+        req.xy = xy.data();
+        req.first = first.data();
+        req.count = count.data();
+        req.contours = 1;
+        req.clip = Rect(8, 8, 10, 6);
+        CoverageRect cov;
+        RasterizeCoverage(req, cov);
+        CHECK(cov.x0 == 8 && cov.y0 == 8 && cov.w == 10 && cov.h == 6,
+              "coverage: clip 决定导出块的位置与尺寸");
+    }
+}
+
 int main() {
+    TestCoverageQuery();
     TestExactRect();
     TestCircleArea();
     TestFillRule();

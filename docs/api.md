@@ -3,6 +3,32 @@
 > 全部在 `namespace bin2d`，头文件在 `include/bin2d/`。除 `src/*.cpp` 里的实现外都是 header-only
 > 可见的类型；库只需链接 `libbin2d.a`。
 
+## 覆盖率查询（`RasterizeCoverage`，0.5.0）
+
+```cpp
+bin2d::CoverageRequest req;
+req.xy = xy;                 // 交错 float：x0,y0,x1,y1,…
+req.first = first;           // 每条折线的起始点下标
+req.count = count;           // 每条折线的点数（首尾自动闭合 = 填充语义）
+req.contours = contours;
+req.rule = bin2d::FillRule::NonZero;              // 或 EvenOdd
+req.style = bin2d::CoverageStyle::Fractional;     // 或 HardEdge（crispEdges）
+req.subSamples = bin2d::kSubSamples;              // 默认 8；要和自己老管线逐位对齐时才改
+req.clip = bin2d::Rect(0, 0, w, h);               // 设备像素
+bin2d::CoverageRect cov;
+if (bin2d::RasterizeCoverage(req, cov)) { /* cov.at(x, y) ∈ [0,255] */ }
+```
+
+什么时候用它（而不是 `FillPath`）：**宿主不往 CPU 的 Surface 上落像素**，而是把覆盖率
+拼成条带或四边形下发给 GPU。这时候要的是"覆盖率"这个中间量，不是混好的像素。
+binUI 的 `<path>` 填充就是这种（AA 时逐行把等覆盖率的连续像素合并成一条带）。
+
+为什么不能用 `FillPath` 再读 alpha 顶替：那要求宿主开一块 Surface、走一遍混合、再反解
+alpha —— 既多一次全区域读写，又把"颜料"和"覆盖率"耦合在一起。
+
+数值口径与 `FillPath` 完全一致（同一个光栅器）：8bit 是 `round(cov × 255)`，内部整像素
+覆盖率恰好 1.0 → 直接 255。
+
 ## core.h —— 基础类型
 
 ```cpp

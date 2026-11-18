@@ -92,22 +92,20 @@ struct Edge {
 };
 
 // 把一批设备空间折线栅进 cover（union=true 时取 max，用于描边的多块并集）
-void RasterPolys(const std::vector<Polyline>& polys, FillRule rule, bool unionMode,
-                 Cover& cover) {
-    if (cover.empty()) return;
-    const int h = cover.h;
-    const int w = cover.w;
-    const int baseX = cover.x0;
-    const float subStep = 1.0f / static_cast<float>(kSubSamples);
-    const float subWeight = 1.0f / static_cast<float>(kSubSamples);
+// 边表：跨调用复用（每线程一份；容量按最长路径增长一次就不再分配）
+std::vector<Edge>& edgesScratch() {
+    static thread_local std::vector<Edge> edges;
+    return edges;
+}
 
-    // ---- 建边表 ----
+// 建边表：设备空间折线（bin2d 自己的 Polyline 批）
+void BuildEdges(const std::vector<Polyline>& polys, std::vector<Edge>& edges) {
     size_t edgeCount = 0;
     for (const Polyline& pl : polys) {
         const size_t n = pl.pts.size();
         if (n >= 2) edgeCount += pl.closed ? n : n - 1;
     }
-    std::vector<Edge> edges;
+    edges.clear();
     edges.reserve(edgeCount);
     for (const Polyline& pl : polys) {
         const size_t n = pl.pts.size();
@@ -130,26 +128,113 @@ void RasterPolys(const std::vector<Polyline>& polys, FillRule rule, bool unionMo
             edges.push_back(e);
         }
     }
-    if (edges.empty()) return;
+}
+
+// 建边表：交错 float + 折线表（宿主免拷贝的那条路；填充语义 = 首尾自动闭合）
+void BuildEdgesInterleaved(const float* xy, const uint32_t* first, const uint32_t* count,
+                           int contours, std::vector<Edge>& edges) {
+    size_t total = 0;
+    for (int c = 0; c < contours; c++)
+        if (count[c] >= 2) total += count[c];
+    edges.clear();
+    edges.reserve(total);
+    for (int c = 0; c < contours; c++) {
+        const uint32_t f = first[c];
+        const uint32_t n = count[c];
+        if (n < 2) continue;
+        for (uint32_t i = 0; i < n; i++) {
+            const size_t ka = static_cast<size_t>(f + i) * 2;
+            const size_t kb = static_cast<size_t>(f + (i + 1) % n) * 2;
+            const float ax = xy[ka], ay = xy[ka + 1];
+            const float bx = xy[kb], by = xy[kb + 1];
+            if (ay == by) continue;
+            Edge e;
+            const float dy = by - ay;
+            e.dyInv = (bx - ax) / dy;
+            if (ay < by) {
+                e.x0 = ax; e.y0 = ay; e.dir = 1;
+                e.ymin = ay; e.ymax = by;
+            } else {
+                e.x0 = bx; e.y0 = by; e.dir = -1;
+                e.ymin = by; e.ymax = ay;
+            }
+            edges.push_back(e);
+        }
+    }
+}
+
+// 交叉点数组：跨调用复用（每线程一份）
+std::vector<Crossing>& xsScratch() {
+    static thread_local std::vector<Crossing> xs;
+    return xs;
+}
+
+std::vector<int>& activeScratch() {
+    static thread_local std::vector<int> v;
+    return v;
+}
+
+// 三个行缓冲：一次长到最宽的那个形状，之后不再分配
+float* rowAccScratch(int w, bool& grew) {
+    static thread_local std::vector<float> v;
+    if (static_cast<int>(v.size()) < w) {
+        v.resize(static_cast<size_t>(w), 0.0f);
+        grew = true;
+    }
+    return v.data();
+}
+
+float* rowDeltaScratch(int w, bool& grew) {
+    static thread_local std::vector<float> v;
+    if (static_cast<int>(v.size()) < w) {
+        v.resize(static_cast<size_t>(w), 0.0f);
+        grew = true;
+    }
+    return v.data();
+}
+
+float* rowCovScratch(int w, bool& grew) {
+    static thread_local std::vector<float> v;
+    if (static_cast<int>(v.size()) < w) {
+        v.resize(static_cast<size_t>(w), 0.0f);
+        grew = true;
+    }
+    return v.data();
+}
+
+
+
+// 行循环：一批已建好的边 → 逐行覆盖率，每落一个像素回调 sink(yy, xi, c)，c 已钳到 [0,1]。
+// **落覆盖率的出口只有这一处**：合成路径（float 缓冲）与导出的覆盖率 API（uint8）都走
+// 这里，所以"覆盖率"在库里只有一份实现，不会漂。
+template <class RowSink>
+void RasterEdges(std::vector<Edge>& edges, FillRule rule, int baseX, int y0, int w, int h,
+                 int nSub, bool hardEdge, RowSink&& sink) {
+    if (edges.empty() || w <= 0 || h <= 0) return;
     std::sort(edges.begin(), edges.end(),
               [](const Edge& a, const Edge& b) { return a.ymin < b.ymin; });
-
-    // 交叉点数组：每条子扫描线按"边下标顺序"重建后插入排序。
-    // （试过跨子扫描线保持上一次的 x 顺序、把插入排序喂成近有序：实测覆盖率开销
-    //  7.34 → 7.48 ms，没有收益，反而多两份下标状态 —— 因为这里真正的花销是
-    //  "每条子扫描线给每条活动边算一次 x"，不是排序。所以没留。）
-    std::vector<Crossing> xs;
-    xs.reserve(edges.size());
-    std::vector<int> active;
+    const float subStep = 1.0f / static_cast<float>(nSub);
+    const float subWeight = 1.0f / static_cast<float>(nSub);
+    // 全部缓冲**每线程复用**（一个形状每帧只走一次这里），但访问一律走裸指针：
+    // 热循环里直接写 `rowAcc[k]` 会让每次访问都过一遍 TLS（实测慢 ~40%），
+    // 函数入口取一次 `.data()` 就没有这个问题。
+    std::vector<Crossing>& xsV = xsScratch();
+    if (xsV.size() < edges.size()) xsV.resize(edges.size());   // 指针写入前必须保证容量
+    Crossing* xs = xsV.data();
+    std::vector<int>& active = activeScratch();
+    active.clear();
     active.reserve(edges.size());
-    // rowAcc = 每行的"端像素小数覆盖率"；rowDelta = 整像素段的差分（前缀和还原）。
-    // 二者只在**被碰到的列**上读写，行尾按 touched 区间清回 0 —— 见 0.4.2 的性能轮。
-    std::vector<float> rowAcc(static_cast<size_t>(w), 0.0f);
-    std::vector<float> rowDelta(static_cast<size_t>(w), 0.0f);
+    // rowAcc = 每行的"端像素小数覆盖率"；rowDelta = 整像素段的差分（前缀和还原）；
+    // rowCov = 本行的最终覆盖率（交给 sink 一整行，而不是逐像素回调）。
+    // 三者只在**被碰到的列**上读写，行尾按 touched 区间清回 0 —— 见 0.4.2 的性能轮。
+    bool grew = false;
+    float* rowAcc = rowAccScratch(w, grew);
+    float* rowDelta = rowDeltaScratch(w, grew);
+    float* rowCov = rowCovScratch(w, grew);
     size_t nextEdge = 0;
 
     for (int yy = 0; yy < h; ++yy) {
-        const int py = cover.y0 + yy;
+        const int py = y0 + yy;
         const float rowTop = static_cast<float>(py);
         const float rowBot = rowTop + 1.0f;
 
@@ -165,26 +250,26 @@ void RasterPolys(const std::vector<Polyline>& polys, FillRule rule, bool unionMo
         }
         if (active.empty()) continue;
 
-        float* dstRow = cover.row(yy);
-        // 本行被写过的列区间（含右端那个"取消项"列）：行内 8 条子扫描线共用，
+        // 本行被写过的列区间（含右端那个"取消项"列）：行内全部子扫描线共用，
         // 前缀和只在 [tLo,tHi] 上跑一遍，不再整行遍历
         int tLo = w;
         int tHi = -1;
 
-        for (int sub = 0; sub < kSubSamples; ++sub) {
+        for (int sub = 0; sub < nSub; ++sub) {
             const float sy = rowTop + (static_cast<float>(sub) + 0.5f) * subStep;
-            xs.clear();
+            int nCross = 0;
             for (size_t k = 0; k < active.size(); ++k) {
                 const Edge& e = edges[static_cast<size_t>(active[k])];
                 if (sy < e.ymin || sy >= e.ymax) continue;
-                xs.push_back(Crossing{e.x0 + (sy - e.y0) * e.dyInv, e.dir});
+                xs[nCross++] = Crossing{e.x0 + (sy - e.y0) * e.dyInv, e.dir};
             }
-            if (xs.empty()) continue;
+            if (nCross == 0) continue;
+            const int nXs = nCross;
 
             // 交叉点通常只有 2~8 个：插入排序比 std::sort 的通用派发快一个数量级
-            for (size_t i = 1; i < xs.size(); ++i) {
+            for (int i = 1; i < nXs; ++i) {
                 const Crossing key = xs[i];
-                size_t j = i;
+                int j = i;
                 while (j > 0 && (xs[j - 1].x > key.x ||
                                  (xs[j - 1].x == key.x && xs[j - 1].dir > key.dir))) {
                     xs[j] = xs[j - 1];
@@ -210,8 +295,15 @@ void RasterPolys(const std::vector<Polyline>& polys, FillRule rule, bool unionMo
                 if (xb <= xa) return;
                 const float minX = static_cast<float>(baseX);
                 const float maxX = static_cast<float>(baseX + w);
-                const float lo = xa < minX ? minX : xa;
-                const float hi = xb > maxX ? maxX : xb;
+                float lo = xa < minX ? minX : xa;
+                float hi = xb > maxX ? maxX : xb;
+                if (hardEdge) {
+                    // 硬边：端点先落到整像素（与老 binUI 的 round(端点) 铺满整像素等价）。
+                    // 亚像素宽的细条因此仍然占一整像素，不会因为"覆盖率不到一半"消失。
+                    lo = std::round(lo);
+                    hi = std::round(hi);
+                    if (hi > maxX) hi = maxX;
+                }
                 if (hi <= lo) return;
                 const int ia = static_cast<int>(std::floor(lo));
                 const int ib = static_cast<int>(std::floor(hi));
@@ -239,10 +331,10 @@ void RasterPolys(const std::vector<Polyline>& polys, FillRule rule, bool unionMo
             };
 
             if (rule == FillRule::EvenOdd) {
-                for (size_t i = 0; i + 1 < xs.size(); i += 2) addSpan(xs[i].x, xs[i + 1].x);
+                for (int i = 0; i + 1 < nXs; i += 2) addSpan(xs[i].x, xs[i + 1].x);
             } else {
                 int winding = 0;
-                for (size_t i = 0; i + 1 < xs.size(); ++i) {
+                for (int i = 0; i + 1 < nXs; ++i) {
                     winding += xs[i].dir;
                     if (winding != 0) addSpan(xs[i].x, xs[i + 1].x);
                 }
@@ -250,8 +342,8 @@ void RasterPolys(const std::vector<Polyline>& polys, FillRule rule, bool unionMo
         }
 
         if (tHi < tLo) continue;
-        // 前缀和 + 落覆盖率：只在 [tLo,tHi] 上，顺带把两个累加器清回 0。
-        // 每个像素最多收到 8 × 1/8，min(1,c) 一次就够，省掉原来整行的二次 clamp。
+        // 前缀和：只在 [tLo,tHi] 上，顺带把两个累加器清回 0。
+        // 每个像素最多收到 nSub × 1/nSub，min(1,c) 一次就够，省掉整行的二次 clamp。
         float run = 0.0f;
         for (int xi = tLo; xi <= tHi; ++xi) {
             const size_t k = static_cast<size_t>(xi);
@@ -259,13 +351,73 @@ void RasterPolys(const std::vector<Polyline>& polys, FillRule rule, bool unionMo
             const float c = rowAcc[k] + run;
             rowAcc[k] = 0.0f;
             rowDelta[k] = 0.0f;
-            if (c <= 0.0f) continue;
-            const float cl = c > 1.0f ? 1.0f : c;
-            if (unionMode) dstRow[xi] = std::max(dstRow[xi], cl);
-            else dstRow[xi] += cl;
+            rowCov[k] = c <= 0.0f ? 0.0f : (c > 1.0f ? 1.0f : c);
         }
+        sink(yy, tLo, tHi, rowCov);
     }
 }
+
+// 公共尾巴：建好的边 + 覆盖率缓冲 → 8bit 导出
+// 包围盒 ∩ 裁剪 → 整数像素矩形（与 Cover::reset 同一套取整规则，只是不分配/不清零）
+bool ClipPixels(const Rect& bbox, const Rect& clip, int& x0, int& y0, int& w, int& h) {
+    const Rect r = Rect::intersect(bbox, clip);
+    if (r.empty()) return false;
+    x0 = static_cast<int>(std::floor(r.x));
+    y0 = static_cast<int>(std::floor(r.y));
+    const int x1 = static_cast<int>(std::ceil(r.right()));
+    const int y1 = static_cast<int>(std::ceil(r.bottom()));
+    w = x1 - x0;
+    h = y1 - y0;
+    return w > 0 && h > 0;
+}
+
+bool RasterizeCoverageEdges(std::vector<Edge>& edges, FillRule rule, int x0, int y0, int w,
+                            int h, int subSamples, CoverageStyle style, CoverageRect& out) {
+    if (edges.empty() || w <= 0 || h <= 0) return false;
+    const int nSub = subSamples < 1 ? 1 : (subSamples > 32 ? 32 : subSamples);
+    out.x0 = x0;
+    out.y0 = y0;
+    out.w = w;
+    out.h = h;
+    out.v.assign(static_cast<size_t>(out.w) * static_cast<size_t>(out.h), 0);
+    RasterEdges(edges, rule, out.x0, out.y0, out.w, out.h, nSub,
+                style == CoverageStyle::HardEdge,
+                [&out](int yy, int tLo, int tHi, const float* cov) {
+                    uint8_t* row = out.v.data() + static_cast<size_t>(yy) *
+                                                     static_cast<size_t>(out.w);
+                    for (int xi = tLo; xi <= tHi; ++xi) {
+                        const float c = cov[xi];
+                        // 与内部 Composite 的"整像素 = 1.0"同一判据：1.0 直接给 255
+                        row[xi] = (c <= 0.0f) ? 0
+                                              : (c >= 1.0f ? 255
+                                                           : static_cast<uint8_t>(c * 255.0f + 0.5f));
+                    }
+                });
+    return true;
+}
+
+// 覆盖率 → float 缓冲（FillPath / StrokePath 用；unionMode = 描边多块取 max）
+void RasterPolys(const std::vector<Polyline>& polys, FillRule rule, bool unionMode,
+                 Cover& cover, int subSamples = kSubSamples, bool hardEdge = false) {
+    if (cover.empty()) return;
+    // 竖直子采样数：默认 kSubSamples（8）。参数化是为了导出的覆盖率 API ——
+    // 宿主若要和自己的老管线逐位对齐（binUI 迁移期 = 4），就得能指定。
+    // 内部所有落像素路径一律用默认值，所以"像素权威"没有变成可调项。
+    const int nSub = subSamples < 1 ? 1 : (subSamples > 32 ? 32 : subSamples);
+    std::vector<Edge>& edges = edgesScratch();
+    BuildEdges(polys, edges);
+    RasterEdges(edges, rule, cover.x0, cover.y0, cover.w, cover.h, nSub, hardEdge,
+                [&cover, unionMode](int yy, int tLo, int tHi, const float* cov) {
+                    float* dstRow = cover.row(yy);
+                    for (int xi = tLo; xi <= tHi; ++xi) {
+                        const float c = cov[xi];
+                        if (c <= 0.0f) continue;
+                        if (unionMode) dstRow[xi] = std::max(dstRow[xi], c);
+                        else dstRow[xi] += c;
+                    }
+                });
+}
+
 // 局部 → 设备；同时给出展平容差（按变换的平均缩放折成用户单位）
 std::vector<Polyline> FlattenToDevice(const Path& path, const Transform& xf,
                                       float tolerancePx) {
@@ -705,6 +857,60 @@ void BuildStrokePolys(const std::vector<Polyline>& polys, const StrokeStyle& st,
 // ============================================================
 // 对外 API
 // ============================================================
+// ------------------------------------------------------------
+// 覆盖率查询（给"自己有条带/四边形管线"的宿主用）
+//
+// 与 FillPath 共用**同一个光栅器**（RasterEdges）：这里只是把覆盖率导成 8bit，
+// 不另写一套扫描线。刻意如此 —— 两套实现一定会漂移，而边缘漂移在 AA 上是肉眼可见的。
+// 交错数组那条路直接建边、直接写 uint8，不拷贝 Polyline、不经过 float 缓冲。
+// ------------------------------------------------------------
+bool RasterizeCoverage(const std::vector<Polyline>& polys, FillRule rule, const Rect& clip,
+                       int subSamples, CoverageRect& out, CoverageStyle style) {
+    out.x0 = out.y0 = out.w = out.h = 0;
+    out.v.clear();
+    if (polys.empty() || clip.empty()) return false;
+    const Rect bbox = PolysBounds(polys);
+    if (bbox.empty()) return false;
+    int x0 = 0, y0 = 0, w = 0, h = 0;
+    if (!ClipPixels(bbox, clip, x0, y0, w, h)) return false;
+    std::vector<Edge>& edges = edgesScratch();
+    BuildEdges(polys, edges);
+    return RasterizeCoverageEdges(edges, rule, x0, y0, w, h, subSamples, style, out);
+}
+
+bool RasterizeCoverage(const CoverageRequest& req, CoverageRect& out) {
+    out.x0 = out.y0 = out.w = out.h = 0;
+    out.v.clear();
+    if (!req.valid() || req.clip.empty()) return false;
+    // 包围盒自己算（宿主给的是整条路径的设备坐标）
+    float minx = 0, miny = 0, maxx = 0, maxy = 0;
+    bool first = true;
+    for (int c = 0; c < req.contours; c++) {
+        const uint32_t f = req.first[c];
+        const uint32_t n = req.count[c];
+        for (uint32_t i = 0; i < n; i++) {
+            const size_t k = static_cast<size_t>(f + i) * 2;
+            const float x = req.xy[k], y = req.xy[k + 1];
+            if (first) {
+                minx = maxx = x; miny = maxy = y; first = false;
+                continue;
+            }
+            if (x < minx) minx = x;
+            if (x > maxx) maxx = x;
+            if (y < miny) miny = y;
+            if (y > maxy) maxy = y;
+        }
+    }
+    if (first) return false;
+    int x0 = 0, y0 = 0, w = 0, h = 0;
+    if (!ClipPixels(Rect(minx, miny, maxx - minx, maxy - miny), req.clip, x0, y0, w, h))
+        return false;
+    std::vector<Edge>& edges = edgesScratch();
+    BuildEdgesInterleaved(req.xy, req.first, req.count, req.contours, edges);
+    return RasterizeCoverageEdges(edges, req.rule, x0, y0, w, h, req.subSamples, req.style,
+                                  out);
+}
+
 void FillPath(const RasterTarget& t, const Path& path, FillRule rule,
               const Paint& paint, const Transform& xf, float tolerancePx) {
     if (!t.valid() || path.empty()) return;
@@ -717,7 +923,7 @@ void FillPath(const RasterTarget& t, const Path& path, FillRule rule,
     Cover cover;
     cover.reset(bbox, Rect::intersect(t.clip, t.surface->bounds()));
     if (cover.empty()) return;
-    RasterPolys(polys, rule, false, cover);
+    RasterPolys(polys, rule, false, cover, kSubSamples, false);
     Composite(t, cover, paint, inv, 1.0f);
 }
 
@@ -761,7 +967,8 @@ void StrokePath(const RasterTarget& t, const Path& path, const Paint& paint,
     cover.reset(bbox, Rect::intersect(t.clip, t.surface->bounds()));
     if (cover.empty()) return;
     // union：多块叠在同一像素取 max（不是相加），接缝不会变深
-    for (const Polyline& piece : devPieces) RasterPolys({piece}, FillRule::NonZero, true, cover);
+    for (const Polyline& piece : devPieces)
+        RasterPolys({piece}, FillRule::NonZero, true, cover, kSubSamples, false);
     Composite(t, cover, paint, inv, 1.0f);
 }
 
