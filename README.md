@@ -66,6 +66,9 @@ ctest --test-dir build --output-on-failure
 **0.1.1（2026-11-15）**：性能轮。六项单线程吞吐合计 **4.03×**（190.56 → 47.33 ns/px，
 圆角矩形 2.51 ns/px、星形路径 1.53 ns/px、512² 图层合成 4.94 ns/px），像素结果不变；
 94 项断言全绿，GPU 桥往返最大通道差 0。基线与方法见 [docs/perf.md](docs/perf.md)。下一步是把上层 UI 库的路径渲染迁到 bin2d（验收 = 三端像素基准 0 diff），
-见 [docs/roadmap.md](docs/roadmap.md)。
+见 [docs/roadmap.md](docs/roadmap.md)；**边界与分工线**（和 binGPU / UI 库各管什么、迁移台账）
+见 [docs/layering.md](docs/layering.md)。
+
+**0.1.2（2026-11-18）**：只有文档（`docs/layering.md`），接口与像素行为不变。
 
 ![能力展示](docs/img/bin2d-demo.png)

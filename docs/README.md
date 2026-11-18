@@ -6,6 +6,7 @@
 | [api.md](api.md) | 每个头的关键类型 + 可直接抄的代码片段 |
 | [perf.md](perf.md) | 吞吐基线：怎么测、0.1.0 → 0.1.1 的同机数字对照、每条优化对应哪一步、没做的项与原因 |
 | [roadmap.md](roadmap.md) | 五个阶段：地基 → 上层 UI 库迁移（0 diff 验收） → GPU 合成 → 滤镜/mip → 缓存与脏区；每阶段写开工条件 |
+| [layering.md](layering.md) | **这一层在哪、和 binGPU / UI 库的分工线、两条一致性承诺的落点、与 UI 库的迁移台账（含删除条件）、GPU 阶段的开工前置、对 binGPU ABI 2 的诉求** |
 
 测试说明见 [`../tests/README.md`](../tests/README.md)。
 
