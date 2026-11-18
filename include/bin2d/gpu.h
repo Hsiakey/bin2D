@@ -38,6 +38,10 @@ public:
 
     // HEADLESS + CPU 后端：不需要窗口/驱动，纯粹用来验证"这条路上真的跑过一遍"
     bool create(int width, int height, bool preferCpu = true);
+    // 同一个回合，但**点名**后端（BGPU_BACKEND_CPU / _VULKAN / _D3D11 / _GL / _AUTO）。
+    // 用途：三端一致性验收 —— 同一份 Surface 过每个真实后端，读回来必须还是它。
+    // 这个后端不可用时返回 false（error() 里有原因），调用方据此跳过而不是当成失败。
+    bool create(int width, int height, BgpuBackendKind backend);
     void destroy();
     bool ready() const { return device_ != 0 && swapchain_ != 0; }
 
@@ -56,6 +60,9 @@ public:
     bool render(const Surface& src, Surface& out);
 
     const std::string& lastError() const { return error_; }
+    // 实际拿到的后端（AUTO 解析之后的那个），以及它的名字（"vulkan" / "d3d11" / "gl" / "cpu"）
+    BgpuBackendKind backend() const { return backend_; }
+    const char* backendName() const { return bingpu_backend_name(backend_); }
 
 private:
     void fail(const char* what, BgpuResult result);
@@ -67,6 +74,7 @@ private:
     BgpuSampler sampler_ = 0;
     int width_ = 0;
     int height_ = 0;
+    BgpuBackendKind backend_ = BGPU_BACKEND_AUTO;
     std::string error_;
 };
 

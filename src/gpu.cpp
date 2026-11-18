@@ -48,14 +48,19 @@ void GpuBridge::fail(const char* what, BgpuResult result) {
 }
 
 bool GpuBridge::create(int width, int height, bool preferCpu) {
+    return create(width, height, preferCpu ? BGPU_BACKEND_CPU : BGPU_BACKEND_AUTO);
+}
+
+bool GpuBridge::create(int width, int height, BgpuBackendKind backend) {
     destroy();
     if (width <= 0 || height <= 0) return false;
     width_ = width;
     height_ = height;
+    backend_ = backend;
 
     BgpuDeviceDesc dd{};
     dd.struct_size = sizeof(dd);
-    dd.backend = preferCpu ? BGPU_BACKEND_CPU : BGPU_BACKEND_AUTO;
+    dd.backend = backend;
     dd.native_window = nullptr;
     dd.width = static_cast<uint32_t>(width);
     dd.height = static_cast<uint32_t>(height);
@@ -92,6 +97,12 @@ bool GpuBridge::create(int width, int height, bool preferCpu) {
 
     r = bingpu_cmd_create(device_, &cmd_);
     if (r != BGPU_OK) { fail("bingpu_cmd_create", r); destroy(); return false; }
+
+    /* AUTO 解析之后再问一次：上层要如实知道"这一帧到底跑在哪个后端上"，
+     * 三端一致性验收就是按后端名逐个打印的。 */
+    BgpuDeviceInfo info{};
+    info.struct_size = sizeof(info);
+    if (bingpu_device_info(device_, &info) == BGPU_OK) backend_ = info.backend;
     return true;
 }
 

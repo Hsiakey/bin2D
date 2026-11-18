@@ -3,6 +3,32 @@
 本文件记录 bin2d 的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0] - 2026-11-18
+
+**GPU 桥可以点名后端了**，并且顺手当了 binGPU 的一次真验收：同一份 `Surface` 过
+CPU / Vulkan / D3D11 / GL 四个后端往返，读回来**都是它自己**（最大通道差 **0**）。
+
+### Added
+
+- `GpuBridge::create(width, height, BgpuBackendKind)`：点名后端（`_CPU` / `_VULKAN` /
+  `_D3D11` / `_GL` / `_AUTO`）。原来只有 `preferCpu` 布尔，AUTO 落到哪个后端是黑盒；
+  现在 `backend()` / `backendName()` 回报**实际**拿到的后端（AUTO 解析之后的值）。
+- `tests/test_gpu_bridge.cpp` 从"只测 CPU 后端"扩成"每个可用后端各测一遍"，不可用就
+  打印原因跳过（CI 机没显卡不会红）。
+
+### Fixed（修在 binGPU 那边，这里记一笔）
+
+这条桥上第一次跑真实后端就抓到 binGPU 两个 bug，都在"交换链回读"这条路上：
+D3D11 的 HEADLESS 借出对象漏了 `res_w/res_h`（viewport 0×0，一笔画不出来，差 255）、
+GL 的 FBO 回读多翻了一次行（整幅上下镜像，差 38）。已修在 **binGPU 0.5.1**，
+并在 binGPU 的 `tests/gpu_parity.h` 里补了对应的 `swapchain(frame_read)` 用例。
+记在这里是因为**发现它的不是 binGPU 自己的测试，是这层消费者** —— 这正是
+"上层一行不改、底下换后端"这条约定该起的作用。
+
+### 版本
+
+- `BIN2D_VERSION_MINOR` 1 → 2（`BIN2D_VERSION_STRING` = "0.2.0"）。
+
 ## [0.1.3] - 2026-11-18
 
 **只有文档**：订正 [`docs/layering.md`](docs/layering.md) 里的 binUI 行数（迁移台账引用的是
