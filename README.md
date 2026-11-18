@@ -47,6 +47,7 @@ make all       # 库 + 测试 + 演示（零警告）
 make test      # 跑全部测试，失败非 0 退出
 make demo      # 出图：build-mingw/out/bin2d-demo.png
 make bench-gpu # 图层合成基准（CPU / GPU 每帧上传 / GPU 纹理常驻；要显卡）
+make quality   # 绘制质量取证：数值 + build-mingw/out/quality/*.png
 make layers    # 层边界检查
 make clean
 ```
@@ -76,7 +77,28 @@ ctest --test-dir build --output-on-failure
 **0.3.0（2026-11-18）**：多图层合成器 GpuCompositor —— 一帧一次回读、相邻图层合批
 （8 层同纹理 → 1 次绘制）、纹理池 + 脏矩形上传、离屏渲染目标（图层套图层不落 CPU 内存）、
 五种混合模式与 CPU 逐像素对齐（4 个后端最大通道差 1，且四端彼此完全相同）。
-顺带修掉 CPU 侧两个混合模式 bug（DrawSurface 快路径无视 lend、==0 一律跳过）。
-116 项断言全绿。合成基准见 [docs/perf.md](docs/perf.md)。
+顺带修掉 CPU 侧两个混合模式 bug（`DrawSurface` 快路径无视 `blend`、`a==0` 一律跳过）。
+合成基准见 [docs/perf.md](docs/perf.md)。
 
 ![能力展示](docs/img/bin2d-demo.png)
+
+**0.4.0（2026-11-18）**：画质轮。① *缩小的盒式预滤波*（mip 的轻量版）：8× 缩小一张
+细纹图与理想盒式平均的偏差 **31.8 级 → 0.0 级**（原来满屏摩尔纹）；② *渐变有序抖动*
+（8×8 Bayer，默认开）：低 alpha 渐变的可见级数 **9 → 17**、色带宽度 **32 px → 12 px**；
+③ `make quality`：把画质做成可复现的数字 + 图。125 项断言全绿；
+渐变填充 +9% 时间、其余五项不动。
+
+## 画质（`make quality` 的固定数字）
+
+| 指标 | 数值 | 口径 |
+|---|---|---|
+| 圆（r=40，半像素圆心）面积误差 | **−0.24%** | 覆盖率求和 vs πr² |
+| 45° 边缘位置误差 | **0.000 px** | 水平方向解析求交 |
+| 1px 线在 4 个亚像素偏移下的覆盖率总和 | **100.0**（理想 100） | 亚像素平移不改变总墨水 |
+| 0.1 / 0.5 px 竖线的峰值覆盖率 | **26 / 128** | 再细的线也不会消失 |
+| 8× 缩小 vs 理想盒式平均 | **0.0 级** | 0.3.0 是 31.8 级（摩尔纹） |
+| 低 alpha 渐变可见级数 / 色带宽度 | **17 级 / 12 px** | 0.3.0 是 9 级 / 32 px |
+| GPU 细节场景 vs CPU | **0 / 98304 px 差** | 细网格 + 1.3px 弧 + 渐变 + 像素图标 |
+
+对应图：[AA](docs/img/quality-aa.png)、[阶调](docs/img/quality-gradient.png)、
+[缩小](docs/img/quality-minify.png)。

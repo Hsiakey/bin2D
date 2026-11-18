@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(bin2D VERSION 0.3.0 LANGUAGES CXX)
+project(bin2D VERSION 0.4.0 LANGUAGES CXX)
 
 # bin2d 是纯 C++17 的 2D 绘制核：无第三方依赖。
 # GPU 桥（src/gpu.cpp）可选 —— 只有定义了 BIN2D_BINGPU_DIR 且能找到 bingpu.h 时才编。
@@ -35,6 +35,10 @@ foreach(t ${BIN2D_TESTS})
     add_test(NAME ${t} COMMAND ${t})
 endforeach()
 
+# ---- 绘制质量取证（数值 + 图，不需要显卡）----
+add_executable(bin2d-quality tools/bin2d_quality.cpp)
+target_link_libraries(bin2d-quality PRIVATE bin2d)
+
 # ---- 演示 ----
 add_executable(bin2d-demo tools/bin2d_demo.cpp)
 target_link_libraries(bin2d-demo PRIVATE bin2d)
@@ -53,6 +57,7 @@ if (BIN2D_BINGPU_DIR AND EXISTS "${BIN2D_BINGPU_DIR}/include/bingpu.h")
         add_test(NAME test_gpu_bridge COMMAND test_gpu_bridge)
         add_executable(bin2d-bench-gpu tools/bin2d_bench_gpu.cpp)
         target_link_libraries(bin2d-bench-gpu PRIVATE bin2d)
+        target_compile_definitions(bin2d-quality PRIVATE BIN2D_QUALITY_GPU)
     endif()
 endif()
 

@@ -59,9 +59,9 @@ TESTS := $(TEST_DIR)/test_geometry$(EXT) $(TEST_DIR)/test_raster$(EXT) \
 DEMO  := $(OUT_DIR)/bin2d-demo$(EXT)
 BENCH := $(OUT_DIR)/bin2d-bench$(EXT)
 
-.PHONY: all lib test demo bench bench-gpu layers clean gpu-syntax
+.PHONY: all lib test demo bench bench-gpu quality layers clean gpu-syntax
 
-all: $(LIB_A) $(TESTS) $(DEMO) $(BENCH)
+all: $(LIB_A) $(TESTS) $(DEMO) $(BENCH) $(QUALITY)
 	@echo "[bin2d] all: 库 + 测试 + 演示 就绪"
 
 lib: $(LIB_A)
@@ -138,6 +138,25 @@ bench-gpu: $(BENCH_GPU)
 	@echo "[bin2d] 1280x720 目标，16 个图层的三条合成路线"
 	./$(BENCH_GPU) auto
 endif
+
+# ---- 绘制质量取证（数值 + 图）----
+# 不需要显卡也能跑（AA/阶调/缩小/描边）；有 binGPU 时额外跑 GPU 一致性那一项。
+QUALITY := $(OUT_DIR)/bin2d-quality$(EXT)
+ifeq ($(BINGPU_LIB),)
+QUALITY_FLAGS :=
+else
+QUALITY_FLAGS := -DBIN2D_QUALITY_GPU -I../binGPU/include
+endif
+
+$(QUALITY): tools/bin2d_quality.cpp $(LIB_A) $(BINGPU_LIB)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INC) $(QUALITY_FLAGS) $< $(LIB_A) $(BINGPU_LIB) \
+	    $(RTLINK) $(LDFLAGS) -o $@
+
+quality: $(QUALITY)
+	@mkdir -p $(OUT_DIR)/quality
+	./$(QUALITY) $(OUT_DIR)/quality
+	@echo "[bin2d] 质量图: $(OUT_DIR)/quality/*.png"
 
 # ---- 层边界 ----
 # bin2d 是"上层 UI 库下面"的一层：出现上层概念就说明抽错了。

@@ -88,6 +88,14 @@ public:
     bool nearest = false;                        // true = 最近邻采样
     Rect imageDst;                               // 图片在局部坐标里铺到的矩形
 
+    // ---- 渐变的抖动（0.4.0）----
+    // 8 位**预乘**存储下，低 alpha 的彩色渐变只剩个位数色阶（实测 alpha=7.8% 时
+    // 256px 上只有 9 级），叠在亮底上就是可见的色带。抖动把量化误差摊到相邻像素
+    // （Bayer 4×4，±0.5 级），眼睛看到的是"级数与级数之间的平均值"，色带消失。
+    // 默认开：这是画质收益，代价只是每像素一次查表；要逐像素复现旧结果（对拍/回归）
+    // 关掉即可，此时像素与 0.3.0 逐位相同。
+    bool dither = true;
+
     Paint() = default;
 
     // ---- 工厂：纯色 ----
@@ -176,6 +184,8 @@ public:
     }
 
     // stops 的归一化插值：色档要求按 t 升序（调用方保证；乱序由 GradientStopList 排好）
+    // 这是"每次渐变填充每像素都跑"的热路径，所以保持**直接**实现（不落中间数组、
+    // 不做多余的夹紧）：值域天然在 0..255，`(uint8_t)(v+0.5f)` 就是四舍五入。
     static Color SampleStops(const std::vector<GradientStop>& st, float t) {
         if (st.empty()) return Color::trans();
         if (t <= st.front().t) return st.front().color;
@@ -188,6 +198,78 @@ public:
         }
         return st.back().color;
     }
+
+    // 抖动版：量化前加 ±0.5 级的有序抖动（Bayer 4×4）。px/py 是**设备像素**坐标 ——
+    // 抖动图样必须钉在屏幕上，否则画面一动就"爬行"（放大/旋转时尤其明显）。
+    static Color SampleStopsDithered(const std::vector<GradientStop>& st, float t, int px, int py) {
+        float f[4];
+        if (!StopsAt(st, t, f)) return Color::trans();
+        const float d = Bayer8(px, py);
+        for (int i = 0; i < 4; ++i) f[i] += d;
+        return FromFloats(f);
+    }
+
+    // 8×8 Bayer 阈值，返回 (-0.5, 0.5) 之间的偏移（单位：8 位色阶）
+    //
+    // 为什么是 8×8 而不是 4×4：抖动能"凭空"造出的中间调数量 = 图样格数。
+    // 低 alpha 的彩色渐变本身只有 ~9 级（预乘 8 位），4×4 能把它摊成 17 个半级，
+    // 8×8 摊成 33 个（实测）；代价是同一张 64 字节表和一个更绕的取模。
+    // 为什么钉在设备像素上：抖动图样的周期必须跟着屏幕走，否则画面一动（滚动、
+    // 动画）抖点会"爬行"，那比色带更难看。
+    static float Bayer8(int x, int y) {
+        static const unsigned char kTable[64] = {
+            0,  32, 8,  40, 2,  34, 10, 42, 48, 16, 56, 24, 50, 18, 58, 26,
+            12, 44, 4,  36, 14, 46, 6,  38, 60, 28, 52, 20, 62, 30, 54, 22,
+            3,  35, 11, 43, 1,  33, 9,  41, 51, 19, 59, 27, 49, 17, 57, 25,
+            15, 47, 7,  39, 13, 45, 5,  37, 63, 31, 55, 23, 61, 29, 53, 21};
+        const int i = ((y & 7) << 3) | (x & 7);
+        return (static_cast<float>(kTable[i]) + 0.5f) / 64.0f - 0.5f;
+    }
+    static float Bayer4(int x, int y) {
+        static const int kTable[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+        const int i = ((y & 3) << 2) | (x & 3);
+        return (static_cast<float>(kTable[i]) + 0.5f) / 16.0f - 0.5f;
+    }
+
+private:
+    // 段查找 + **浮点**插值（量化留给调用方：不抖动的走 FromFloats，抖动的先加偏移）
+    static bool StopsAt(const std::vector<GradientStop>& st, float t, float out[4]) {
+        if (st.empty()) {
+            out[0] = out[1] = out[2] = out[3] = 0.0f;
+            return false;
+        }
+        if (t <= st.front().t) { LoadF(st.front().color, out); return true; }
+        if (t >= st.back().t) { LoadF(st.back().color, out); return true; }
+        for (size_t i = 1; i < st.size(); ++i) {
+            if (t > st[i].t) continue;
+            const float span = st[i].t - st[i - 1].t;
+            if (span <= 1e-6f) { LoadF(st[i].color, out); return true; }
+            const float u = (t - st[i - 1].t) / span;
+            const Color& a = st[i - 1].color;
+            const Color& b = st[i].color;
+            out[0] = static_cast<float>(a.r) + (static_cast<float>(b.r) - static_cast<float>(a.r)) * u;
+            out[1] = static_cast<float>(a.g) + (static_cast<float>(b.g) - static_cast<float>(a.g)) * u;
+            out[2] = static_cast<float>(a.b) + (static_cast<float>(b.b) - static_cast<float>(a.b)) * u;
+            out[3] = static_cast<float>(a.a) + (static_cast<float>(b.a) - static_cast<float>(a.a)) * u;
+            return true;
+        }
+        LoadF(st.back().color, out);
+        return true;
+    }
+    static void LoadF(const Color& c, float out[4]) {
+        out[0] = c.r;
+        out[1] = c.g;
+        out[2] = c.b;
+        out[3] = c.a;
+    }
+    // 与 core.h 的 lerp() 同一取整口径（+0.5 截断）。值域：色档 0..255 之间插值，
+    // 抖动再加 ±0.5，所以结果必然落在 [0, 255.99]，不需要夹紧。
+    static Color FromFloats(const float f[4]) {
+        auto q = [](float v) { return static_cast<uint8_t>(v + 0.5f); };
+        return Color(q(f[0]), q(f[1]), q(f[2]), q(f[3]));
+    }
+
+public:
 };
 
 // stops 排序 + 夹紧（t 单调不回退）。返回整理后的列表。

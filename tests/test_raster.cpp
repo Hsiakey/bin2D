@@ -1,5 +1,9 @@
 // test_raster —— 整像素矩形精确值、圆面积误差、AA 边缘平滑、填充规则差异、描边宽度
+#include "bin2d/canvas.h"
+#include "bin2d/image.h"
 #include "bin2d/raster.h"
+#include <algorithm>
+#include <vector>
 #include "test_util.h"
 
 using namespace bin2d;
@@ -151,10 +155,159 @@ static void TestStrokeWidth() {
     CHECK(AlphaSum(sRound) > AlphaSum(sButt) + 30.0, "raster: 圆端帽比平端帽多出半圆面积");
 }
 
+// ------------------------------------------------------------
+// 缩小预滤波（0.4.0）：8× 缩小一张 2px 棋盘，必须接近"理想盒式平均"，
+// 而不是把高频折成摩尔纹（0.3.0 实测差 31.8 级）
+// ------------------------------------------------------------
+static void TestMinifyPrefilter() {
+    Image checker(512, 512);
+    for (int y = 0; y < 512; ++y)
+        for (int x = 0; x < 512; ++x)
+            checker.surface().set(x, y, ((x / 2) + (y / 2)) % 2 ? Color::white() : Color::black());
+
+    // 理想：8×8 面积平均 → 均匀 50% 灰
+    Surface ref(64, 64);
+    for (int y = 0; y < 64; ++y)
+        for (int x = 0; x < 64; ++x) {
+            double acc = 0.0;
+            for (int dy = 0; dy < 8; ++dy)
+                for (int dx = 0; dx < 8; ++dx)
+                    acc += checker.surface().get(x * 8 + dx, y * 8 + dy).r / 255.0;
+            const uint8_t v = static_cast<uint8_t>(acc / 64.0 * 255.0 + 0.5);
+            ref.set(x, y, Color(v, v, v, 255));
+        }
+
+    Surface out(64, 64);
+    Canvas c(out);
+    c.clear(Color::black());
+    c.drawImage(checker, Rect(0, 0, 64, 64), Rect(0, 0, 1, 1), Color::white(),
+                ImageFilter::Linear);
+
+    double sumDiff = 0.0;
+    int maxDiff = 0;
+    for (int y = 0; y < 64; ++y)
+        for (int x = 0; x < 64; ++x) {
+            const int d = std::abs(static_cast<int>(out.get(x, y).r) - ref.get(x, y).r);
+            sumDiff += d;
+            maxDiff = std::max(maxDiff, d);
+        }
+    const double meanDiff = sumDiff / (64.0 * 64.0);
+    CHECK(meanDiff < 4.0, "raster: 8× 缩小的棋盘与理想盒式平均的平均偏差 < 4 级");
+    CHECK(maxDiff <= 8, "raster: 8× 缩小的棋盘不会出现整块翻转（最大偏差 ≤ 8 级）");
+    std::printf("  （平均偏差 %.2f 级，最大 %d 级）\n", meanDiff, maxDiff);
+    CHECK(checker.mipLevelCount() > 0, "raster: 缩小时真的生成了预缩小副本");
+
+    // 最近邻不参与预滤波：缩小后必须是"每块一个纹素"的硬棋盘（不糊）
+    Surface nearOut(64, 64);
+    Canvas c2(nearOut);
+    c2.clear(Color::black());
+    c2.drawImage(checker, Rect(0, 0, 64, 64), Rect(0, 0, 1, 1), Color::white(),
+                 ImageFilter::Nearest);
+    int extremes = 0;
+    for (int y = 0; y < 64; ++y)
+        for (int x = 0; x < 64; ++x) {
+            const uint8_t v = nearOut.get(x, y).r;
+            if (v <= 8 || v >= 247) ++extremes;
+        }
+    CHECK(extremes == 64 * 64, "raster: 最近邻缩小保持硬边（全部像素都是极值）");
+
+    // 1:1 画不受影响：逐像素等于原图
+    Image tile(32, 32);
+    for (int y = 0; y < 32; ++y)
+        for (int x = 0; x < 32; ++x)
+            tile.surface().set(x, y, Color::straight(static_cast<uint8_t>(x * 8),
+                                                     static_cast<uint8_t>(y * 8), 90,
+                                                     static_cast<uint8_t>(x * 8)));
+    Surface one(32, 32);
+    Canvas c3(one);
+    c3.drawImage(tile, Rect(0, 0, 32, 32));
+    int exact = 0;
+    for (int y = 0; y < 32; ++y)
+        for (int x = 0; x < 32; ++x) {
+            const Color a = tile.surface().get(x, y), b = one.get(x, y);
+            if (a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a) ++exact;
+        }
+    CHECK(exact == 32 * 32, "raster: 1:1 贴图逐像素精确（预滤波不介入）");
+}
+
+// ------------------------------------------------------------
+// 渐变抖动（0.4.0）：低 alpha 渐变在预乘 8 位下只有几级，
+// 抖动把量化误差摊到相邻像素 —— 判据是"每个色阶占几个像素"
+// ------------------------------------------------------------
+static Surface LowAlphaGradient(bool dither) {
+    Surface s(256, 64);
+    Canvas c(s);
+    c.clear(Color::argb(0xFFF0F2F5));
+    Paint p = Paint::linearAngle(Rect(0, 0, 256, 64), 90.0f, 0x14C86432, 0x146446C8);
+    p.dither = dither;
+    c.fillRect(Rect(0, 0, 256, 64), p);
+    return s;
+}
+
+// 一行里"连续相同值"的最长游程：色带有多宽
+static int LongestRun(const Surface& s, int row) {
+    int best = 1, run = 1;
+    for (int x = 1; x < s.width(); ++x) {
+        if (s.get(x, row).r == s.get(x - 1, row).r) {
+            ++run;
+            best = std::max(best, run);
+        } else {
+            run = 1;
+        }
+    }
+    return best;
+}
+
+static void TestGradientDither() {
+    const Surface off = LowAlphaGradient(false);
+    const Surface on = LowAlphaGradient(true);
+    const int row = 32;
+    const int runOff = LongestRun(off, row);
+    const int runOn = LongestRun(on, row);
+    // 256 px 走完约 9 级 → 不抖动时每级约 28 px 一片；抖动后同一片内会有明暗交替，
+    // 游程显著变短（色带被打散成网点）
+    CHECK(runOff >= 12, "raster: 不抖动的低 alpha 渐变色带宽（≥ 12 px）");
+    CHECK(runOn * 2 <= runOff, "raster: 打开抖动后色带被打散（游程 ≤ 不抖动的一半）");
+    std::printf("  （最长同值游程：不抖动 %d px，抖动 %d px）\n", runOff, runOn);
+
+    // 块平均后的"可见级数"：抖动应该明显更多（半级分辨率统计）
+    auto blockLevels = [](const Surface& s) {
+        std::vector<int> means;
+        for (int x0 = 0; x0 + 4 <= s.width(); x0 += 4) {
+            double acc = 0.0;
+            for (int dx = 0; dx < 4; ++dx) acc += s.get(x0 + dx, 32).r;
+            means.push_back(static_cast<int>(acc / 4.0 * 2.0 + 0.5));
+        }
+        std::sort(means.begin(), means.end());
+        means.erase(std::unique(means.begin(), means.end()), means.end());
+        return static_cast<int>(means.size());
+    };
+    const int lvOff = blockLevels(off), lvOn = blockLevels(on);
+    CHECK(lvOn > lvOff, "raster: 抖动把低 alpha 渐变的可见级数翻倍");
+    std::printf("  （4px 块平均后的级数：不抖动 %d，抖动 %d）\n", lvOff, lvOn);
+
+    // 抖动图样是 8×8、且只由**设备像素**决定：同一个 t 下，第 x 列与第 x+8 列必须逐位相同。
+    // 这条钉住"图样跟着屏幕走"（而不是跟着局部坐标漂移 —— 那样画面一动抖点会爬行）。
+    {
+        const Paint p = Paint::linearAngle(Rect(0, 0, 100, 100), 90.0f, 0x14C86432, 0x146446C8);
+        int same = 0, total = 0;
+        for (int y = 0; y < 8; ++y)
+            for (int x = 0; x < 56; ++x) {
+                const Color a = Paint::SampleStopsDithered(p.stops, 0.37f, x, y);
+                const Color b = Paint::SampleStopsDithered(p.stops, 0.37f, x + 8, y);
+                if (a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a) ++same;
+                ++total;
+            }
+        CHECK(same == total, "raster: 抖动图样周期为 8（每列与右边第 8 列逐位相同）");
+    }
+}
+
 int main() {
     TestExactRect();
     TestCircleArea();
     TestFillRule();
     TestStrokeWidth();
+    TestMinifyPrefilter();
+    TestGradientDither();
     return Bin2dTestSummary("test_raster");
 }

@@ -57,9 +57,15 @@ Paint image  = Paint::withImage(img, Rect(0, 0, 64, 64));
 
 Paint faded = FadePaint(grad, 0.5f);          // 单个形状折 alpha（组透明度要走图层）
 
+grad.dither = false;   // 关掉有序抖动（0.4.0 起默认开；关掉后渐变像素与 0.3.0 逐位相同）
+
 Shadow sh;
 sh.dx = 4; sh.dy = 10; sh.blur = 12; sh.color = Color::argb(0x77000000);
 ```
+
+> 渐变的抖动只在"每个色阶 ≥ 3 设备像素"时生效（色带肉眼可见的场合）：8×8 Bayer、
+> 量化前 ±0.5 级、图样钉在**设备像素**上。它把低 alpha 渐变的可见级数从 9 提到 17、
+> 色带宽度从 32 px 压到 12 px；代价是渐变填充约 +9% 时间。
 
 ## raster.h —— 光栅核心（一般由 Canvas 调）
 
@@ -138,6 +144,17 @@ uint64_t v = scene.version();   // 任何改动都要 scene.touch()；缓存阶�
 Image img = Image::generate(64, 64, [](int x, int y) { return Color::straight(r,g,b,a); });
 Color texel = img.sample(u, v, ImageFilter::Linear);   // UV 0..1，CLAMP
 ```
+
+缩小时的预滤波（0.4.0）：
+
+```cpp
+// "每个设备像素盖几个源纹素"：>1 就换用盒式预缩小过的副本，取样仍是双线性
+const Surface& src = img.sampleSurface(texelsPerPixel);
+img.mipLevelCount();   // 已经生成了几级（0 = 还没用到缩小）
+```
+
+`drawImage` / `DrawImage` 自动做这件事，调用方一般不用管；`nearest` 不参与
+（最近邻的语义是"给我那一个纹素"）。副本惰性生成，`img.surface()` 非 const 取用时作废。
 
 ## gpu.h —— binGPU 桥（可选）
 
