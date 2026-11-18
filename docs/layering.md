@@ -74,7 +74,7 @@ bin3d 没这个待遇（浮点光栅顺序不同，见它的 `roadmap.md` ②）
 
 | 故意不收 | 归谁 | 为什么 |
 |---|---|---|
-| 布局 / flex / 节点树遍历 | binUI | 与"画"正交；binUI 的 `binui_draw_nodes.h`（1788 行）就是这条线的实现 |
+| 布局 / flex / 节点树遍历 | binUI | 与"画"正交；binUI 的 `binui_draw_nodes.h`（1860 行）就是这条线的实现 |
 | 文本排版 / 字形图集 | binUI | 字形是几千个小位图，走 UI 的图集与 hinting；bin2d 只画它给的位图 |
 | 窗口 / 事件 / IME / 拖拽 | binUI 外壳 | bin2d 不碰 Win32 |
 | 设备 / 交换链 / present | binGPU | 见 binGPU `layering.md` §3 |
@@ -85,8 +85,8 @@ bin3d 没这个待遇（浮点光栅顺序不同，见它的 `roadmap.md` ②）
 
 ## 4. 和 UI 库的迁移台账（roadmap ② 的可执行版）
 
-binUI 现在自带一份"半成品 bin2d"：路径几何在 `include/binui_path.h`（1112 行），
-变换/绘制工具在 `binui_paint.h`，节点遍历在 `binui_draw_nodes.h`（1788 行）。
+binUI 现在自带一份"半成品 bin2d"：路径几何在 `include/binui_path.h`（1183 行），
+变换/绘制工具在 `binui_paint.h`，节点遍历在 `binui_draw_nodes.h`（1860 行）。
 
 | binUI 资产 | 行数 | 迁移后 |
 |---|---|---|

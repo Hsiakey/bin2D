@@ -3,6 +3,16 @@
 本文件记录 bin2d 的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.3] - 2026-11-18
+
+**只有文档**：订正 [`docs/layering.md`](docs/layering.md) 里的 binUI 行数（迁移台账引用的是
+旧数字）——`binui_path.h` 1112 → **1183** 行、`binui_draw_nodes.h` 1788 → **1860** 行。
+接口与像素行为一字未动（94 条断言、demo 图不变）。
+
+### 版本
+
+- `BIN2D_VERSION_PATCH` 2 → 3（`BIN2D_VERSION_STRING` = "0.1.3"）。
+
 ## [0.1.2] - 2026-11-18
 
 **只有文档**：新增 [`docs/layering.md`](docs/layering.md)，把"bin2d 在哪一层、和 binGPU / UI 库
@@ -18,7 +28,7 @@
   明确区分开。
 - **边界判据**：这段代码**认不认节点/布局/文本**？认 → 上层；不认 → bin2d。
 - **与 UI 库的迁移台账**（roadmap ② 的可执行版）：`binui_path.h`（1112 行）迁完即删、
-  `binui_paint.h` 与 bin2d 收敛成一份、`binui_draw_nodes.h`（1788 行）与字形图集留下；
+  `binui_paint.h` 与 bin2d 收敛成一份、`binui_draw_nodes.h`（1860 行）与字形图集留下；
   每步的删除条件 + 验收线（三端 0 diff、18 张 GDI 基准、单帧 ≤ 现实现 ×1.2）。
 - **GPU 阶段的真前置**：binGPU 得有能跑的真后端（VK/D3D11）并通过它自己的 P1；否则"GPU 合成"
   只是跑在 CPU 后端上的链路演示（现状就是）。
