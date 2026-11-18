@@ -267,4 +267,31 @@ bool RasterizeStrokeCoverage(const StrokeCoverageRequest& req, CoverageRect& out
 bool RasterizeStrokeCoverage(const std::vector<Polyline>& polys, const StrokeStyle& style,
                              const Rect& clip, int subSamples, CoverageRect& out);
 
+// ------------------------------------------------------------
+// 圆角模板覆盖率（0.7.0）：九宫格角片用的那张"圆角方块"覆盖率位图。
+//
+// 为什么这个也归 bin2d 管：宿主（binUI）的三个 GPU 后端各自写了一份一模一样的解析式
+// **有符号距离**覆盖率（30 行 × 3 份），再把结果当灰度纹理去 9 宫格拉伸 —— 三份代码只要
+// 有一份改了（边长、内缩、边界半像素的取舍），三端圆角就差一圈像素。这跟 P2 的填充/描边
+// 是同一类漂移，所以同样收口到这里。
+//
+// 尺寸：边长 = max(8, 2r+4)。形状铺满整张模板 [0,t]，于是圆弧的包围盒正好是 [0,r]，
+// 角片边长与弧长严格对应 —— 半径取到短边一半时四角才能无缝拼成圆/胶囊。
+// 覆盖率口径（与 binUI 三端 0.16 起的那份逐位相同）：
+//   · stroke=false：内部，边界处线性 1px 渐变（抗锯齿）；
+//   · stroke=true ：贴着**外侧边界往里** 1px 的实心带（骑在边界上会让白色焦点环发灰）。
+// 这是**有符号距离**的解析式，不是多边形光栅化 —— 别拿 RasterizeCoverage 拼圆角路径来顶，
+// 那会得到另一张模板（弧是折线、边缘是 8 条子采样），三端像素就不再相同了。
+// ------------------------------------------------------------
+constexpr int kRoundedTileMin = 8;
+
+inline int RoundedTileSize(int radius) {
+    const int r = radius > 0 ? radius : 1;
+    const int t = r * 2 + 4;
+    return t < kRoundedTileMin ? kRoundedTileMin : t;
+}
+
+// 导出一张 t×t 的覆盖率（t = RoundedTileSize(radius)；out.x0/y0 = 0，out.v 行优先）。
+bool RasterizeRoundedTileCoverage(int radius, bool stroke, CoverageRect& out);
+
 } // namespace bin2d

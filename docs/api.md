@@ -62,6 +62,28 @@ if (bin2d::RasterizeStrokeCoverage(req, cov)) { /* cov.at(x, y) ∈ [0,255] */ }
 `Fractional` —— 硬边描边没有意义（细长小面四舍五入等于丢形）。`subSamples` 默认
 `kSubSamples`，binUI 传 4 以与它自己的填充口径一致。
 
+## 圆角模板覆盖率（`RasterizeRoundedTileCoverage`，0.7.0）
+
+```cpp
+const int t = bin2d::RoundedTileSize(radius);   // max(8, 2r+4)
+bin2d::CoverageRect cov;
+if (bin2d::RasterizeRoundedTileCoverage(radius, /*stroke=*/false, cov)) {
+    // cov.w == cov.h == t；cov.v[i] 是 0..255 的覆盖率（行优先）
+    // 宿主的用法：把它当灰度纹理，按 9 宫格把四角各裁 t/2、中段取正中 1px 拉伸
+}
+```
+
+九宫格角片用的"圆角方块"位图。**有符号距离的解析式**，不是多边形光栅化 ——
+想要一张"折线圆弧 + 子采样"的覆盖率请走 `RasterizeCoverage`，那是另一张图。
+
+口径：
+
+| 参数 | 含义 |
+|---|---|
+| 形状范围 | 铺满整张模板 `[0,t]`（直边正好落在模板边界上），于是圆弧包围盒 = `[0,r]` |
+| `stroke=false` | 内部：边界处 0.5、往里 0.5px 满覆盖 → 1px 宽的抗锯齿过渡 |
+| `stroke=true` | 贴着外侧边界往里的 **1px 实心带**：`min(0.5-dist, dist+1.5)`。骑在边界上画会让靠内半个像素只剩 50%，白色焦点环会变成灰线 |
+
 ## core.h —— 基础类型
 
 ```cpp

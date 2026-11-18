@@ -1067,6 +1067,45 @@ bool RasterizeStrokeCoverage(const StrokeCoverageRequest& req, CoverageRect& out
     return RasterizeStrokeCoverage(polys, req.style, req.clip, req.subSamples, out);
 }
 
+// ------------------------------------------------------------
+// 圆角模板覆盖率（0.7.0）
+//
+// 有符号距离的解析式，不经过扫描线：这张模板是"圆角方块"的覆盖率位图，宿主要把它当
+// 灰度纹理去 9 宫格拉伸（角片只采样 [0,r] 那一块）。所以这里刻意**不**走 RasterizeCoverage
+// —— 那会给出一张"折线圆弧 + 8 条子采样"的覆盖率，和三端现在的模板不是同一张图。
+//
+// 边界口径：填充 `0.5 - dist`（dist 是到边界的距离，正 = 在外面），于是边界上正好 0.5、
+// 往内 0.5px 满覆盖 —— 这就是 1px 宽的抗锯齿过渡。描边把带子整体挪到内侧
+// （`min(0.5 - dist, dist + 1.5)`，即 dist ∈ (-1.5, 0.5)），否则环线骑在边界上、靠内的
+// 半个像素只有 50%，白色焦点环会画成灰线（binUI 0.16 实测 #858990）。
+// ------------------------------------------------------------
+bool RasterizeRoundedTileCoverage(int radius, bool stroke, CoverageRect& out) {
+    out.x0 = out.y0 = 0;
+    out.w = out.h = 0;
+    out.v.clear();
+    const int r = radius > 0 ? radius : 1;
+    const int t = RoundedTileSize(r);
+    out.w = t;
+    out.h = t;
+    out.v.assign(static_cast<size_t>(t) * static_cast<size_t>(t), 0);
+    const float half = static_cast<float>(t) / 2.0f;      // 形状半边长
+    const float inset = half - static_cast<float>(r);     // 直边段起点距中心
+    for (int i = 0; i < t; ++i) {
+        for (int j = 0; j < t; ++j) {
+            const float fx = std::fabs(static_cast<float>(j) + 0.5f - half) - inset;
+            const float fy = std::fabs(static_cast<float>(i) + 0.5f - half) - inset;
+            const float dx = fx > 0.0f ? fx : 0.0f;
+            const float dy = fy > 0.0f ? fy : 0.0f;
+            const float dist = std::sqrt(dx * dx + dy * dy) - static_cast<float>(r);
+            float cov = stroke ? std::min(0.5f - dist, dist + 1.5f) : 0.5f - dist;
+            cov = cov < 0.0f ? 0.0f : (cov > 1.0f ? 1.0f : cov);
+            out.v[static_cast<size_t>(i) * static_cast<size_t>(t) + static_cast<size_t>(j)] =
+                static_cast<uint8_t>(cov * 255.0f + 0.5f);
+        }
+    }
+    return true;
+}
+
 void FillPath(const RasterTarget& t, const Path& path, FillRule rule,
               const Paint& paint, const Transform& xf, float tolerancePx) {
     if (!t.valid() || path.empty()) return;

@@ -574,7 +574,110 @@ static void TestStrokeCoverage() {
     }
 }
 
+// ------------------------------------------------------------
+// 圆角模板覆盖率（RasterizeRoundedTileCoverage，0.7.0）
+//
+// 这张位图是"九宫格角片"的纹理，三端（GL/VK/D3D11）以前各写一份一模一样的解析式。
+// 所以本组测试的核心不是"形状像不像"，而是**与那三份逐字节相同** —— 迁移要能证明
+// "换了实现、像素一位没动"。
+// ------------------------------------------------------------
+static void TestRoundedTile() {
+    // ① 尺寸公式：max(8, 2r+4)
+    CHECK(RoundedTileSize(1) == 8 && RoundedTileSize(2) == 8 && RoundedTileSize(3) == 10,
+          "rounded tile: 边长 = max(8, 2r+4)");
+    CHECK(RoundedTileSize(10) == 24, "rounded tile: r=10 → 24x24");
+
+    // ② 填充：中心满覆盖、角上 0、边界处只有一档过渡
+    {
+        CoverageRect cov;
+        const bool ok = RasterizeRoundedTileCoverage(10, false, cov);
+        CHECK(ok && cov.w == 24 && cov.h == 24 && cov.x0 == 0 && cov.y0 == 0,
+              "rounded tile: 导出矩形 = t×t、原点 0");
+        CHECK(cov.at(12, 12) == 255, "rounded tile: 中心满覆盖");
+        CHECK(cov.at(0, 0) == 0 && cov.at(23, 0) == 0 && cov.at(0, 23) == 0,
+              "rounded tile: 四角在圆外");
+        CHECK(cov.at(12, 0) == 255 && cov.at(0, 12) == 255,
+              "rounded tile: 直边中点满覆盖（形状铺满整张模板）");
+        // 抗锯齿的宽度：整张模板里"半覆盖"的像素只应该分布在边界那一圈（≈ 1px 宽），
+        // 所以总数远小于面积；同时必须 > 0（圆角上一定有落在弧线中间的像素）。
+        // 注意直边正好落在模板边界上（形状铺满 [0,t]），所以只有圆角那一段有半覆盖像素。
+        int partials = 0;
+        bool mono = true;
+        int prev = 256;
+        for (int x = 12; x >= 0; --x) {          // 中心行：直边，覆盖率应恒为 255
+            const int c = cov.at(x, 12);
+            if (c > prev) mono = false;
+            prev = c;
+        }
+        for (int y = 0; y < cov.h; ++y)
+            for (int x = 0; x < cov.w; ++x) {
+                const int c = cov.at(x, y);
+                if (c > 0 && c < 255) partials++;
+            }
+        CHECK(mono && cov.at(0, 12) == 255, "rounded tile: 中心行是直边（整行满覆盖）");
+        CHECK(partials > 0 && partials <= 8 * cov.w,
+              "rounded tile: 半覆盖像素集中在边界那一圈（≈1px 宽的抗锯齿）");
+        std::printf("  （r=10 的模板里半覆盖像素 %d 个，面积 %d）\n", partials, cov.w * cov.h);
+    }
+
+    // ③ 描边：内部空、带子贴在内侧（外侧边界上不该有半覆盖的灰）
+    {
+        CoverageRect cov;
+        RasterizeRoundedTileCoverage(10, true, cov);
+        CHECK(cov.at(12, 12) == 0, "rounded tile: 描边模板内部为空");
+        CHECK(cov.at(12, 0) == 255 && cov.at(0, 12) == 255,
+              "rounded tile: 描边带在直边上满覆盖（贴着边界往里 1px）");
+        CHECK(cov.at(0, 0) == 0, "rounded tile: 描边模板的角上仍然为空");
+        // 直边段 = [r, t-r)：这一段上整行都是满覆盖的带子
+        bool straightFull = true;
+        for (int x = 10; x < cov.w - 10; ++x)
+            if (cov.at(x, 0) != 255) straightFull = false;
+        CHECK(straightFull, "rounded tile: 直边段整条都是满覆盖的带子（两端只剩圆角）");
+    }
+
+    // ④ 与三端旧实现逐字节相同（参考实现 = binUI 0.16~0.22 里那三段一模一样的循环）
+    {
+        auto reference = [](int radius, bool stroke, std::vector<uint8_t>& out) {
+            const int r = std::max(1, radius);
+            const int t = std::max(8, r * 2 + 4);
+            out.assign(static_cast<size_t>(t) * static_cast<size_t>(t), 0);
+            const float half = static_cast<float>(t) / 2.0f;
+            const float inset = half - static_cast<float>(r);
+            for (int i = 0; i < t; i++) {
+                for (int j = 0; j < t; j++) {
+                    const float fx = std::fabs(static_cast<float>(j) + 0.5f - half) - inset;
+                    const float fy = std::fabs(static_cast<float>(i) + 0.5f - half) - inset;
+                    const float dx = fx > 0 ? fx : 0.0f;
+                    const float dy = fy > 0 ? fy : 0.0f;
+                    const float dist = std::sqrt(dx * dx + dy * dy) - static_cast<float>(r);
+                    float cov = stroke ? std::min(0.5f - dist, dist + 1.5f) : 0.5f - dist;
+                    cov = cov < 0.0f ? 0.0f : (cov > 1.0f ? 1.0f : cov);
+                    out[static_cast<size_t>(i) * t + j] =
+                        static_cast<uint8_t>(cov * 255.0f + 0.5f);
+                }
+            }
+            return t;
+        };
+        int worst = 0;
+        for (int r = 1; r <= 40; r++) {
+            for (int s = 0; s < 2; s++) {
+                std::vector<uint8_t> ref;
+                const int t = reference(r, s != 0, ref);
+                CoverageRect cov;
+                RasterizeRoundedTileCoverage(r, s != 0, cov);
+                if (cov.w != t) { worst = 999; break; }
+                for (size_t k = 0; k < ref.size(); k++)
+                    worst = std::max(worst, std::abs(int(ref[k]) - int(cov.v[k])));
+            }
+            if (worst == 999) break;
+        }
+        CHECK(worst == 0, "rounded tile: 与三端旧实现逐字节相同（r=1..40，填充+描边）");
+        std::printf("  （r=1..40 × {填充,描边} 与旧实现最大差 %d 级）\n", worst);
+    }
+}
+
 int main() {
+    TestRoundedTile();
     TestStrokeCoverage();
     TestCoverageQuery();
     TestExactRect();
