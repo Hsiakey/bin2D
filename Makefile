@@ -56,7 +56,7 @@ endif
 
 TESTS := $(TEST_DIR)/test_geometry$(EXT) $(TEST_DIR)/test_raster$(EXT) \
          $(TEST_DIR)/test_composite$(EXT) $(TEST_DIR)/test_scene$(EXT) \
-         $(TEST_DIR)/test_filter$(EXT) $(TEST_DIR)/test_image$(EXT) \
+         $(TEST_DIR)/test_filter$(EXT) $(TEST_DIR)/test_image$(EXT) $(TEST_DIR)/test_cache$(EXT) \
          $(TEST_DIR)/test_png$(EXT) $(GPU_TEST)
 DEMO  := $(OUT_DIR)/bin2d-demo$(EXT)
 BENCH := $(OUT_DIR)/bin2d-bench$(EXT)

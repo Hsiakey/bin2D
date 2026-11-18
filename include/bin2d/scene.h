@@ -17,7 +17,9 @@
 // ============================================================
 
 #include <cstdint>
+#include <cstring>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "bin2d/canvas.h"
@@ -30,6 +32,31 @@
 #include "bin2d/transform.h"
 
 namespace bin2d {
+
+// ------------------------------------------------------------
+// 内容版本号的哈希（0.9.0 的子树缓存判断"这块内容变没变"）
+//
+// 为什么用"混合哈希"而不是记一个全局脏标记：缓存要按**组**失效 —— 改了第 3 张
+// 卡片的文字，另外 39 个组不该重画。每个节点带自己的 version，组的版本号由
+// 子树混合而成；改一个叶子只让祖先的哈希变，兄弟节点不受影响。
+//
+// 注意：哈希只覆盖"框架字段"（transform / opacity / blend / clip / shadow / 子节点指针）
+// 和每个节点的 version()。Shape 的 path/paint 是公开字段、没有迭代器可哈希，
+// 所以**改了形状几何或颜料之后必须调用 item.touch()** —— 与 Scene::version()
+// 从 0.1 起就有的约定完全一致（"任何改动都叫一次 touch"）。
+// ------------------------------------------------------------
+namespace detail {
+inline uint64_t HashMix(uint64_t h, uint64_t v) {
+    h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    return h;
+}
+inline uint64_t HashFloat(float f) {
+    uint32_t u = 0;
+    std::memcpy(&u, &f, sizeof(u));
+    return u;
+}
+inline uint64_t HashU64(uint64_t v) { return v; }
+} // namespace detail
 
 // ------------------------------------------------------------
 // 节点基类
@@ -56,12 +83,49 @@ public:
     virtual Rect localBounds() const = 0;
     virtual void draw(Canvas& canvas) const = 0;
 
+    // 内容版本号（0.9.0）：改完任何影响像素的字段后调用 touch()。
+    // 子树缓存（SceneCache）靠它判断"这个组能不能直接贴上一帧的位图"。
+    uint64_t version() const { return version_; }
+    void touch() { ++version_; }
+
+    // 本节点 + 子树的内容版本（框架字段 + 每个节点的 version() 混合而成）。
+    // Group 覆盖它把子节点混进来；Shape 的 path/paint 靠 touch() 表达。
+    virtual uint64_t contentVersion() const {
+        using namespace detail;
+        uint64_t h = 0xCBF29CE484222325ull;
+        h = HashMix(h, version_);
+        h = HashMix(h, HashFloat(transform.a));
+        h = HashMix(h, HashFloat(transform.b));
+        h = HashMix(h, HashFloat(transform.c));
+        h = HashMix(h, HashFloat(transform.d));
+        h = HashMix(h, HashFloat(transform.e));
+        h = HashMix(h, HashFloat(transform.f));
+        h = HashMix(h, HashFloat(opacity));
+        h = HashMix(h, visible ? 1u : 0u);
+        h = HashMix(h, static_cast<uint64_t>(blend));
+        h = HashMix(h, hasClip ? 1u : 0u);
+        h = HashMix(h, hasClipRect ? 1u : 0u);
+        h = HashMix(h, HashFloat(clipRect.x));
+        h = HashMix(h, HashFloat(clipRect.y));
+        h = HashMix(h, HashFloat(clipRect.w));
+        h = HashMix(h, HashFloat(clipRect.h));
+        h = HashMix(h, shadow.visible() ? 1u : 0u);
+        h = HashMix(h, HashFloat(shadow.dx));
+        h = HashMix(h, HashFloat(shadow.dy));
+        h = HashMix(h, HashFloat(shadow.blur));
+        h = HashMix(h, static_cast<uint64_t>(shadow.color.toArgbStraight()));
+        return h;
+    }
+
     // 把当前节点的 transform/裁剪应用到画布上（子类进来第一件事就是调它）
     void applyState(Canvas& canvas) const {
         canvas.concat(transform);
         if (hasClipRect) canvas.clipRect(clipRect);
         if (hasClip && !clip.empty()) canvas.clipPath(clip);
     }
+
+private:
+    uint64_t version_ = 1;
 };
 
 // ------------------------------------------------------------
@@ -147,8 +211,22 @@ public:
         children.push_back(std::move(item));
         return *children.back();
     }
-    void clearChildren() { children.clear(); }
+    void clearChildren() {
+        children.clear();
+        touch();
+    }
     size_t childCount() const { return children.size(); }
+
+    uint64_t contentVersion() const override {
+        using namespace detail;
+        uint64_t h = SceneItem::contentVersion();
+        h = HashMix(h, children.size());
+        for (const auto& ch : children) {
+            h = HashMix(h, reinterpret_cast<uintptr_t>(ch.get()));
+            if (ch) h = HashMix(h, ch->contentVersion());
+        }
+        return h;
+    }
 
     Rect localBounds() const override {
         bool first = true;
@@ -198,6 +276,61 @@ public:
 };
 
 // ------------------------------------------------------------
+// 子树缓存（0.9.0）
+//
+// 缓存粒度 = **组**（不是节点）：一张卡片 5 个图元，逐个缓存 5 张位图既费内存又
+// 省不下合成；整组一张位图才划算。这也是 roadmap ⑤ 里"缓存粒度按图层不按节点"。
+//
+// 只缓存"能直接当位图贴回"的组：组自身 opacity=1、blend=SrcOver、没有裁剪/投影、
+// 至少 2 个子节点、设备面积 >= minGroupArea。别的组直接走原来的绘制路径 ——
+// 缓存只允许替换**同语义**的那条路径，绝不"为了缓存改渲染语义"。
+//
+// 版本契约（重要）：改 Shape 的 path/paint 之后必须 item.touch()；框架字段
+// （transform/opacity/blend/clip/shadow/子节点表）会自动参与哈希，不用手动 touch。
+// ------------------------------------------------------------
+class SceneCache {
+public:
+    struct Stats {
+        int groups_total = 0;   // 本帧遇到的"可缓存组"数
+        int hits = 0;           // 直接贴上一帧位图的
+        int misses = 0;         // 重画并重新缓存的
+        int entries = 0;        // 当前常驻的缓存条目
+        size_t bytes = 0;       // 常驻缓存位图总量
+    };
+
+    // 可缓存组的最小设备面积（像素²）。太小的话贴一张位图的采样成本 >= 直接画。
+    int minGroupArea = 4096;
+
+    void clear();
+    const Stats& stats() const { return stats_; }
+    Stats& stats() { return stats_; }
+    bool empty() const { return entries_.empty(); }
+
+    // ---- 以下给 Scene::drawCached 的内部实现用（不属于稳定 API）----
+    struct Entry {
+        Surface surface;
+        int ox = 0, oy = 0;
+        int w = 0, h = 0;
+        uint64_t version = 0;
+        uint64_t stamp = 0;   // 最近一次被访问的帧号（用来淘汰没再出现的组）
+    };
+    void BeginFrame();
+    void EndFrame();
+    uint64_t frame() const { return frame_; }
+    Entry* Find(const void* key) {
+        auto it = entries_.find(key);
+        return it == entries_.end() ? nullptr : &it->second;
+    }
+    Entry& Insert(const void* key) { return entries_[key]; }
+    void Erase(const void* key);
+
+private:
+    std::unordered_map<const void*, Entry> entries_;
+    Stats stats_;
+    uint64_t frame_ = 0;
+};
+
+// ------------------------------------------------------------
 // 场景
 // ------------------------------------------------------------
 class Scene {
@@ -227,6 +360,10 @@ public:
         root_.draw(canvas);
     }
     void drawOnto(Canvas& canvas) const { root_.draw(canvas); }
+
+    // 带子树缓存地渲染（0.9.0）。像素必须与 draw() 逐像素相同（tests/test_cache.cpp）。
+    // 根组的 opacity<1 或 blend!=SrcOver 时退化成 draw()（根层的合成语义不在缓存范围内）。
+    void drawCached(Surface& target, SceneCache& cache) const;
 
 private:
     Size size_;

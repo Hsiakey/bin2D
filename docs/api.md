@@ -222,7 +222,18 @@ scene.root().add(std::move(group));
 Surface out(660, 470);
 scene.draw(out);            // 与 Canvas 直接画逐像素相同（tests/test_scene.cpp 保证）
 uint64_t v = scene.version();   // 任何改动都要 scene.touch()；缓存阶段的判断依据
+
+// 0.9.0：按组缓存。命中时贴上一帧的位图，像素与 draw() 逐像素相同
+SceneCache cache;
+scene.drawCached(out, cache);
+cache.stats();              // groups_total / hits / misses / entries / bytes
+item->touch();              // 改完 Shape 的 path/paint/stroke 后必须调（框架字段不用）
 ```
+
+> **缓存契约**：框架字段（transform / opacity / blend / clip / shadow / 子节点表）自动参与
+> 内容哈希；Shape 的 `path` / `paint` / `stroke` 是不可哈希的公开字段，改完必须 `touch()`。
+> 只缓存 `opacity=1`、`blend=SrcOver`、无裁剪/投影、≥2 个子节点、设备面积 ≥
+> `SceneCache::minGroupArea`（默认 4096 px²）的组；其余走原路径。
 
 ## image.h —— 位图素材
 

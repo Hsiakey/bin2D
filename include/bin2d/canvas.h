@@ -124,6 +124,20 @@ public:
     void popLayer();
     int layerDepth() const { return static_cast<int>(layers_.size()); }
 
+    // ---- 离屏内容（0.9.0：Scene 的子树缓存用）----
+    // 与 pushLayer/popLayer 同一套坐标与裁剪语义，区别只在出口：
+    //   pushOffscreen 吃掉接下来的绘制，popOffscreen 把内容**交出来**（不合成）。
+    // 调用方拿到 (surface, originX, originY) 之后可以自己决定什么时候、按什么
+    // 不透明度/混合模式贴回去（缓存就是"上一帧已经贴过一次了"）。
+    bool pushOffscreen(const Rect& localBounds);
+    bool popOffscreen(Surface& out, int& originX, int& originY);
+
+    // 把一张已经算好的内容图按"图层合成"语义贴回当前目标：
+    // opacity 乘在内容上、blend 是这次合成的模式 —— 与 popLayer 的出口逐位相同
+    // （popLayer 内部就调它，所以不存在"两条合成路径慢慢漂移"）。
+    void compositeSurface(const Surface& surface, int originX, int originY, float opacity,
+                          BlendMode blend);
+
     // 当前绘制目标上"设备像素矩形"：图层里是层内的局部像素（含原点偏移）
     Rect deviceClip() const { return state().clipRect; }
 

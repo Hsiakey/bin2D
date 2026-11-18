@@ -82,4 +82,138 @@ void Shape::DrawOwnShadow(Canvas& canvas) const {
     canvas.blendCoverageMask(mask.data(), w, h, devX, devY, sh.color);
 }
 
+// ============================================================
+// 子树缓存（0.9.0）
+//
+// 缓存粒度是**组**：一张卡片 5 个图元，逐个缓存既费内存又省不下合成，整组一张
+// 位图才划算（roadmap ⑤ 的"粒度按图层不按节点"）。命中时把那一位图贴回去，
+// 像素与"重新画一遍子树"逐像素相同 —— 这条由 tests/test_cache.cpp 钉死。
+//
+// 只缓存"能直接当位图贴回"的组（见 CacheableGroup）：组自身 opacity=1、blend=SrcOver、
+// 无裁剪/投影。其余组走原路径 —— 缓存只替换**同语义**的路径，不许为了缓存改渲染语义。
+// ============================================================
+
+namespace {
+
+bool CacheableGroup(const Group& g, int minArea) {
+    if (!g.visible || g.opacity < 1.0f || g.blend != BlendMode::SrcOver) return false;
+    if (g.hasClip || g.hasClipRect || g.shadow.visible()) return false;
+    if (g.children.size() < 2) return false;
+    const Rect b = g.localBounds();
+    return b.w * b.h >= static_cast<float>(minArea);
+}
+
+void DrawGroupCached(Group& g, Canvas& canvas, SceneCache& cache) {
+    const Rect localB = g.localBounds();
+    const Transform devXf = canvas.transform() * g.transform;
+    const Rect dev = devXf.mapBounds(localB).snappedOut();
+    if (dev.empty()) return;
+    const int dx = static_cast<int>(dev.x), dy = static_cast<int>(dev.y);
+    const int dw = static_cast<int>(dev.w), dh = static_cast<int>(dev.h);
+    const uint64_t ver = g.contentVersion();
+
+    ++cache.stats().groups_total;
+    SceneCache::Entry* hitEntry = cache.Find(&g);
+    if (hitEntry && hitEntry->version == ver && hitEntry->w == dw && hitEntry->h == dh) {
+        hitEntry->stamp = cache.frame();
+        ++cache.stats().hits;
+        canvas.save();
+        canvas.setTransform(Transform::identity());
+        canvas.drawSurface(hitEntry->surface,
+                           Rect(static_cast<float>(dx), static_cast<float>(dy),
+                                static_cast<float>(dw), static_cast<float>(dh)));
+        canvas.restore();
+        return;
+    }
+    ++cache.stats().misses;
+
+    canvas.save();
+    g.applyState(canvas);
+    Surface content;
+    int ox = 0, oy = 0;
+    bool rendered = false;
+    if (canvas.pushOffscreen(localB)) {
+        for (const auto& ch : g.children)
+            if (ch) ch->draw(canvas);
+        rendered = canvas.popOffscreen(content, ox, oy);
+    }
+    canvas.restore();   // 回到父坐标系（popOffscreen 已把目标/原点还原）
+
+    if (!rendered) return;   // 完全被裁掉：什么都不画，也不进缓存（下次同样廉价）
+
+    SceneCache::Entry& slot = hitEntry ? *hitEntry : cache.Insert(&g);
+    slot.surface = std::move(content);
+    slot.ox = ox;
+    slot.oy = oy;
+    slot.w = dw;
+    slot.h = dh;
+    slot.version = ver;
+    slot.stamp = cache.frame();
+
+    canvas.save();
+    canvas.setTransform(Transform::identity());
+    canvas.drawSurface(slot.surface,
+                       Rect(static_cast<float>(ox), static_cast<float>(oy),
+                            static_cast<float>(slot.surface.width()),
+                            static_cast<float>(slot.surface.height())));
+    canvas.restore();
+}
+
+} // namespace
+
+void SceneCache::clear() {
+    entries_.clear();
+    stats_ = Stats{};
+    frame_ = 0;
+}
+
+void SceneCache::BeginFrame() {
+    ++frame_;
+    stats_.groups_total = 0;
+    stats_.hits = 0;
+    stats_.misses = 0;
+}
+
+void SceneCache::EndFrame() {
+    // 淘汰"这一帧没再出现"的组（被删掉的子树），否则缓存会永久占着内存
+    for (auto it = entries_.begin(); it != entries_.end();) {
+        if (it->second.stamp != frame_) {
+            it = entries_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    size_t bytes = 0;
+    for (const auto& kv : entries_) bytes += kv.second.surface.byteSize();
+    stats_.entries = static_cast<int>(entries_.size());
+    stats_.bytes = bytes;
+}
+
+void SceneCache::Erase(const void* key) { entries_.erase(key); }
+
+void Scene::drawCached(Surface& target, SceneCache& cache) const {
+    // 根组自身的 opacity/blend 需要"整棵树一层"的合成语义，不在缓存范围内：直接退化。
+    if (root_.opacity < 1.0f || root_.blend != BlendMode::SrcOver) {
+        cache.clear();
+        draw(target);
+        return;
+    }
+    Canvas canvas(target);
+    canvas.clear(background);
+    cache.BeginFrame();
+    canvas.save();
+    root_.applyState(canvas);
+    for (const auto& ch : root_.children) {
+        if (!ch || !ch->visible || ch->opacity <= 0.0f) continue;
+        Group* g = dynamic_cast<Group*>(ch.get());
+        if (g && CacheableGroup(*g, cache.minGroupArea)) {
+            DrawGroupCached(*g, canvas, cache);
+        } else {
+            ch->draw(canvas);
+        }
+    }
+    canvas.restore();
+    cache.EndFrame();
+}
+
 } // namespace bin2d

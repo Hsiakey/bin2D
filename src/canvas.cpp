@@ -254,6 +254,21 @@ bool Canvas::pushLayer(const Rect& localBounds, float opacity, BlendMode blend) 
     return true;
 }
 
+void Canvas::compositeSurface(const Surface& surface, int originX, int originY, float opacity,
+                              BlendMode blend) {
+    if (!target_ || surface.empty() || opacity <= 0.0f) return;
+    RasterTarget rt;
+    rt.surface = target_;
+    rt.clip = target_->bounds();
+    rt.mask = nullptr;              // 层外已经有了自己的裁剪：层已按裁剪尺寸分配
+    rt.blend = blend;
+    const Rect dstRect(static_cast<float>(originX), static_cast<float>(originY),
+                       static_cast<float>(surface.width()),
+                       static_cast<float>(surface.height()));
+    const Color tint = Color::white() * opacity;
+    DrawSurface(rt, surface, dstRect, Rect(0, 0, 1, 1), tint, false, Transform::identity());
+}
+
 void Canvas::popLayer() {
     if (layers_.empty()) return;
     std::unique_ptr<Layer> layerPtr = std::move(layers_.back());
@@ -275,17 +290,34 @@ void Canvas::popLayer() {
     if (!target_ || layer.surface.empty()) return;
 
     // 合成：层内容整体乘 opacity（预乘空间就是纯乘法），再按层的混合模式压到父目标
-    const Rect dstRect(static_cast<float>(layer.originX), static_cast<float>(layer.originY),
-                       static_cast<float>(layer.surface.width()),
-                       static_cast<float>(layer.surface.height()));
-    RasterTarget rt;
-    rt.surface = target_;
-    rt.clip = target_->bounds();
-    rt.mask = nullptr;              // 层外已经有了自己的裁剪：层已按裁剪尺寸分配
-    rt.blend = layer.blend;
-    const Rect srcUv(0, 0, 1, 1);
-    const Color tint = Color::white() * layer.opacity;
-    DrawSurface(rt, layer.surface, dstRect, srcUv, tint, false, Transform::identity());
+    compositeSurface(layer.surface, layer.originX, layer.originY, layer.opacity, layer.blend);
+}
+
+// 离屏内容：入层语义与 pushLayer 相同（opacity=1、SrcOver），只是出层时不合成
+bool Canvas::pushOffscreen(const Rect& localBounds) {
+    return pushLayer(localBounds, 1.0f, BlendMode::SrcOver);
+}
+
+bool Canvas::popOffscreen(Surface& out, int& originX, int& originY) {
+    if (layers_.empty()) return false;
+    std::unique_ptr<Layer> layerPtr = std::move(layers_.back());
+    layers_.pop_back();
+    Layer& layer = *layerPtr;
+    if (stack_.size() > layer.stackMark) stack_.resize(layer.stackMark);
+    if (stack_.empty()) return false;
+
+    target_ = layers_.empty() ? baseTarget_ : &layers_.back()->surface;
+    if (!layers_.empty()) {
+        originX_ = layers_.back()->originX;
+        originY_ = layers_.back()->originY;
+    } else {
+        originX_ = 0;
+        originY_ = 0;
+    }
+    originX = layer.originX;
+    originY = layer.originY;
+    out = std::move(layer.surface);
+    return !out.empty();
 }
 
 } // namespace bin2d

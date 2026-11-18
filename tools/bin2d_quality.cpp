@@ -23,6 +23,9 @@
 
 #include "bin2d/canvas.h"
 #include "bin2d/filter.h"
+#include "bin2d/scene.h"
+
+#include <memory>
 #include "bin2d/image.h"
 #include "bin2d/paint.h"
 #include "bin2d/png.h"
@@ -470,6 +473,52 @@ void MeasureFiltersShadowNine()
     }
 }
 
+// ------------------------------------------------------------
+// 7) 子树缓存（0.9.0）：1280×720、40 张卡片（每张 5 个图元）的两种画法
+//
+// 这是 roadmap ⑤ 的开工判据的实测：全量重绘多少 ms、命中缓存后多少 ms。
+// 缓存只改变"重画的数量"，像素由 tests/test_cache.cpp 逐像素钉死。
+// ------------------------------------------------------------
+void MeasureSceneCache() {
+    Scene scene(1280, 720);
+    scene.setBackground(Color::argb(0xFF10141A));
+    for (int i = 0; i < 40; ++i) {
+        auto g = std::make_unique<Group>();
+        g->transform = Transform::translate(24.0f + (i % 8) * 154.0f, 24.0f + (i / 8) * 136.0f);
+        const Rect card(0, 0, 140, 118);
+        auto add = [&](const Rect& r, float radius, const Paint& paint) {
+            auto s2 = std::make_unique<Shape>();
+            s2->path.addRoundedRect(r, radius);
+            s2->paint = paint;
+            g->add(std::move(s2));
+        };
+        add(card, 12.0f, Paint::linearAngle(card, 35.0f, 0xFF22303F, 0xFF1A2430));
+        add(Rect(12, 12, 40, 40), 10.0f, Paint::solid(Color::argb(0xFF3E8BFF)));
+        add(Rect(62, 16, 66, 9), 4.0f, Paint::solid(Color::argb(0xFF8FA3B8)));
+        add(Rect(62, 32, 48, 9), 4.0f, Paint::solid(Color::argb(0xFF8FA3B8)));
+        add(Rect(12, 66, 116, 38), 8.0f,
+            Paint::linearAngle(Rect(12, 66, 116, 38), 10.0f, 0xFF2FBF9A, 0xFF1E8F74));
+        scene.root().add(std::move(g));
+    }
+    Surface target(1280, 720);
+    const int frames = 20;
+    const auto bench = [&](auto&& fn) {
+        fn();   // 预热（首次会分配缓冲）
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < frames; ++i) fn();
+        const auto t1 = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(t1 - t0).count() / frames;
+    };
+    const double uncached = bench([&] { scene.draw(target); });
+    SceneCache cache;
+    const double cached = bench([&] { scene.drawCached(target, cache); });
+    std::printf("[缓存] 1280x720 / 40 组 / 200 个图元：全量 %.2f ms（%.0f fps） → 缓存命中 %.2f ms（%.0f fps） = %.1f×\n",
+                uncached, 1000.0 / uncached, cached, 1000.0 / cached, uncached / cached);
+    std::printf("[缓存] 命中 %d/%d，常驻 %zu KB（%d 条）\n", cache.stats().hits,
+                cache.stats().groups_total, cache.stats().bytes / 1024, cache.stats().entries);
+    Save(target, "quality_cache.png");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -480,6 +529,7 @@ int main(int argc, char** argv) {
     MeasureStroke();
     MeasureGpuParity();
     MeasureFiltersShadowNine();
+    MeasureSceneCache();
     std::printf("图已写到 %s\n", g_dir.c_str());
     return 0;
 }
