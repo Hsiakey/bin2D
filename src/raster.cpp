@@ -134,11 +134,18 @@ void RasterPolys(const std::vector<Polyline>& polys, FillRule rule, bool unionMo
     std::sort(edges.begin(), edges.end(),
               [](const Edge& a, const Edge& b) { return a.ymin < b.ymin; });
 
+    // 交叉点数组：每条子扫描线按"边下标顺序"重建后插入排序。
+    // （试过跨子扫描线保持上一次的 x 顺序、把插入排序喂成近有序：实测覆盖率开销
+    //  7.34 → 7.48 ms，没有收益，反而多两份下标状态 —— 因为这里真正的花销是
+    //  "每条子扫描线给每条活动边算一次 x"，不是排序。所以没留。）
     std::vector<Crossing> xs;
     xs.reserve(edges.size());
     std::vector<int> active;
     active.reserve(edges.size());
+    // rowAcc = 每行的"端像素小数覆盖率"；rowDelta = 整像素段的差分（前缀和还原）。
+    // 二者只在**被碰到的列**上读写，行尾按 touched 区间清回 0 —— 见 0.4.2 的性能轮。
     std::vector<float> rowAcc(static_cast<size_t>(w), 0.0f);
+    std::vector<float> rowDelta(static_cast<size_t>(w), 0.0f);
     size_t nextEdge = 0;
 
     for (int yy = 0; yy < h; ++yy) {
@@ -159,7 +166,10 @@ void RasterPolys(const std::vector<Polyline>& polys, FillRule rule, bool unionMo
         if (active.empty()) continue;
 
         float* dstRow = cover.row(yy);
-        bool any = false;
+        // 本行被写过的列区间（含右端那个"取消项"列）：行内 8 条子扫描线共用，
+        // 前缀和只在 [tLo,tHi] 上跑一遍，不再整行遍历
+        int tLo = w;
+        int tHi = -1;
 
         for (int sub = 0; sub < kSubSamples; ++sub) {
             const float sy = rowTop + (static_cast<float>(sub) + 0.5f) * subStep;
@@ -182,8 +192,20 @@ void RasterPolys(const std::vector<Polyline>& polys, FillRule rule, bool unionMo
                 }
                 xs[j] = key;
             }
-
-            // 把 [xa,xb] 区间按像素小数部分累进本行覆盖率
+            // 把 [xa,xb] 区间按像素小数部分累进本行覆盖率。
+            //
+            // 0.4.2：整像素段原来是"逐像素 += subWeight"的循环（一个 120px 宽的行，
+            // 每条子扫描线要走一遍 120 次加法）。现在改成差分：两端各写一次
+            // +subWeight / -subWeight，行尾用一次前缀和还原。加法次序变了，
+            // 但浮点结果在端像素之外**恰好等于** 8 × 1/8 = 1.0（0.125 是二进制精确值）。
+            //
+            // touched 区间必须同时盖住"最后一个落覆盖率的列"(ib-1) 和"取消项所在的列"(ib)：
+            // 漏掉 ib 会让 rowDelta 留下没被清零的残值，污染下一行。
+            auto note = [&](int xiLo, int xiHi) {
+                if (xiLo < tLo) tLo = xiLo;
+                const int hiCol = xiHi < w ? xiHi : w - 1;
+                if (hiCol > tHi) tHi = hiCol;
+            };
             auto addSpan = [&](float xa, float xb) {
                 if (xb <= xa) return;
                 const float minX = static_cast<float>(baseX);
@@ -193,34 +215,27 @@ void RasterPolys(const std::vector<Polyline>& polys, FillRule rule, bool unionMo
                 if (hi <= lo) return;
                 const int ia = static_cast<int>(std::floor(lo));
                 const int ib = static_cast<int>(std::floor(hi));
+                const int xiA = ia - baseX;
+                const int xiB = ib - baseX;
                 if (ia == ib) {
-                    const int xi = ia - baseX;
-                    if (xi >= 0 && xi < w) rowAcc[static_cast<size_t>(xi)] += (hi - lo) * subWeight;
-                    any = true;
+                    if (xiA >= 0 && xiA < w) {
+                        rowAcc[static_cast<size_t>(xiA)] += (hi - lo) * subWeight;
+                        note(xiA, xiA);
+                    }
                     return;
                 }
+                note(xiA, xiB);
                 // 左端的不完整像素
-                {
-                    const int xi = ia - baseX;
-                    if (xi >= 0 && xi < w)
-                        rowAcc[static_cast<size_t>(xi)] +=
-                            (static_cast<float>(ia + 1) - lo) * subWeight;
-                }
-                // 中间整像素段：一次加法（循环能被向量化成 4~8 像素一批）
-                const int firstFull = ia + 1;
-                const int lastFull = ib - 1;
-                if (lastFull >= firstFull) {
-                    float* p = rowAcc.data() + static_cast<size_t>(firstFull - baseX);
-                    const int n = lastFull - firstFull + 1;
-                    for (int k = 0; k < n; ++k) p[k] += subWeight;
-                }
+                if (xiA >= 0 && xiA < w)
+                    rowAcc[static_cast<size_t>(xiA)] +=
+                        (static_cast<float>(ia + 1) - lo) * subWeight;
+                // 中间整像素段 [ia+1, ib-1]：差分，一次加减代替整段循环
+                if (xiA + 1 < w) rowDelta[static_cast<size_t>(xiA + 1)] += subWeight;
+                if (xiB < w) rowDelta[static_cast<size_t>(xiB)] -= subWeight;
                 // 右端的不完整像素
                 const float rightFrac = hi - static_cast<float>(ib);
-                if (rightFrac > 0.0f) {
-                    const int xi = ib - baseX;
-                    if (xi >= 0 && xi < w) rowAcc[static_cast<size_t>(xi)] += rightFrac * subWeight;
-                }
-                any = true;
+                if (rightFrac > 0.0f && xiB >= 0 && xiB < w)
+                    rowAcc[static_cast<size_t>(xiB)] += rightFrac * subWeight;
             };
 
             if (rule == FillRule::EvenOdd) {
@@ -234,18 +249,20 @@ void RasterPolys(const std::vector<Polyline>& polys, FillRule rule, bool unionMo
             }
         }
 
-        if (!any) continue;
-        for (int xi = 0; xi < w; ++xi) {
-            const float c = rowAcc[static_cast<size_t>(xi)];
-            rowAcc[static_cast<size_t>(xi)] = 0.0f;
+        if (tHi < tLo) continue;
+        // 前缀和 + 落覆盖率：只在 [tLo,tHi] 上，顺带把两个累加器清回 0。
+        // 每个像素最多收到 8 × 1/8，min(1,c) 一次就够，省掉原来整行的二次 clamp。
+        float run = 0.0f;
+        for (int xi = tLo; xi <= tHi; ++xi) {
+            const size_t k = static_cast<size_t>(xi);
+            run += rowDelta[k];
+            const float c = rowAcc[k] + run;
+            rowAcc[k] = 0.0f;
+            rowDelta[k] = 0.0f;
             if (c <= 0.0f) continue;
             const float cl = c > 1.0f ? 1.0f : c;
             if (unionMode) dstRow[xi] = std::max(dstRow[xi], cl);
             else dstRow[xi] += cl;
-        }
-        if (!unionMode) {
-            for (int xi = 0; xi < w; ++xi)
-                if (dstRow[xi] > 1.0f) dstRow[xi] = 1.0f;
         }
     }
 }
