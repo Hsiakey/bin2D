@@ -3,6 +3,58 @@
 本文件记录 bin2d 的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0] - 2026-11-18
+
+**GPU 路径从"证明链路通"变成"真能合成一帧"**：一帧 N 个图层、一次回读、五种混合模式
+与 CPU 逐像素对齐（4 个后端实测最大通道差 **1**，且四个后端彼此完全相同）。顺带**修掉
+CPU 侧两个混合模式的 bug** —— 它们是做对齐时被抓出来的，不修就没法对齐。
+
+### Added
+
+- **`GpuCompositor`（`include/bin2d/gpu.h`）**：多图层合成器。
+  - `compose(layers, n, out)`：**一个回合**合成 N 层（一次 `frame_begin/frame_end` +
+    一次 `frame_read`），而不是每层各一个回合。
+  - **合批**：相邻图层只要"纹理 + 混合模式 + 采样器"相同就并进同一次 `draw_quads`。
+    `Stats{layers, draws, quads, textureBinds}` 把这件事变成**数字**：
+    8 个同纹理同模式的层 → `draws == 1`；交替五种模式 → `draws == 5`。
+  - **纹理池**：`acquire/upload/recycle/purgePool`，按 (宽,高,用途) 分桶复用；
+    `upload(tex, surface, box)` 只传脏矩形。静态图层可以一直躺在显存里。
+  - **离屏渲染目标**：`acquireTarget/composeTo/readTarget` —— 合成结果留在显存里接下一层
+    （图层套图层不落 CPU 内存），`waitIdle()` 等 GPU 真的画完（基准/截图必须调）。
+  - `ToBgpuBlend(BlendMode)`：bin2d 与 bingpu 的混合模式映射放在**一处**。两边枚举值
+    顺序不同（bin2d 的 Erase=2/Keep=3，bingpu 是 KEEP=2/ERASE=3），直接强转会把
+    "擦除"和"保留"对调 —— 第一版就是这么错的，靠五模式合成对齐测试抓到（`draws` 都对、
+    像素差 154）。
+- `tools/bin2d_bench_gpu.cpp` + `make bench-gpu`：1280×720 / 16 层的**三条路线**对比
+  （CPU 合成 / GPU 每帧上传 / GPU 纹理常驻），以及"合到离屏目标"和"+ 每帧回读"两档。
+  数字见 [docs/perf.md](docs/perf.md)。
+
+### Fixed（CPU 侧，`src/raster.cpp`）
+
+1. **`RasterTarget::blend` 被两条快路径无视**：`DrawSurface` 的"1:1 平移"和"轴对齐缩放"
+   两条路径都把混合模式写死成 `SrcOver`（只有旋转/斜切那条用了 `t.blend`）。
+   后果：`Canvas::popLayer` 的图层合成**永远**是 `SrcOver` —— 组的 `Replace/Erase/Keep/
+   Additive` 一个都不生效，而且不会红任何测试（`test_composite` 那五个手算用例走的是
+   `fillRect`，不是图层合成）。现在两条快路径都按混合模式分派一次（模板参数），
+   `SrcOver` 逐位不变。
+2. **`a == 0` 的源像素一律跳过**，但 `Replace` 要写透明（清掉目标）、`Keep` 要乘 0（也清 0）。
+   判据原来散落在 `BlendPixel` 的分支里，现在统一成 `ZeroAlphaMatters(mode)` 一条，
+   所有落像素路径（`BlendOne` / 三条行实现 / `DrawSurface` 三条路径）都问它。
+3. **`nearest=true` 在轴对齐路径下没生效**（查表双线性照样插值）—— 放大镜/像素图会糊。
+
+### 验收
+
+- `tests/test_composite.cpp` 20 → **30** 项：新增"组混合模式 = 直接按该模式合成"（5 种，
+  逐像素 0 差）与"全透明层在 5 种模式下该不该清目标"。
+- `tests/test_gpu_bridge.cpp` 3 → **15** 项：五模式多图层合成（CPU / VK / D3D11 / GL
+  各一遍）、合批次数、纹理池复用、脏矩形上传、跳过规则、渲染目标套层、`composeOne`
+  与老桥一致。全部通过；不可用的后端打印原因跳过。
+- `make test` = 32 + 14 + 30 + 9 + 16 + 15 = **116 项断言**，0 失败。
+
+### 版本
+
+- `BIN2D_VERSION_MINOR` 2 → 3（`BIN2D_VERSION_STRING` = "0.3.0"）；`CMakeLists.txt` 同步。
+
 ## [0.2.0] - 2026-11-18
 
 **GPU 桥可以点名后端了**，并且顺手当了 binGPU 的一次真验收：同一份 `Surface` 过

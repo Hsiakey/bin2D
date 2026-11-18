@@ -111,8 +111,86 @@ static void TestNestedLayers() {
     CHECK_NEAR(static_cast<int>(s.get(60, 60).r), 128, 3, "composite: 外层自己的内容只乘一次组透明度");
 }
 
-static void TestClipRect() {
-    Surface s(50, 50);
+// 组混合模式：pushLayer 的 blend 必须真的生效。
+// 权威口径 = "把整块层内容按该模式合到同一个底上"（RasterTarget + DrawSurface），
+// 这条以前是坏的：DrawSurface 的 1:1 快路径把混合模式写死成 SrcOver，
+// 于是 Replace/Erase/Keep/Additive 在图层合成时全部退化成 SrcOver（0.3.0 修）。
+static void TestLayerBlendModes() {
+    const BlendMode modes[] = {BlendMode::SrcOver, BlendMode::Replace, BlendMode::Erase,
+                               BlendMode::Keep, BlendMode::Additive};
+    const char* names[] = {"SrcOver", "Replace", "Erase", "Keep", "Additive"};
+
+    // 层内容：左半不透明、右半半透明、中间带一整列**全透明**孔（零 alpha 的坑就在这里）
+    Surface layer(20, 20);
+    for (int y = 0; y < 20; ++y) {
+        for (int x = 0; x < 20; ++x) {
+            if (x == 9 || x == 10) continue;                       // 全透明孔
+            const uint8_t a = (x < 9) ? 255 : 110;
+            layer.set(x, y, Color::straight(static_cast<uint8_t>(40 + x * 8),
+                                           static_cast<uint8_t>(200 - y * 5), 90, a));
+        }
+    }
+
+    for (int i = 0; i < 5; ++i) {
+        const Color bg = Color::argb(0xFF204060);
+        // ① 权威：直接按模式合成
+        Surface direct(40, 40);
+        direct.clear(bg);
+        {
+            RasterTarget rt;
+            rt.surface = &direct;
+            rt.clip = direct.bounds();
+            rt.blend = modes[i];
+            DrawSurface(rt, layer, Rect(10, 10, 20, 20), Rect(0, 0, 1, 1), Color::white(),
+                        false, Transform::identity());
+        }
+        // ② 经 Canvas 图层（popLayer 的合成路径）
+        Surface via(40, 40);
+        via.clear(bg);
+        {
+            Canvas c(via);
+            if (c.pushLayer(Rect(10, 10, 20, 20), 1.0f, modes[i])) {
+                c.drawSurface(layer, Rect(10, 10, 20, 20));
+                c.popLayer();
+            }
+        }
+        int diff = 0;
+        for (int y = 0; y < 40; ++y)
+            for (int x = 0; x < 40; ++x) {
+                const Color a = direct.get(x, y), b = via.get(x, y);
+                diff = std::max(diff, std::abs(a.r - b.r));
+                diff = std::max(diff, std::abs(a.g - b.g));
+                diff = std::max(diff, std::abs(a.b - b.b));
+                diff = std::max(diff, std::abs(a.a - b.a));
+            }
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "composite: 组混合模式 %s 与直接合成逐像素相同", names[i]);
+        CHECK(diff == 0, msg);
+        if (diff != 0) std::printf("  最大通道差 %d\n", diff);
+    }
+
+    // 零 alpha 的两种模式必须**落笔**（把底清成透明），其余三种是真·空操作
+    for (int i = 0; i < 5; ++i) {
+        Surface s(4, 4);
+        s.clear(Color::argb(0xFF204060));
+        RasterTarget rt;
+        rt.surface = &s;
+        rt.clip = s.bounds();
+        rt.blend = modes[i];
+        DrawSurface(rt, Surface(2, 2), Rect(0, 0, 2, 2), Rect(0, 0, 1, 1), Color::white(),
+                    false, Transform::identity());
+        const bool shouldClear = (modes[i] == BlendMode::Replace || modes[i] == BlendMode::Keep);
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "composite: 全透明层在 %s 下%s", names[i],
+                      shouldClear ? "清空目标" : "不动目标");
+        if (shouldClear)
+            CHECK(s.get(0, 0).a == 0 && s.get(1, 1).a == 0, msg);
+        else
+            CHECK(s.get(0, 0).a == 255, msg);
+    }
+}
+
+static void TestClipRect() {    Surface s(50, 50);
     Canvas canvas(s);
     canvas.clear(Color::black());
     canvas.clipRect(Rect(10, 10, 20, 20));
@@ -126,6 +204,7 @@ int main() {
     TestGroupOpacity();
     TestPathClip();
     TestNestedLayers();
+    TestLayerBlendModes();
     TestClipRect();
     return Bin2dTestSummary("test_composite");
 }

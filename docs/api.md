@@ -152,3 +152,38 @@ bool ok = RenderViaGpu(src, out, &err);   // 一次性往返
 
 > 桥只 include `bingpu.h`（C 头），不 include binGPU 源码；`libbingpu.a` 不存在时
 > 这一层不进库（`make gpu-syntax` 仍做语法检查）。
+
+### 多图层合成器（0.3.0）
+
+```cpp
+GpuCompositor comp;
+if (!comp.create(1280, 720, BGPU_BACKEND_AUTO)) return;   // 不可用 → 退回 CPU 合成
+
+// ① 纹理池：静态图层只传一次，之后一直躺在显存里
+BgpuTexture bg = comp.acquire(1280, 720);
+comp.upload(bg, backdrop);                 // 预乘 Surface → 直通上传（后端再预乘）
+comp.upload(card, cardSurface, dirtyRect); // 只传脏矩形
+
+// ② 一帧 N 层：一次 frame_begin/frame_end + 一次回读
+GpuCompositor::Layer layers[2] = {};
+layers[0] = {bg,   Rect(0, 0, 1280, 720), Rect(0,0,1,1), Color::white(),          BlendMode::Replace,   ImageFilter::Linear};
+layers[1] = {card, Rect(40, 40, 320, 240), Rect(0,0,1,1), Color::white() * 0.6f,  BlendMode::SrcOver,  ImageFilter::Linear};
+Surface out;
+comp.compose(layers, 2, out);
+
+// ③ 不想每帧回读？合成到离屏目标，下一层直接当纹理用（图层套图层不落 CPU 内存）
+BgpuTexture group = comp.acquireTarget(1280, 720);
+comp.composeTo(layers, 2, group);
+comp.waitIdle();                    // 基准/截图前必须调；正常渲染别调
+comp.readTarget(group, out);        // 真要 CPU 侧像素时
+
+comp.stats();                       // {layers, draws, quads, textureBinds}：合批有没有生效
+comp.recycle(bg); comp.recycle(card); comp.recycle(group);
+```
+
+语义（与 CPU 逐像素对齐的唯一定义）：图层目标矩形内**每个**像素都参与混合，
+`src = 纹理采样（预乘）× tint（预乘）`，再按 `blend` 与底色合成 —— 不像 `Surface::blit`
+那样跳过 alpha==0 的源像素（`Replace`/`Keep` 下"跳过"和"写透明"不等价）。
+
+`ToBgpuBlend(mode)` 是两侧混合模式的唯一映射点：**枚举值顺序不同**（bin2d 的
+`Erase=2/Keep=3`，bingpu 是 `KEEP=2/ERASE=3`），不要强转。

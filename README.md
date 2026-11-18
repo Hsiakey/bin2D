@@ -2,7 +2,7 @@
 
 **C++17 的 2D 绘制核**：路径光栅化 + 覆盖率抗锯齿 + 变换/裁剪/图层/混合模式 + 场景图。
 纯 CPU、无第三方依赖、输出预乘 RGBA8 位图；可选出图（自带极小 PNG 编码器）与
-binGPU 桥（GPU 往返验证）。
+binGPU 桥（往返验证 + **多图层 GPU 合成**）。
 
 ## 是什么
 
@@ -25,10 +25,10 @@ binGPU 桥（GPU 往返验证）。
 ```
 include/bin2d/   core.h surface.h transform.h png.h           地基（类型/位图/矩阵/PNG）
                  paint.h path.h raster.h canvas.h scene.h      绘制
-                 image.h gpu.h                                 素材 / binGPU 桥
+                 image.h gpu.h                                 素材 / binGPU 桥（往返 + 合成器）
 src/             raster.cpp canvas.cpp scene.cpp gpu.cpp      实现
 tests/           test_geometry/raster/composite/scene/png[_gpu_bridge].cpp
-tools/           bin2d_demo.cpp                               能力展示图
+tools/           bin2d_demo.cpp bin2d_bench.cpp bin2d_bench_gpu.cpp  演示 / 基准
 docs/            architecture.md api.md roadmap.md
 ```
 
@@ -46,6 +46,7 @@ MinGW / GCC / Clang，`-std=c++17`：
 make all       # 库 + 测试 + 演示（零警告）
 make test      # 跑全部测试，失败非 0 退出
 make demo      # 出图：build-mingw/out/bin2d-demo.png
+make bench-gpu # 图层合成基准（CPU / GPU 每帧上传 / GPU 纹理常驻；要显卡）
 make layers    # 层边界检查
 make clean
 ```
@@ -69,6 +70,13 @@ ctest --test-dir build --output-on-failure
 见 [docs/roadmap.md](docs/roadmap.md)；**边界与分工线**（和 binGPU / UI 库各管什么、迁移台账）
 见 [docs/layering.md](docs/layering.md)。
 
-**0.1.2（2026-11-18）**：只有文档（`docs/layering.md`），接口与像素行为不变。
+**0.2.0（2026-11-18）**：GPU 桥可以点名后端（CPU / Vulkan / D3D11 / GL），四个后端往返
+最大通道差 **0**。
+
+**0.3.0（2026-11-18）**：多图层合成器 GpuCompositor —— 一帧一次回读、相邻图层合批
+（8 层同纹理 → 1 次绘制）、纹理池 + 脏矩形上传、离屏渲染目标（图层套图层不落 CPU 内存）、
+五种混合模式与 CPU 逐像素对齐（4 个后端最大通道差 1，且四端彼此完全相同）。
+顺带修掉 CPU 侧两个混合模式 bug（DrawSurface 快路径无视 lend、==0 一律跳过）。
+116 项断言全绿。合成基准见 [docs/perf.md](docs/perf.md)。
 
 ![能力展示](docs/img/bin2d-demo.png)

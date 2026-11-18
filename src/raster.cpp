@@ -300,7 +300,8 @@ Color SamplePaint(const Paint& paint, float lx, float ly) {
 // 逐通道混合。Div255 与 (x+127)/255 在 [0,65025] 上逐值相等（穷举验证过）。
 template <BlendMode M>
 inline void BlendOne(uint8_t* d, const Color& src) {
-    if (src.a == 0) return;
+    // Replace/Keep 在 src.a==0 时仍然要落笔（清成透明），其余三种是真·空操作
+    if (src.a == 0 && !ZeroAlphaMatters(M)) return;
     switch (M) {
     case BlendMode::SrcOver: {
         if (src.a >= 255) { d[0] = src.r; d[1] = src.g; d[2] = src.b; d[3] = 255; return; }
@@ -355,7 +356,7 @@ inline void RowSolid(uint8_t* dstRow, const float* cov, const float* mask, int x
         }
         if (alphaScale != 1.0f) c *= alphaScale;
         if (c <= 0.0f) continue;
-        if (color.a == 0) continue;
+        if (color.a == 0 && !ZeroAlphaMatters(M)) continue;
         // 内部像素覆盖率恰好是 1（整像素段），省掉 4 次通道乘法；
         // `color * 1.0f` 本来就返回原值，所以这里逐位等价
         if (c >= 1.0f) {
@@ -391,7 +392,7 @@ inline void RowLinear(uint8_t* dstRow, const float* cov, const float* mask, int 
         float t = ((lx + baseX) * ax + (ly + baseY) * ay) * invLen2;
         t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
         const Color src0 = Paint::SampleStops(paint.stops, t);
-        if (src0.a == 0) continue;
+        if (src0.a == 0 && !ZeroAlphaMatters(M)) continue;
         if (c >= 1.0f) BlendOne<M>(dstRow + static_cast<size_t>(px) * 4, src0);
         else BlendOne<M>(dstRow + static_cast<size_t>(px) * 4, src0 * c);
     }
@@ -413,7 +414,7 @@ inline void RowGeneric(uint8_t* dstRow, const float* cov, const float* mask, int
         if (c <= 0.0f) continue;
         const Point lp = invXf.map(static_cast<float>(px) + 0.5f, rowY);
         const Color src0 = SamplePaint(paint, lp.x, lp.y);
-        if (src0.a == 0) continue;
+        if (src0.a == 0 && !ZeroAlphaMatters(M)) continue;
         const Color src = src0 * (c > 1.0f ? 1.0f : c);
         BlendOne<M>(dstRow + static_cast<size_t>(px) * 4, src);
     }
@@ -794,30 +795,37 @@ void DrawSurface(const RasterTarget& t, const Surface& image, const Rect& dstLoc
         const int dx = static_cast<int>(std::lround(devRect.x));
         const int dy = static_cast<int>(std::lround(devRect.y));
         const bool plainTint = tint.r == 255 && tint.g == 255 && tint.b == 255 && tint.a == 255;
-        for (int py = y0; py < y1; ++py) {
-            const int sy = py - dy;
-            if (sy < 0 || sy >= sh) continue;
-            const uint8_t* s = image.row(sy);
-            uint8_t* d = dst.row(py);
-            for (int px = x0; px < x1; ++px) {
-                const int sx = px - dx;
-                if (sx < 0 || sx >= sw) continue;
-                const uint8_t* sp = s + static_cast<size_t>(sx) * 4;
-                uint8_t* dp = d + static_cast<size_t>(px) * 4;
-                uint8_t r = sp[0], g = sp[1], b = sp[2], a = sp[3];
-                if (!plainTint) {
-                    r = Div255(static_cast<uint32_t>(r) * tint.r);
-                    g = Div255(static_cast<uint32_t>(g) * tint.g);
-                    b = Div255(static_cast<uint32_t>(b) * tint.b);
-                    a = Div255(static_cast<uint32_t>(a) * tint.a);
+        // 混合模式按整次绘制分派一次（不是逐像素 switch）：模板参数让编译器把
+        // 五个分支各自编成一条行内循环，与原来写死 SrcOver 的那份逐位相同。
+        auto blit = [&](auto modeTag) {
+            constexpr BlendMode M = decltype(modeTag)::value;
+            for (int py = y0; py < y1; ++py) {
+                const int sy = py - dy;
+                if (sy < 0 || sy >= sh) continue;
+                const uint8_t* s = image.row(sy);
+                uint8_t* d = dst.row(py);
+                for (int px = x0; px < x1; ++px) {
+                    const int sx = px - dx;
+                    if (sx < 0 || sx >= sw) continue;
+                    const uint8_t* sp = s + static_cast<size_t>(sx) * 4;
+                    uint8_t* dp = d + static_cast<size_t>(px) * 4;
+                    Color c(sp[0], sp[1], sp[2], sp[3]);
+                    if (!plainTint) {
+                        c = Color(Div255(static_cast<uint32_t>(c.r) * tint.r),
+                                  Div255(static_cast<uint32_t>(c.g) * tint.g),
+                                  Div255(static_cast<uint32_t>(c.b) * tint.b),
+                                  Div255(static_cast<uint32_t>(c.a) * tint.a));
+                    }
+                    BlendOne<M>(dp, c);
                 }
-                if (a == 0) continue;
-                const uint32_t ia = 255u - a;
-                dp[0] = static_cast<uint8_t>(r + Div255(static_cast<uint32_t>(dp[0]) * ia));
-                dp[1] = static_cast<uint8_t>(g + Div255(static_cast<uint32_t>(dp[1]) * ia));
-                dp[2] = static_cast<uint8_t>(b + Div255(static_cast<uint32_t>(dp[2]) * ia));
-                dp[3] = static_cast<uint8_t>(a + Div255(static_cast<uint32_t>(dp[3]) * ia));
             }
+        };
+        switch (t.blend) {
+        case BlendMode::SrcOver: blit(std::integral_constant<BlendMode, BlendMode::SrcOver>{}); break;
+        case BlendMode::Replace: blit(std::integral_constant<BlendMode, BlendMode::Replace>{}); break;
+        case BlendMode::Erase: blit(std::integral_constant<BlendMode, BlendMode::Erase>{}); break;
+        case BlendMode::Keep: blit(std::integral_constant<BlendMode, BlendMode::Keep>{}); break;
+        case BlendMode::Additive: blit(std::integral_constant<BlendMode, BlendMode::Additive>{}); break;
         }
         return;
     }
@@ -834,6 +842,16 @@ void DrawSurface(const RasterTarget& t, const Surface& image, const Rect& dstLoc
             const float u = srcUv.x + ((lx - dstLocal.x) / dstLocal.w) * srcUv.w;
             const float cu = u < 0.0f ? 0.0f : (u > 1.0f ? 1.0f : u);
             const float fx = cu * static_cast<float>(sw - 1);
+            if (nearest) {
+                // 最近邻：只取一个纹素。取整口径必须与 SampleSurface 一致
+                // （round(fx)，不是 floor），否则"放大镜"放大后差半像素。
+                const int n = static_cast<int>(fx + 0.5f);
+                const int c = n < 0 ? 0 : (n >= sw ? sw - 1 : n);
+                ix0[static_cast<size_t>(i)] = c;
+                ix1[static_cast<size_t>(i)] = c;
+                wx[static_cast<size_t>(i)] = 0.0f;
+                continue;
+            }
             const int base = static_cast<int>(std::floor(fx));
             ix0[static_cast<size_t>(i)] = base < 0 ? 0 : (base >= sw ? sw - 1 : base);
             const int next = base + 1;
@@ -845,65 +863,83 @@ void DrawSurface(const RasterTarget& t, const Surface& image, const Rect& dstLoc
         const bool plainTint = tint.r == 255 && tint.g == 255 && tint.b == 255 && tint.a == 255;
         const Rect inner(x0 + 1.0f, y0 + 1.0f, static_cast<float>(spanW) - 2.0f,
                          static_cast<float>(y1 - y0) - 2.0f);
-        for (int py = y0; py < y1; ++py) {
-            const float ly = (static_cast<float>(py) + 0.5f - xf.f) * invD;
-            const float v = srcUv.y + ((ly - dstLocal.y) / dstLocal.h) * srcUv.h;
-            const float cv = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-            const float fy = cv * static_cast<float>(sh - 1);
-            const int by = static_cast<int>(std::floor(fy));
-            const int ry0 = by < 0 ? 0 : (by >= sh ? sh - 1 : by);
-            const int ry1 = (by + 1) < 0 ? 0 : ((by + 1) >= sh ? sh - 1 : (by + 1));
-            const float tyy = fy - static_cast<float>(by);
-            const bool interiorRow = (static_cast<float>(py) >= inner.y &&
-                                      static_cast<float>(py) < inner.bottom());
-            uint8_t* drow = dst.row(py);
-            for (int i = 0; i < spanW; ++i) {
-                const int px = x0 + i;
-                float cov;
-                if (interiorRow && static_cast<float>(px) >= inner.x &&
-                    static_cast<float>(px) < inner.right()) {
-                    cov = 1.0f;
-                } else {
-                    cov = RectCoverage(devRect, px, py);
-                    if (cov <= 0.0f) continue;
+        // 同 ①：混合模式按整次绘制分派一次，模板参数把这五个分支各编成一条行内循环
+        auto scan = [&](auto modeTag) {
+            constexpr BlendMode M = decltype(modeTag)::value;
+            for (int py = y0; py < y1; ++py) {
+                const float ly = (static_cast<float>(py) + 0.5f - xf.f) * invD;
+                const float v = srcUv.y + ((ly - dstLocal.y) / dstLocal.h) * srcUv.h;
+                const float cv = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+                const float fy = cv * static_cast<float>(sh - 1);
+                int by = static_cast<int>(std::floor(fy));
+                int ry0 = by < 0 ? 0 : (by >= sh ? sh - 1 : by);
+                int ry1 = (by + 1) < 0 ? 0 : ((by + 1) >= sh ? sh - 1 : (by + 1));
+                float tyy = fy - static_cast<float>(by);
+                if (nearest) {   // 同横向：纵向也只取一个纹素（口径 = SampleSurface）
+                    const int ny = static_cast<int>(fy + 0.5f);
+                    ry0 = ny < 0 ? 0 : (ny >= sh ? sh - 1 : ny);
+                    ry1 = ry0;
+                    tyy = 0.0f;
+                    by = ry0;
                 }
-                const uint8_t* s0 = srcRows + static_cast<size_t>(ry0) * static_cast<size_t>(stride);
-                const uint8_t* s1 = srcRows + static_cast<size_t>(ry1) * static_cast<size_t>(stride);
-                if (t.mask) {
-                    cov *= t.mask[static_cast<size_t>(py) * static_cast<size_t>(dw) +
-                                  static_cast<size_t>(px)];
-                    if (cov <= 0.0f) continue;
+                const bool interiorRow = (static_cast<float>(py) >= inner.y &&
+                                          static_cast<float>(py) < inner.bottom());
+                uint8_t* drow = dst.row(py);
+                for (int i = 0; i < spanW; ++i) {
+                    const int px = x0 + i;
+                    float cov;
+                    if (interiorRow && static_cast<float>(px) >= inner.x &&
+                        static_cast<float>(px) < inner.right()) {
+                        cov = 1.0f;
+                    } else {
+                        cov = RectCoverage(devRect, px, py);
+                        if (cov <= 0.0f) continue;
+                    }
+                    const uint8_t* s0 = srcRows + static_cast<size_t>(ry0) * static_cast<size_t>(stride);
+                    const uint8_t* s1 = srcRows + static_cast<size_t>(ry1) * static_cast<size_t>(stride);
+                    if (t.mask) {
+                        cov *= t.mask[static_cast<size_t>(py) * static_cast<size_t>(dw) +
+                                      static_cast<size_t>(px)];
+                        if (cov <= 0.0f) continue;
+                    }
+                    const int a0 = ix0[static_cast<size_t>(i)] * 4;
+                    const int a1 = ix1[static_cast<size_t>(i)] * 4;
+                    const float txw = wx[static_cast<size_t>(i)];
+                    // 与 core.h 的 lerp() 完全相同的两步取整（先横向再纵向、每步四舍五入），
+                    // 这样查表版与原来的 SampleSurface 逐值一致，不是"更平滑但不一样"
+                    auto lerp8 = [txw](uint8_t p0, uint8_t p1) {
+                        const float f = static_cast<float>(p0) +
+                                        (static_cast<float>(p1) - static_cast<float>(p0)) * txw;
+                        return static_cast<uint8_t>(f + 0.5f);
+                    };
+                    auto lerpY = [tyy](uint8_t p0, uint8_t p1) {
+                        const float f = static_cast<float>(p0) +
+                                        (static_cast<float>(p1) - static_cast<float>(p0)) * tyy;
+                        return static_cast<uint8_t>(f + 0.5f);
+                    };
+                    const uint8_t c0 = lerpY(lerp8(s0[a0], s0[a1]), lerp8(s1[a0], s1[a1]));
+                    const uint8_t c1 = lerpY(lerp8(s0[a0 + 1], s0[a1 + 1]), lerp8(s1[a0 + 1], s1[a1 + 1]));
+                    const uint8_t c2 = lerpY(lerp8(s0[a0 + 2], s0[a1 + 2]), lerp8(s1[a0 + 2], s1[a1 + 2]));
+                    const uint8_t c3 = lerpY(lerp8(s0[a0 + 3], s0[a1 + 3]), lerp8(s1[a0 + 3], s1[a1 + 3]));
+                    Color c(c0, c1, c2, c3);
+                    if (!plainTint) {
+                        c = Color(Div255(static_cast<uint32_t>(c.r) * tint.r),
+                                  Div255(static_cast<uint32_t>(c.g) * tint.g),
+                                  Div255(static_cast<uint32_t>(c.b) * tint.b),
+                                  Div255(static_cast<uint32_t>(c.a) * tint.a));
+                    }
+                    // a==0 要不要落笔由 BlendOne 判（Replace/Keep 必须写透明）
+                    c = c * (cov > 1.0f ? 1.0f : cov);
+                    BlendOne<M>(drow + static_cast<size_t>(px) * 4, c);
                 }
-                const int a0 = ix0[static_cast<size_t>(i)] * 4;
-                const int a1 = ix1[static_cast<size_t>(i)] * 4;
-                const float txw = wx[static_cast<size_t>(i)];
-                // 与 core.h 的 lerp() 完全相同的两步取整（先横向再纵向、每步四舍五入），
-                // 这样查表版与原来的 SampleSurface 逐值一致，不是"更平滑但不一样"
-                auto lerp8 = [txw](uint8_t p0, uint8_t p1) {
-                    const float f = static_cast<float>(p0) +
-                                    (static_cast<float>(p1) - static_cast<float>(p0)) * txw;
-                    return static_cast<uint8_t>(f + 0.5f);
-                };
-                auto lerpY = [tyy](uint8_t p0, uint8_t p1) {
-                    const float f = static_cast<float>(p0) +
-                                    (static_cast<float>(p1) - static_cast<float>(p0)) * tyy;
-                    return static_cast<uint8_t>(f + 0.5f);
-                };
-                const uint8_t c0 = lerpY(lerp8(s0[a0], s0[a1]), lerp8(s1[a0], s1[a1]));
-                const uint8_t c1 = lerpY(lerp8(s0[a0 + 1], s0[a1 + 1]), lerp8(s1[a0 + 1], s1[a1 + 1]));
-                const uint8_t c2 = lerpY(lerp8(s0[a0 + 2], s0[a1 + 2]), lerp8(s1[a0 + 2], s1[a1 + 2]));
-                const uint8_t c3 = lerpY(lerp8(s0[a0 + 3], s0[a1 + 3]), lerp8(s1[a0 + 3], s1[a1 + 3]));
-                Color c(c0, c1, c2, c3);
-                if (!plainTint) {
-                    c = Color(Div255(static_cast<uint32_t>(c.r) * tint.r),
-                              Div255(static_cast<uint32_t>(c.g) * tint.g),
-                              Div255(static_cast<uint32_t>(c.b) * tint.b),
-                              Div255(static_cast<uint32_t>(c.a) * tint.a));
-                }
-                if (c.a == 0) continue;
-                c = c * (cov > 1.0f ? 1.0f : cov);
-                BlendOne<BlendMode::SrcOver>(drow + static_cast<size_t>(px) * 4, c);
             }
+        };
+        switch (t.blend) {
+        case BlendMode::SrcOver: scan(std::integral_constant<BlendMode, BlendMode::SrcOver>{}); break;
+        case BlendMode::Replace: scan(std::integral_constant<BlendMode, BlendMode::Replace>{}); break;
+        case BlendMode::Erase: scan(std::integral_constant<BlendMode, BlendMode::Erase>{}); break;
+        case BlendMode::Keep: scan(std::integral_constant<BlendMode, BlendMode::Keep>{}); break;
+        case BlendMode::Additive: scan(std::integral_constant<BlendMode, BlendMode::Additive>{}); break;
         }
         return;
     }
@@ -940,7 +976,7 @@ void DrawSurface(const RasterTarget& t, const Surface& image, const Rect& dstLoc
                       Div255(static_cast<uint32_t>(c.g) * tint.g),
                       Div255(static_cast<uint32_t>(c.b) * tint.b),
                       Div255(static_cast<uint32_t>(c.a) * tint.a));
-            if (c.a == 0) continue;
+            // 同 ①②：a==0 要不要落笔交给混合模式（BlendPixel 自己会判）
             c = c * (cov > 1.0f ? 1.0f : cov);
             const Color out = BlendPixel(dst.get(px, py), c, t.blend);
             dst.set(px, py, out);

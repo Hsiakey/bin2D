@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(bin2D VERSION 0.2.0 LANGUAGES CXX)
+project(bin2D VERSION 0.3.0 LANGUAGES CXX)
 
 # bin2d 是纯 C++17 的 2D 绘制核：无第三方依赖。
 # GPU 桥（src/gpu.cpp）可选 —— 只有定义了 BIN2D_BINGPU_DIR 且能找到 bingpu.h 时才编。
@@ -51,6 +51,8 @@ if (BIN2D_BINGPU_DIR AND EXISTS "${BIN2D_BINGPU_DIR}/include/bingpu.h")
         target_link_libraries(test_gpu_bridge PRIVATE bin2d)
         target_include_directories(test_gpu_bridge PRIVATE tests ${BIN2D_BINGPU_DIR}/include)
         add_test(NAME test_gpu_bridge COMMAND test_gpu_bridge)
+        add_executable(bin2d-bench-gpu tools/bin2d_bench_gpu.cpp)
+        target_link_libraries(bin2d-bench-gpu PRIVATE bin2d)
     endif()
 endif()
 
@@ -60,3 +62,4 @@ install(FILES include/bin2d/paint.h include/bin2d/path.h include/bin2d/raster.h
               include/bin2d/canvas.h include/bin2d/scene.h include/bin2d/image.h
               include/bin2d/gpu.h
         DESTINATION include/bin2d)
+

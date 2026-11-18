@@ -82,6 +82,15 @@ inline Color BlendPixel(const Color& dst, const Color& src, BlendMode mode) {
     }
 }
 
+// 源 alpha == 0 时还要不要落笔：Replace 写透明（把目标清成 0）、Keep 乘 0（同样清 0），
+// 另外三种模式下 src.a==0 真的什么都不改。
+// 这条判据原本只写在 BlendPixel 的分支里，而**落像素的快路径**（整行搬运、查表双线性）
+// 各自写死了"src.a==0 就 continue"—— 于是"组混合模式 = Replace/Keep"在 1:1 图层合成
+// 上被悄悄跳过（0.3.0 修）。现在只有这一个判据，所有落像素路径都问它。
+inline bool ZeroAlphaMatters(BlendMode mode) {
+    return mode == BlendMode::Replace || mode == BlendMode::Keep;
+}
+
 // ------------------------------------------------------------
 // 描边参数
 // ------------------------------------------------------------
