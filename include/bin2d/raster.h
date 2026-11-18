@@ -231,4 +231,40 @@ bool RasterizeCoverage(const std::vector<Polyline>& polys, FillRule rule, const 
 // 交错数组版本（宿主免拷贝）
 bool RasterizeCoverage(const CoverageRequest& req, CoverageRect& out);
 
+// ------------------------------------------------------------
+// 描边覆盖率（0.6.0）：给同一批宿主用 —— 它们要描边的**覆盖率**，不要像素。
+//
+// 语义与 `StrokePath` **完全一致**（同一份 BuildStrokePolys：每段一个四边形、每个拐点
+// 一个连接块、开放两端加端帽；然后**逐块栅格化取 max** 合成并集）。这一点是刻意的：
+// 描边最容易漂移的地方不是"四边形怎么摆"，而是"重叠处怎么合"——
+//   · 逐段各自混合（老 binUI）= 接缝混合两次，半透明描边的每个接缝都深一条；
+//   · 把多块丢进同一个边表用 nonzero = 反向的四边形互相抵消，拐点会开洞；
+//   · 取 max = 接缝处覆盖率取大者，混一次，这正是并集的语义。
+// 所以这里不做"聪明的单多边形轮廓"优化：宁可多几次小栅格化，也要和 StrokePath 同源。
+//
+// width 是**目标空间**（设备像素）的线宽，不做变换缩放 —— 宿主若有变换，自己先折进去。
+// clip 是设备像素裁剪矩形；subSamples 是竖直子采样数（默认 kSubSamples）。
+// 覆盖率风格固定 Fractional：硬边描边没有意义（本来就是细长小面，四舍五入等于丢形）。
+// ------------------------------------------------------------
+struct StrokeCoverageRequest {
+    const float* xy = nullptr;          // x,y 交错（与 CoverageRequest 同一布局）
+    const uint32_t* first = nullptr;    // 子路径起始点下标
+    const uint32_t* count = nullptr;    // 子路径点数（≥2）
+    const uint8_t* closed = nullptr;    // 每条子路径是否闭合（可为 nullptr = 全开放）
+    int contours = 0;
+    StrokeStyle style;                  // 线宽 / 端帽 / 连接 / miter-limit
+    Rect clip;
+    int subSamples = kSubSamples;
+
+    bool valid() const {
+        return xy && first && count && contours > 0 && style.width > 0.0f;
+    }
+};
+
+bool RasterizeStrokeCoverage(const StrokeCoverageRequest& req, CoverageRect& out);
+
+// 折线批量版本（bin2d 自己的调用方 / 测试用）。closed 由 Polyline 自带。
+bool RasterizeStrokeCoverage(const std::vector<Polyline>& polys, const StrokeStyle& style,
+                             const Rect& clip, int subSamples, CoverageRect& out);
+
 } // namespace bin2d

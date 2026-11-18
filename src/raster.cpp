@@ -911,6 +911,162 @@ bool RasterizeCoverage(const CoverageRequest& req, CoverageRect& out) {
                                   out);
 }
 
+// ------------------------------------------------------------
+// 描边覆盖率（0.6.0）
+//
+// 与 StrokePath 同源：BuildStrokePolys 出"四边形 + 连接块 + 端帽"，然后**逐块**栅格化、
+// 在同一张 uint8 上取 max —— 这就是并集。逐块而不是合成一个边表：方向相反的四边形放进
+// 同一个 nonzero 边表会互相抵消（拐点开洞），而逐块取 max 与"一个像素只混一次"的语义
+// 完全对齐（半透明描边的接缝不会变深）。
+//
+// 每块只用**自己**的像素矩形调用行循环（RasterEdges 的 baseX/y0/w/h），所以一块只是一小段
+// 行，成本跟"块的面积"成正比，而不是跟整条路径的包围盒成正比。
+// ------------------------------------------------------------
+namespace {
+
+// 一圈顶点（隐式闭合）→ 边表。描边块全部是闭合小环（四边形 / 三角 / 圆）。
+void BuildEdgesRing(const std::vector<Point>& ring, std::vector<Edge>& edges) {
+    edges.clear();
+    const size_t n = ring.size();
+    if (n < 3) return;
+    edges.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const Point& a = ring[i];
+        const Point& b = ring[(i + 1) % n];
+        if (a.y == b.y) continue;
+        Edge e;
+        const float dy = b.y - a.y;
+        e.dyInv = (b.x - a.x) / dy;
+        if (a.y < b.y) {
+            e.x0 = a.x; e.y0 = a.y; e.dir = 1;
+            e.ymin = a.y; e.ymax = b.y;
+        } else {
+            e.x0 = b.x; e.y0 = b.y; e.dir = -1;
+            e.ymin = b.y; e.ymax = a.y;
+        }
+        edges.push_back(e);
+    }
+}
+
+Rect RingBounds(const std::vector<Point>& ring) {
+    if (ring.empty()) return Rect();
+    float minx = ring[0].x, maxx = ring[0].x, miny = ring[0].y, maxy = ring[0].y;
+    for (const Point& p : ring) {
+        if (p.x < minx) minx = p.x;
+        if (p.x > maxx) maxx = p.x;
+        if (p.y < miny) miny = p.y;
+        if (p.y > maxy) maxy = p.y;
+    }
+    return Rect(minx, miny, maxx - minx, maxy - miny);
+}
+
+} // namespace
+
+bool RasterizeStrokeCoverage(const std::vector<Polyline>& polys, const StrokeStyle& style,
+                            const Rect& clip, int subSamples, CoverageRect& out) {
+    out.x0 = out.y0 = out.w = out.h = 0;
+    out.v.clear();
+    if (polys.empty() || clip.empty() || style.width <= 0.0f) return false;
+
+    std::vector<std::vector<Point>> pieces;
+    BuildStrokePolys(polys, style, pieces);
+    if (pieces.empty()) return false;
+
+    // 并集的包围盒 = 块的顶点框（块的顶点已经是"最外的那层"，端口帽/斜接尖角都在里面）。
+    // 不外扩：块的顶点就是几何的极值，floor/ceil 已经覆盖到"被斜边切到一半"的边像素 ——
+    // 外扩只会让宿主多扫一圈空行（导出矩形是宿主要遍历的范围，别白给）。
+    Rect bbox;
+    bool first = true;
+    for (const std::vector<Point>& piece : pieces) {
+        if (piece.size() < 3) continue;
+        const Rect pb = RingBounds(piece);
+        if (first) {
+            bbox = pb;
+            first = false;
+        } else {
+            const float minx = std::min(bbox.x, pb.x);
+            const float miny = std::min(bbox.y, pb.y);
+            const float maxx = std::max(bbox.right(), pb.right());
+            const float maxy = std::max(bbox.bottom(), pb.bottom());
+            bbox = Rect(minx, miny, maxx - minx, maxy - miny);
+        }
+    }
+    if (first) return false;
+
+    int ax0 = 0, ay0 = 0, aw = 0, ah = 0;
+    if (!ClipPixels(bbox, clip, ax0, ay0, aw, ah)) return false;
+    const int nSub = subSamples < 1 ? 1 : (subSamples > 32 ? 32 : subSamples);
+
+    out.x0 = ax0;
+    out.y0 = ay0;
+    out.w = aw;
+    out.h = ah;
+    out.v.assign(static_cast<size_t>(aw) * static_cast<size_t>(ah), 0);
+    uint8_t* base = out.v.data();
+    const Rect outRect(static_cast<float>(ax0), static_cast<float>(ay0),
+                       static_cast<float>(aw), static_cast<float>(ah));
+    const int ax1 = ax0 + aw, ay1 = ay0 + ah;
+    std::vector<Edge>& edges = edgesScratch();
+
+    for (const std::vector<Point>& piece : pieces) {
+        if (piece.size() < 3) continue;
+        const Rect pr = Rect::intersect(RingBounds(piece), outRect);
+        if (pr.empty()) continue;
+        int px0 = static_cast<int>(std::floor(pr.x));
+        int py0 = static_cast<int>(std::floor(pr.y));
+        int px1 = static_cast<int>(std::ceil(pr.right()));
+        int py1 = static_cast<int>(std::ceil(pr.bottom()));
+        if (px0 < ax0) px0 = ax0;
+        if (py0 < ay0) py0 = ay0;
+        if (px1 > ax1) px1 = ax1;
+        if (py1 > ay1) py1 = ay1;
+        if (px1 <= px0 || py1 <= py0) continue;
+        BuildEdgesRing(piece, edges);
+        if (edges.empty()) continue;
+        const int ox = px0 - ax0, oy = py0 - ay0;
+        RasterEdges(edges, FillRule::NonZero, px0, py0, px1 - px0, py1 - py0, nSub, false,
+                    [base, aw, ox, oy](int yy, int tLo, int tHi, const float* cov) {
+                        uint8_t* row = base + static_cast<size_t>(oy + yy) *
+                                                  static_cast<size_t>(aw) +
+                                       static_cast<size_t>(ox);
+                        for (int xi = tLo; xi <= tHi; ++xi) {
+                            const float c = cov[xi];
+                            if (c <= 0.0f) continue;
+                            const uint8_t q =
+                                (c >= 1.0f) ? 255
+                                            : static_cast<uint8_t>(c * 255.0f + 0.5f);
+                            if (q > row[xi]) row[xi] = q;   // 并集 = 取 max，不是相加
+                        }
+                    });
+    }
+    return true;
+}
+
+bool RasterizeStrokeCoverage(const StrokeCoverageRequest& req, CoverageRect& out) {
+    if (!req.valid()) {
+        out.x0 = out.y0 = out.w = out.h = 0;
+        out.v.clear();
+        return false;
+    }
+    // 交错数组 → Polyline 批（拷贝一次点；描边本来就要展平出块的顶点，这点拷贝不算什么）
+    std::vector<Polyline> polys;
+    polys.reserve(static_cast<size_t>(req.contours));
+    for (int c = 0; c < req.contours; ++c) {
+        const uint32_t f = req.first[c];
+        const uint32_t n = req.count[c];
+        if (n < 2) continue;
+        Polyline pl;
+        pl.closed = req.closed && req.closed[c] != 0;
+        pl.pts.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            const size_t k = static_cast<size_t>(f + i) * 2;
+            pl.pts.push_back(Point{req.xy[k], req.xy[k + 1]});
+        }
+        polys.push_back(std::move(pl));
+    }
+    return RasterizeStrokeCoverage(polys, req.style, req.clip, req.subSamples, out);
+}
+
 void FillPath(const RasterTarget& t, const Path& path, FillRule rule,
               const Paint& paint, const Transform& xf, float tolerancePx) {
     if (!t.valid() || path.empty()) return;

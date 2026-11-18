@@ -29,6 +29,39 @@ alpha —— 既多一次全区域读写，又把"颜料"和"覆盖率"耦合在
 数值口径与 `FillPath` 完全一致（同一个光栅器）：8bit 是 `round(cov × 255)`，内部整像素
 覆盖率恰好 1.0 → 直接 255。
 
+## 描边覆盖率（`RasterizeStrokeCoverage`，0.6.0）
+
+```cpp
+bin2d::StrokeCoverageRequest req;
+req.xy = xy;                 // 交错 float（与覆盖率查询同一布局）
+req.first = first;
+req.count = count;
+req.closed = closed;         // 每条子路径是否闭合（可为 nullptr = 全开放）
+req.contours = contours;
+req.style.width = 4.0f;      // 目标空间（设备像素）的线宽
+req.style.roundCap = false;  // 端帽：butt / round / square（squareCap 优先）
+req.style.roundJoin = true;  // 连接：round / miter（超 miterLimit 退化成 bevel）
+req.style.miterLimit = 4.0f; // SVG 默认 4
+req.clip = bin2d::Rect(0, 0, w, h);
+bin2d::CoverageRect cov;
+if (bin2d::RasterizeStrokeCoverage(req, cov)) { /* cov.at(x, y) ∈ [0,255] */ }
+```
+
+语义与 `StrokePath` **完全同源**：同一份 `BuildStrokePolys`（每段一个四边形、每个拐点一个
+连接块、开放两端加端帽），然后逐块栅格化、在同一个像素上**取 max**。
+
+为什么必须"取 max"而不是"把多块丢进同一个边表一次算完"，或者"逐段各自混合"：
+
+| 做法 | 后果 |
+|---|---|
+| 逐段各自混合（老 binUI） | 接缝处覆盖率各算一次、混两次 → 半透明描边的每个接缝深一条 |
+| 多块同一 nonzero 边表 | 方向相反的四边形互相抵消 → 拐点开洞 |
+| 逐块取 max（这里） | 接缝取大者、只混一次 = 并集语义 |
+
+`width` 是**目标空间**线宽，不做变换缩放（宿主有变换时自己先折进去）；覆盖率风格固定
+`Fractional` —— 硬边描边没有意义（细长小面四舍五入等于丢形）。`subSamples` 默认
+`kSubSamples`，binUI 传 4 以与它自己的填充口径一致。
+
 ## core.h —— 基础类型
 
 ```cpp

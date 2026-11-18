@@ -414,7 +414,168 @@ static void TestCoverageQuery() {
     }
 }
 
+// ------------------------------------------------------------
+// 描边覆盖率（RasterizeStrokeCoverage，0.6.0）
+//
+// 三条要点：端帽/连接块的几何真的落在覆盖率里；导出值与 `StrokePath` 的像素**同源**；
+// 重叠块取 max（并集）—— 不是相加，所以半透明描边的接缝不会混两次。
+// ------------------------------------------------------------
+static void TestStrokeCoverage() {
+    const Rect clip(0, 0, 64, 64);
+    // 导出矩形外的像素一律当 0 读（`at()` 不做越界检查，测"外面是 0"必须自己收口）
+    auto covAt = [](const CoverageRect& c, int x, int y) -> int {
+        if (c.empty() || x < c.x0 || y < c.y0 || x >= c.x0 + c.w || y >= c.y0 + c.h) return 0;
+        return c.at(x, y);
+    };
+
+    // ① 平头直线：整像素对齐时内部 255、外部 0，导出矩形就是线的包围盒
+    {
+        std::vector<float> xy = {10, 20, 30, 20};
+        std::vector<uint32_t> first = {0}, count = {2};
+        std::vector<uint8_t> closed = {0};
+        StrokeCoverageRequest req;
+        req.xy = xy.data();
+        req.first = first.data();
+        req.count = count.data();
+        req.closed = closed.data();
+        req.contours = 1;
+        req.style.width = 4.0f;
+        req.clip = clip;
+        CoverageRect cov;
+        const bool ok = RasterizeStrokeCoverage(req, cov);
+        CHECK(ok, "stroke coverage: 平头直线可导出");
+        CHECK(ok && cov.x0 == 10 && cov.y0 == 18 && cov.w == 20 && cov.h == 4,
+              "stroke coverage: 导出矩形 = 线的包围盒（y = 20 ± 半线宽）");
+        CHECK(ok && cov.at(20, 19) == 255 && cov.at(20, 21) == 255,
+              "stroke coverage: 内部整像素 255");
+        CHECK(ok && covAt(cov, 9, 19) == 0 && covAt(cov, 30, 19) == 0 &&
+                  covAt(cov, 20, 17) == 0,
+              "stroke coverage: 平头端外/线外 0");
+
+        // ② 端帽：square 外延半线宽（整像素 255），round 只有亚像素的一小片
+        StrokeStyle sq = req.style;
+        sq.squareCap = true;
+        req.style = sq;
+        CoverageRect covSq;
+        RasterizeStrokeCoverage(req, covSq);
+        CHECK(covSq.x0 == 8 && covSq.w == 24 && covSq.at(8, 19) == 255 &&
+                  covSq.at(9, 19) == 255,
+              "stroke coverage: square 端帽两端各外延半线宽");
+
+        StrokeStyle rd = req.style;
+        rd.squareCap = false;
+        rd.roundCap = true;
+        req.style = rd;
+        CoverageRect covRd;
+        RasterizeStrokeCoverage(req, covRd);
+        const int tip = covRd.at(31, 19);   // 端点 (30,20) 外 1px
+        CHECK(tip > 0 && tip < 255, "stroke coverage: round 端帽只多出亚像素覆盖率");
+        CHECK(covAt(covRd, 32, 19) == 0, "stroke coverage: round 端帽不外延到半线宽之外");
+        std::printf("  （round 端帽外 1px 处覆盖率 %d/255）\n", tip);
+    }
+
+    // ③ 斜接 vs 斜面：(25,5) 那个尖角只有 miter 盖得住，bevel/miter-limit 必须盖不住
+    {
+        std::vector<float> xy = {0, 10, 20, 10, 20, 30};
+        std::vector<uint32_t> first = {0}, count = {3};
+        std::vector<uint8_t> closed = {0};
+        StrokeCoverageRequest req;
+        req.xy = xy.data();
+        req.first = first.data();
+        req.count = count.data();
+        req.closed = closed.data();
+        req.contours = 1;
+        req.style.width = 10.0f;
+        req.style.roundJoin = false;
+        req.style.miterLimit = 4.0f;
+        req.clip = clip;
+        CoverageRect covMiter;
+        RasterizeStrokeCoverage(req, covMiter);
+        CHECK(covMiter.at(24, 6) == 255, "stroke coverage: 斜接尖角区域被覆盖");
+        req.style.miterLimit = 1.0f;   // 直角比值 √2 > 1 → 规范要求退回斜面
+        CoverageRect covBevel;
+        RasterizeStrokeCoverage(req, covBevel);
+        CHECK(covBevel.at(24, 6) == 0, "stroke coverage: 超 miter-limit 退回斜面（尖角不覆盖）");
+        CHECK(covBevel.at(21, 9) == 255, "stroke coverage: 斜面仍然填满拐点内侧");
+    }
+
+    // ④ 与 StrokePath 同源：同一几何的覆盖率必须逐像素一致（含端帽/连接块）
+    {
+        Path p;
+        p.moveTo(10, 12);
+        p.lineTo(40, 20);
+        p.lineTo(20, 40);
+        StrokeStyle st;
+        st.width = 6.0f;
+        st.roundCap = true;
+        st.roundJoin = true;
+        Surface s(64, 64);
+        StrokePath(MakeTarget(s), p, Paint::solid(Color::white()), st, Transform::identity());
+
+        std::vector<float> xy = {10, 12, 40, 20, 20, 40};
+        std::vector<uint32_t> first = {0}, count = {3};
+        std::vector<uint8_t> closed = {0};
+        StrokeCoverageRequest req;
+        req.xy = xy.data();
+        req.first = first.data();
+        req.count = count.data();
+        req.closed = closed.data();
+        req.contours = 1;
+        req.style = st;
+        req.clip = clip;
+        CoverageRect cov;
+        const bool ok = RasterizeStrokeCoverage(req, cov);
+        int maxDelta = 0;
+        for (int y = cov.y0; y < cov.y0 + cov.h; ++y)
+            for (int x = cov.x0; x < cov.x0 + cov.w; ++x)
+                maxDelta = std::max(maxDelta, std::abs(int(cov.at(x, y)) - int(s.get(x, y).a)));
+        CHECK(ok && maxDelta <= 1, "stroke coverage: 与 StrokePath 的覆盖率逐像素一致（≤1 级）");
+        std::printf("  （描边覆盖率 vs StrokePath alpha 最大差 %d 级）\n", maxDelta);
+    }
+
+    // ⑤ 半透明描边的接缝：重叠块取 max（并集）→ 接缝只混一次，不会变深
+    {
+        Path p;
+        p.moveTo(10, 10);
+        p.lineTo(40, 10);
+        p.lineTo(40, 40);   // 直角 + 圆角连接：连接圆与两段四边形在拐点大面积重叠
+        StrokeStyle st;
+        st.width = 12.0f;
+        st.roundJoin = true;
+        Surface s(64, 64);
+        RasterTarget t = MakeTarget(s);
+        FillRect(t, Rect(0, 0, 64, 64), Paint::solid(Color::argb(0xFFFF0000)),
+                 Transform::identity());
+        StrokePath(t, p, Paint::solid(Color::argb(0x80FFFFFF)), st, Transform::identity());
+        // 拐点内侧（两段都盖到、连接圆也盖到）必须正好 50% 白：混两次会到 ~75%
+        const Color c = s.get(36, 14);
+        CHECK(c.g >= 126 && c.g <= 130, "stroke coverage: 接缝像素只混一次（并集不是叠加）");
+        std::printf("  （拐点接缝像素 = (%d,%d,%d)，白色 50%% 叠在红底上应为 g≈128）\n",
+                    int(c.r), int(c.g), int(c.b));
+    }
+
+    // ⑥ clip：只导 clip 内那块（位置与尺寸都跟 clip 走）
+    {
+        std::vector<float> xy = {10, 20, 30, 20};
+        std::vector<uint32_t> first = {0}, count = {2};
+        std::vector<uint8_t> closed = {0};
+        StrokeCoverageRequest req;
+        req.xy = xy.data();
+        req.first = first.data();
+        req.count = count.data();
+        req.closed = closed.data();
+        req.contours = 1;
+        req.style.width = 8.0f;
+        req.clip = Rect(14, 14, 6, 6);
+        CoverageRect cov;
+        RasterizeStrokeCoverage(req, cov);
+        CHECK(cov.x0 == 14 && cov.y0 == 16 && cov.w == 6 && cov.h == 4,
+              "stroke coverage: clip 决定导出块的位置与尺寸");
+    }
+}
+
 int main() {
+    TestStrokeCoverage();
     TestCoverageQuery();
     TestExactRect();
     TestCircleArea();

@@ -95,6 +95,14 @@ ctest --test-dir build --output-on-failure
 星形 1.50 → **0.79 ns/px**、六项合计 42.9 → **38.9 ns/px**。
 归因与"试过没留"的两条见 [docs/perf.md](docs/perf.md)。
 
+**0.5.0 / 0.6.0（2026-11-18/19）**：把**覆盖率**本身导出来，给"不往 CPU 像素上落、而是把
+覆盖率拼成条带/四边形下发给 GPU"的宿主用 —— binUI 是第一个：0.5.0 导出填充
+（`RasterizeCoverage`，binUI 0.21.0 用它换掉了自己的扫描线），0.6.0 导出描边
+（`RasterizeStrokeCoverage`：每段四边形 + 拐点连接块 + 端帽逐块栅格化、同一像素取 max
+= 并集，binUI 0.22.0 用它换掉了逐段 `fillLine`）。数值口径与库内的 `FillPath` / `StrokePath`
+**同一个光栅器**，所以宿主的像素和这里逐像素一致（binUI 侧实测：GDI 与 GL 在描边用例上
+从 1016~1284 个不同像素降到 **0**）。
+
 ## 画质（`make quality` 的固定数字）
 
 | 指标 | 数值 | 口径 |
