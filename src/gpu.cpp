@@ -123,31 +123,18 @@ void GpuBridge::destroy() {
 BgpuTexture GpuBridge::upload(const Surface& surface) {
     if (!device_ || surface.empty()) return 0;
     const int w = surface.width(), h = surface.height();
-    // 预乘 → 直通（bingpu 的纹理是直通 RGBA8）
-    std::vector<uint8_t> straight(static_cast<size_t>(w) * static_cast<size_t>(h) * 4u);
-    for (int y = 0; y < h; ++y) {
-        const uint8_t* p = surface.row(y);
-        uint8_t* q = straight.data() + static_cast<size_t>(y) * static_cast<size_t>(w) * 4u;
-        for (int x = 0; x < w; ++x, p += 4, q += 4) {
-            const uint32_t v = Color(p[0], p[1], p[2], p[3]).toArgbStraight();
-            q[0] = static_cast<uint8_t>((v >> 16) & 0xFFu);
-            q[1] = static_cast<uint8_t>((v >> 8) & 0xFFu);
-            q[2] = static_cast<uint8_t>(v & 0xFFu);
-            q[3] = static_cast<uint8_t>((v >> 24) & 0xFFu);
-        }
-    }
-
+    // Surface 本来就是预乘：纹理按"输入已预乘"建，像素原样直传（0 分配、0 转换）
     BgpuTextureDesc td{};
     td.struct_size = sizeof(td);
     td.width = static_cast<uint32_t>(w);
     td.height = static_cast<uint32_t>(h);
     td.format = BGPU_FORMAT_RGBA8;
-    td.flags = BGPU_TEXTURE_CPU_READ | BGPU_TEXTURE_DYNAMIC;
+    td.flags = BGPU_TEXTURE_CPU_READ | BGPU_TEXTURE_DYNAMIC | BGPU_TEXTURE_PREMULTIPLIED;
     BgpuTexture tex = 0;
     BgpuResult r = bingpu_texture_create(device_, &td, &tex);
     if (r != BGPU_OK) { fail("bingpu_texture_create", r); return 0; }
-    r = bingpu_texture_upload(tex, nullptr, straight.data(),
-                              static_cast<uint32_t>(w) * 4u);
+    r = bingpu_texture_upload(tex, nullptr, surface.pixels().data(),
+                              static_cast<uint32_t>(surface.stride()));
     if (r != BGPU_OK) {
         fail("bingpu_texture_upload", r);
         bingpu_texture_destroy(device_, tex);
@@ -238,28 +225,16 @@ bool GpuBridge::render(const Surface& src, Surface& out) {
 BgpuTexture uploadSurface(BgpuDevice device, const Surface& surface) {
     if (!device || surface.empty()) return 0;
     const int w = surface.width(), h = surface.height();
-    std::vector<uint8_t> straight(static_cast<size_t>(w) * static_cast<size_t>(h) * 4u);
-    for (int y = 0; y < h; ++y) {
-        const uint8_t* p = surface.row(y);
-        uint8_t* q = straight.data() + static_cast<size_t>(y) * static_cast<size_t>(w) * 4u;
-        for (int x = 0; x < w; ++x, p += 4, q += 4) {
-            const uint32_t v = Color(p[0], p[1], p[2], p[3]).toArgbStraight();
-            q[0] = static_cast<uint8_t>((v >> 16) & 0xFFu);
-            q[1] = static_cast<uint8_t>((v >> 8) & 0xFFu);
-            q[2] = static_cast<uint8_t>(v & 0xFFu);
-            q[3] = static_cast<uint8_t>((v >> 24) & 0xFFu);
-        }
-    }
     BgpuTextureDesc td{};
     td.struct_size = sizeof(td);
     td.width = static_cast<uint32_t>(w);
     td.height = static_cast<uint32_t>(h);
     td.format = BGPU_FORMAT_RGBA8;
-    td.flags = BGPU_TEXTURE_CPU_READ | BGPU_TEXTURE_DYNAMIC;
+    td.flags = BGPU_TEXTURE_CPU_READ | BGPU_TEXTURE_DYNAMIC | BGPU_TEXTURE_PREMULTIPLIED;
     BgpuTexture tex = 0;
     if (bingpu_texture_create(device, &td, &tex) != BGPU_OK) return 0;
-    if (bingpu_texture_upload(tex, nullptr, straight.data(),
-                              static_cast<uint32_t>(w) * 4u) != BGPU_OK) {
+    if (bingpu_texture_upload(tex, nullptr, surface.pixels().data(),
+                              static_cast<uint32_t>(surface.stride())) != BGPU_OK) {
         bingpu_texture_destroy(device, tex);
         return 0;
     }
@@ -296,27 +271,6 @@ BgpuBlend ToBgpuBlend(BlendMode mode) {
     return BGPU_BLEND_PREMULTIPLIED;
 }
 
-namespace {
-
-// 预乘 → 直通（bingpu 的纹理是直通的，上传时后端会立刻再预乘存起来）。
-// 与 Color::toArgbStraight 同一口径：sr = (r*255 + a/2)/a，四舍五入后夹到 255。
-void StraightFromPremul(const uint8_t* src, uint8_t* dst, size_t count) {
-    for (size_t i = 0; i < count; ++i, src += 4, dst += 4) {
-        const uint32_t a = src[3];
-        if (a == 0) {
-            dst[0] = dst[1] = dst[2] = dst[3] = 0;
-            continue;
-        }
-        for (int c = 0; c < 3; ++c) {
-            const uint32_t v = (static_cast<uint32_t>(src[c]) * 255u + a / 2u) / a;
-            dst[c] = static_cast<uint8_t>(v > 255u ? 255u : v);
-        }
-        dst[3] = static_cast<uint8_t>(a);
-    }
-}
-
-} // namespace
-
 void GpuCompositor::fail(std::string& error, const char* what, BgpuResult result) {
     error = what;
     error += ": ";
@@ -330,17 +284,25 @@ void GpuCompositor::fail(std::string& error, const char* what, BgpuResult result
 }
 
 bool GpuCompositor::create(int width, int height, BgpuBackendKind backend) {
-    return createInternal(width, height, backend, nullptr, false);
+    return createInternal(width, height, backend, nullptr, false, false);
 }
 
 bool GpuCompositor::createWindow(void* nativeWindow, int width, int height,
-                                 BgpuBackendKind backend) {
+                                 BgpuBackendKind backend, bool vsync) {
     if (!nativeWindow) { error_ = "createWindow: nativeWindow 为空"; return false; }
-    return createInternal(width, height, backend, nativeWindow, true);
+    return createInternal(width, height, backend, nativeWindow, true, vsync);
+}
+
+bool GpuCompositor::presentPacesFrames() const {
+    if (!swapchain_) return false;
+    BgpuSwapchainInfo info{};
+    info.struct_size = sizeof(info);
+    if (bingpu_swapchain_info(swapchain_, &info) != BGPU_OK) return false;
+    return info.present_paces_frames != 0;
 }
 
 bool GpuCompositor::createInternal(int width, int height, BgpuBackendKind backend,
-                                   void* nativeWindow, bool windowed) {
+                                   void* nativeWindow, bool windowed, bool vsync) {
     destroy();
     if (width <= 0 || height <= 0) return false;
     width_ = width;
@@ -367,6 +329,9 @@ bool GpuCompositor::createInternal(int width, int height, BgpuBackendKind backen
     sd.width = static_cast<uint32_t>(width);
     sd.height = static_cast<uint32_t>(height);
     sd.format = BGPU_FORMAT_RGBA8;
+    // 窗口版默认等垂直同步：present 阻塞到刷新边界，帧落点才跟刷新周期对齐
+    // （关着的时候不阻塞、会撕裂，而外壳又按自己的 8.33 ms 掐拍，两者互相错开 = 一顿一顿）
+    sd.flags = vsync ? static_cast<uint32_t>(BGPU_DEVICE_VSYNC) : 0u;
     r = bingpu_swapchain_create(device_, &sd, &swapchain_);
     if (r != BGPU_OK) { fail("bingpu_swapchain_create", r); destroy(); return false; }
 
@@ -483,14 +448,19 @@ BgpuTexture GpuCompositor::acquireInternal(int w, int h, uint32_t flags) {
     return e.texture;
 }
 
+// 池里的纹理都带 BGPU_TEXTURE_PREMULTIPLIED：合成器的数据源永远是预乘 Surface，
+// 上传时就该原样落进纹理（见 upload 的零拷贝注释）。这个位只影响"怎么读上传缓冲"，
+// 与"能不能当渲染目标""能不能被采样"无关。
+//
 // 图层纹理：内容每帧可能被 upload 覆盖；合成只画不读，所以不开 CPU_READ
 BgpuTexture GpuCompositor::acquire(int w, int h) {
-    return acquireInternal(w, h, BGPU_TEXTURE_DYNAMIC);
+    return acquireInternal(w, h, BGPU_TEXTURE_DYNAMIC | BGPU_TEXTURE_PREMULTIPLIED);
 }
 
 // 渲染目标：可当渲染目标、可 texture_read（回读时要求两者之一，这里两个都给）
 BgpuTexture GpuCompositor::acquireTarget(int w, int h) {
-    return acquireInternal(w, h, BGPU_TEXTURE_RENDER_TARGET | BGPU_TEXTURE_CPU_READ);
+    return acquireInternal(w, h, BGPU_TEXTURE_RENDER_TARGET | BGPU_TEXTURE_CPU_READ |
+                                  BGPU_TEXTURE_PREMULTIPLIED);
 }
 
 bool GpuCompositor::upload(BgpuTexture texture, const Surface& surface) {
@@ -509,19 +479,18 @@ bool GpuCompositor::upload(BgpuTexture texture, const Surface& surface, const Re
 
     const int bw = x1 - x0, bh = y1 - y0;
     const bool whole = (bw == surface.width() && bh == surface.height());
-    std::vector<uint8_t> straight(static_cast<size_t>(bw) * static_cast<size_t>(bh) * 4u);
-    for (int y = 0; y < bh; ++y) {
-        StraightFromPremul(surface.row(y0 + y) + x0 * 4,
-                           straight.data() + static_cast<size_t>(y) * static_cast<size_t>(bw) * 4u,
-                           static_cast<size_t>(bw));
-    }
     BgpuBox b{};
     b.x = static_cast<uint32_t>(x0);
     b.y = static_cast<uint32_t>(y0);
     b.w = static_cast<uint32_t>(bw);
     b.h = static_cast<uint32_t>(bh);
+    /* 零拷贝直传（0.27.3）：Surface 本来就是预乘，合成器的纹理也是按"输入已预乘"建的
+     * （acquireInternal 带 BGPU_TEXTURE_PREMULTIPLIED），所以这里把像素指针直接交给
+     * bingpu —— 不分配直通缓冲、不做 3×(像素数) 次整数除法、也没有往返舍入。
+     * 局部 Box 走同一条路：bingpu 的上传本来就吃 (box, stride)，行距用 surface 自己的。 */
+    const uint8_t* px = surface.row(y0) + static_cast<size_t>(x0) * 4u;
     const BgpuResult r = bingpu_texture_upload(
-        texture, whole ? nullptr : &b, straight.data(), static_cast<uint32_t>(bw) * 4u);
+        texture, whole ? nullptr : &b, px, static_cast<uint32_t>(surface.stride()));
     if (r != BGPU_OK) { fail("bingpu_texture_upload", r); return false; }
     return true;
 }

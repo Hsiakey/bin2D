@@ -381,6 +381,63 @@ bool RunCompositor(const char* label, BgpuBackendKind kind) {
     return pass;
 }
 
+// 预乘直传（0.27.3）：纹理按 BGPU_TEXTURE_PREMULTIPLIED 建，上传时后端**不得**再预乘一遍。
+//
+// 判据用"读回来的直通值"：上传预乘 (10,20,30,128)，正确实现反预乘回来是 (20,40,60)；
+// 如果后端忘了看这个标志、又预乘了一次，存进去的会是 5 → 读回来变成 (10,20,30)。
+// 这一条专门防"以后某个后端漏掉这个位"——它不会在画面上立刻炸，只会让半透明处变暗。
+bool RunPremulUpload(const char* label, BgpuBackendKind kind) {
+    BgpuDeviceDesc dd{};
+    dd.struct_size = sizeof(dd);
+    dd.backend = kind;
+    dd.width = 4;
+    dd.height = 1;
+    dd.flags = BGPU_DEVICE_HEADLESS | BGPU_DEVICE_VALIDATE;
+    dd.msaa_samples = 1;
+    BgpuDevice dev = 0;
+    if (bingpu_device_create(&dd, &dev) != BGPU_OK) {
+        std::printf("  [%s] 设备创建失败：%s\n", label, bingpu_last_error());
+        return false;
+    }
+    BgpuTextureDesc td{};
+    td.struct_size = sizeof(td);
+    td.width = 4;
+    td.height = 1;
+    td.format = BGPU_FORMAT_RGBA8;
+    td.flags = BGPU_TEXTURE_CPU_READ | BGPU_TEXTURE_PREMULTIPLIED;
+    BgpuTexture tex = 0;
+    bool pass = bingpu_texture_create(dev, &td, &tex) == BGPU_OK;
+    // 半透明 / 全透明 / 不透明 / 另一个半透明档，覆盖整数除法会暴露差异的取值
+    const uint8_t premul[16] = {10, 20, 30, 128,  255, 0, 0, 0,  5, 5, 5, 255,  200, 100, 50, 129};
+    if (pass)
+        pass = bingpu_texture_upload(tex, nullptr, premul, 16) == BGPU_OK;
+    uint8_t out[16] = {0};
+    uint32_t stride = 0;
+    if (pass) pass = bingpu_texture_read(tex, out, sizeof(out), &stride) == BGPU_OK;
+    if (!pass) {
+        std::printf("  [%s] 上传/回读失败：%s\n", label, bingpu_last_error());
+    } else {
+        const uint32_t expect[4] = {Color(premul[0], premul[1], premul[2], premul[3]).toArgbStraight(),
+                                    Color(premul[4], premul[5], premul[6], premul[7]).toArgbStraight(),
+                                    Color(premul[8], premul[9], premul[10], premul[11]).toArgbStraight(),
+                                    Color(premul[12], premul[13], premul[14], premul[15]).toArgbStraight()};
+        for (int i = 0; i < 4 && pass; ++i) {
+            const uint8_t* p = out + i * 4;
+            const uint32_t got = (static_cast<uint32_t>(p[3]) << 24) |
+                                 (static_cast<uint32_t>(p[0]) << 16) |
+                                 (static_cast<uint32_t>(p[1]) << 8) | static_cast<uint32_t>(p[2]);
+            if (got != expect[i]) {
+                std::printf("  [%s] 第 %d 个像素：期望 %08X，读回 %08X（后端多预乘了一次？）\n",
+                            label, i, expect[i], got);
+                pass = false;
+            }
+        }
+    }
+    if (tex) bingpu_texture_destroy(dev, tex);
+    bingpu_device_destroy(dev);
+    return pass;
+}
+
 }  // namespace
 
 int main() {
@@ -422,6 +479,18 @@ int main() {
     CHECK(RunCompositor("cpu", BGPU_BACKEND_CPU),
           "gpu: CPU 后端五模式合成 / 合批 / 纹理池 / 脏区上传全部通过");
 
+    // ①c 预乘直传（三个后端都必须认这个标志）
+    CHECK(RunPremulUpload("cpu", BGPU_BACKEND_CPU), "gpu: 预乘直传上传（CPU 后端不多预乘）");
+
+    // ①d presentPacesFrames：离屏合成器没有可呈现的链，必须是 false
+    //    （外壳据此决定"要不要自己按刷新率节流"，猜错的代价就是一顿一顿）
+    {
+        GpuCompositor comp;
+        const bool created = comp.create(32, 32, BGPU_BACKEND_CPU);
+        CHECK(created && !comp.presentPacesFrames(),
+              "gpu: 离屏合成器 presentPacesFrames() == false");
+    }
+
     // ② 每个真实后端各跑一遍（不可用就跳过）
     {
         const struct {
@@ -441,6 +510,8 @@ int main() {
                   "gpu: 真实后端往返与软件路径逐像素一致（容差 ≤1）");
             CHECK(RunCompositor(b.label, b.kind),
                   "gpu: 真实后端五模式合成 / 合批 / 纹理池 / 脏区上传全部通过");
+            CHECK(RunPremulUpload(b.label, b.kind),
+                  "gpu: 预乘直传上传（后端不多预乘）");
         }
     }
     return Bin2dTestSummary("test_gpu_bridge");

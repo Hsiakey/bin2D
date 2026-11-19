@@ -114,7 +114,10 @@ bool RenderViaGpu(const Surface& src, Surface& out, std::string* error = nullptr
 //   Replace/Erase/Keep 三种模式下"跳过透明像素"和"写透明像素"是不等价的。
 //
 // 颜色的两个边界（与 core.h 一致）：
-//   · Surface 是预乘；bingpu 纹理是直通 → upload 时反预乘，回读时再预乘。
+//   · Surface 是预乘。bingpu 的纹理**默认**按直通收（后端上传时自己预乘一遍），
+//     但合成器建的纹理带 BGPU_TEXTURE_PREMULTIPLIED（0.27.3 起）——数据本来就是
+//     预乘的，上传就是**零拷贝直传**：不分配直通缓冲、不做除法、也没有舍入损失。
+//     回读方向不变（frame_read 出来的是直通，再预乘成 Surface）。
 //   · 顶点色（tint）走 0xAARRGGBB 直通。tint = Color::white() * k（整数不透明度）
 //     与不透明彩色 tint 能逐像素精确；**带 alpha 的彩色 tint** 反预乘成 8 位
 //     直通会掉精度（≤2），要精确就把 tint 折进纹理。
@@ -157,8 +160,15 @@ public:
     // 与 create 的差别只有两处 —— native_window 从 nullptr 换成窗口句柄、设备
     // 不再带 BGPU_DEVICE_HEADLESS。headless 后端（NULL / CPU）在这里必然失败
     // （它们没有呈现路径），调用方据此退回"CPU 出图 + 系统贴屏"。
+    // vsync（0.27.3 起，默认开）：交换链带 BGPU_DEVICE_VSYNC，present 会阻塞到刷新
+    // 边界。**这是期望行为** —— 关着的时候 present 不阻塞但画面撕裂，而外壳又按自己的
+    // 节奏掐拍（8.33 ms），帧落点跟刷新周期对不上，肉眼看就是"一顿一顿"。
+    // 打开后单帧 CPU 耗时的上限变成"向上取整到刷新周期"，别拿它当回归。
     bool createWindow(void* nativeWindow, int width, int height,
-                      BgpuBackendKind backend = BGPU_BACKEND_GL);
+                      BgpuBackendKind backend = BGPU_BACKEND_GL, bool vsync = true);
+    // present 会不会自己掐拍（= bingpu_swapchain_info 的 present_paces_frames）。
+    // 外壳据此决定还要不要自己按帧率节流；没建设备/交换链时返回 false。
+    bool presentPacesFrames() const;
     void destroy();
     bool ready() const { return device_ != 0 && swapchain_ != 0 && cmd_ != 0; }
     // 是不是窗口版（决定 presentSurface 能不能用）
@@ -174,7 +184,7 @@ public:
     // 取一块 w×h 的纹理：池里有同尺寸的空闲块就直接复用（不新建、不分配显存）。
     // 返回的句柄归调用方持有，用完 recycle() 归还（归还**不**销毁）。
     BgpuTexture acquire(int w, int h);
-    // 整张覆盖写入（预乘 Surface → 直通 → upload）
+    // 整张覆盖写入（预乘 Surface → 预乘直传，不再反预乘）
     bool upload(BgpuTexture texture, const Surface& surface);
     // 只写脏矩形（box 会被裁到表面与纹理尺寸之内）。box 为空 = 整张。
     bool upload(BgpuTexture texture, const Surface& surface, const Rect& box);
@@ -226,9 +236,9 @@ private:
     };
     static void fail(std::string& error, const char* what, BgpuResult result);
     void fail(const char* what, BgpuResult result) { fail(error_, what, result); }
-    // create / createWindow 的共同实现（唯一差别是 native_window 与 HEADLESS 位）
+    // create / createWindow 的共同实现（差别只有 native_window、HEADLESS 位与 VSYNC 位）
     bool createInternal(int width, int height, BgpuBackendKind backend,
-                        void* nativeWindow, bool windowed);
+                        void* nativeWindow, bool windowed, bool vsync);
     BgpuPipeline pipelineFor(BlendMode mode) const;
     bool findPooled(int w, int h, uint32_t flags, PoolEntry* out);
     BgpuTexture acquireInternal(int w, int h, uint32_t flags);

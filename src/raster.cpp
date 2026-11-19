@@ -37,6 +37,17 @@ inline uint8_t Div255(uint32_t x) {
 struct Cover {
     int x0 = 0, y0 = 0, w = 0, h = 0;
     std::vector<float> v;
+    // 0.13.x：可选的外部缓冲（描边的稀疏路径用线程常驻缓冲，保持"全零"不变量，
+    // 只在自己碰过的行段上取值/清零，不再每次绘制都 assign 整块 bbox）。
+    float* ext = nullptr;
+
+    void attach(int ax0, int ay0, int aw, int ah, float* data) {
+        x0 = ax0;
+        y0 = ay0;
+        w = aw;
+        h = ah;
+        ext = data;
+    }
 
     void reset(const Rect& bbox, const Rect& clip) {
         const Rect r = Rect::intersect(bbox, clip);
@@ -51,9 +62,13 @@ struct Cover {
         v.assign(static_cast<size_t>(w) * static_cast<size_t>(h), 0.0f);
     }
 
-    float* row(int y) { return v.data() + static_cast<size_t>(y) * static_cast<size_t>(w); }
+    float* row(int y) {
+        float* base = ext != nullptr ? ext : v.data();
+        return base + static_cast<size_t>(y) * static_cast<size_t>(w);
+    }
     const float* row(int y) const {
-        return v.data() + static_cast<size_t>(y) * static_cast<size_t>(w);
+        const float* base = ext != nullptr ? ext : v.data();
+        return base + static_cast<size_t>(y) * static_cast<size_t>(w);
     }
     float at(int x, int y) const { return row(y)[x - x0]; }
     bool empty() const { return w <= 0 || h <= 0; }
@@ -100,6 +115,29 @@ std::vector<Edge>& edgesScratch() {
     return edges;
 }
 
+// 建边：单条折线（描边按"块"逐块栅格化，每块一条折线）
+void AppendEdges(const Polyline& pl, std::vector<Edge>& edges) {
+    const size_t n = pl.pts.size();
+    if (n < 2) return;
+    const size_t segs = pl.closed ? n : n - 1;
+    for (size_t i = 0; i < segs; ++i) {
+        const Point& a = pl.pts[i];
+        const Point& b = pl.pts[(i + 1) % n];
+        if (a.y == b.y) continue;
+        Edge e;
+        const float dy = b.y - a.y;
+        e.dyInv = (b.x - a.x) / dy;
+        if (a.y < b.y) {
+            e.x0 = a.x; e.y0 = a.y; e.dir = 1;
+            e.ymin = a.y; e.ymax = b.y;
+        } else {
+            e.x0 = b.x; e.y0 = b.y; e.dir = -1;
+            e.ymin = b.y; e.ymax = a.y;
+        }
+        edges.push_back(e);
+    }
+}
+
 // 建边表：设备空间折线（bin2d 自己的 Polyline 批）
 void BuildEdges(const std::vector<Polyline>& polys, std::vector<Edge>& edges) {
     size_t edgeCount = 0;
@@ -109,27 +147,7 @@ void BuildEdges(const std::vector<Polyline>& polys, std::vector<Edge>& edges) {
     }
     edges.clear();
     edges.reserve(edgeCount);
-    for (const Polyline& pl : polys) {
-        const size_t n = pl.pts.size();
-        if (n < 2) continue;
-        const size_t segs = pl.closed ? n : n - 1;
-        for (size_t i = 0; i < segs; ++i) {
-            const Point& a = pl.pts[i];
-            const Point& b = pl.pts[(i + 1) % n];
-            if (a.y == b.y) continue;
-            Edge e;
-            const float dy = b.y - a.y;
-            e.dyInv = (b.x - a.x) / dy;
-            if (a.y < b.y) {
-                e.x0 = a.x; e.y0 = a.y; e.dir = 1;
-                e.ymin = a.y; e.ymax = b.y;
-            } else {
-                e.x0 = b.x; e.y0 = b.y; e.dir = -1;
-                e.ymin = b.y; e.ymax = a.y;
-            }
-            edges.push_back(e);
-        }
-    }
+    for (const Polyline& pl : polys) AppendEdges(pl, edges);
 }
 
 // 建边表：交错 float + 折线表（宿主免拷贝的那条路；填充语义 = 首尾自动闭合）
@@ -209,7 +227,12 @@ float* rowCovScratch(int w, bool& grew) {
 // 行循环：一批已建好的边 → 逐行覆盖率，每落一个像素回调 sink(yy, xi, c)，c 已钳到 [0,1]。
 // **落覆盖率的出口只有这一处**：合成路径（float 缓冲）与导出的覆盖率 API（uint8）都走
 // 这里，所以"覆盖率"在库里只有一份实现，不会漂。
-template <class RowSink>
+//
+// kFusedRow（0.13.x）：给"算完一行就地混合"的实心填充用。置 true 时**不写 rowCov**，
+// 而是把 rowAcc/rowDelta 直接交给 sink，由它在前缀和那一趟里顺手落像素 ——
+// 省掉"写 rowCov + 再读一遍"的一整趟（大卡片一行 994 像素，这一趟就是 8 B/px）。
+// 契约：kFusedRow 时 sink 必须自己把 [tLo,tHi] 的 rowAcc/rowDelta 清回 0（下一行要用）。
+template <bool kFusedRow = false, class RowSink>
 void RasterEdges(std::vector<Edge>& edges, FillRule rule, int baseX, int y0, int w, int h,
                  int nSub, bool hardEdge, RowSink&& sink) {
     if (edges.empty() || w <= 0 || h <= 0) return;
@@ -344,18 +367,23 @@ void RasterEdges(std::vector<Edge>& edges, FillRule rule, int baseX, int y0, int
         }
 
         if (tHi < tLo) continue;
-        // 前缀和：只在 [tLo,tHi] 上，顺带把两个累加器清回 0。
-        // 每个像素最多收到 nSub × 1/nSub，min(1,c) 一次就够，省掉整行的二次 clamp。
-        float run = 0.0f;
-        for (int xi = tLo; xi <= tHi; ++xi) {
-            const size_t k = static_cast<size_t>(xi);
-            run += rowDelta[k];
-            const float c = rowAcc[k] + run;
-            rowAcc[k] = 0.0f;
-            rowDelta[k] = 0.0f;
-            rowCov[k] = c <= 0.0f ? 0.0f : (c > 1.0f ? 1.0f : c);
+        if constexpr (kFusedRow) {
+            // 融合出口：sink 自己在同一趟里做前缀和 + 落像素 + 清零
+            sink(yy, tLo, tHi, rowAcc, rowDelta);
+        } else {
+            // 前缀和：只在 [tLo,tHi] 上，顺带把两个累加器清回 0。
+            // 每个像素最多收到 nSub × 1/nSub，min(1,c) 一次就够，省掉整行的二次 clamp。
+            float run = 0.0f;
+            for (int xi = tLo; xi <= tHi; ++xi) {
+                const size_t k = static_cast<size_t>(xi);
+                run += rowDelta[k];
+                const float c = rowAcc[k] + run;
+                rowAcc[k] = 0.0f;
+                rowDelta[k] = 0.0f;
+                rowCov[k] = c <= 0.0f ? 0.0f : (c > 1.0f ? 1.0f : c);
+            }
+            sink(yy, tLo, tHi, rowCov);
         }
-        sink(yy, tLo, tHi, rowCov);
     }
 }
 
@@ -535,6 +563,111 @@ inline void RowSolid(uint8_t* dstRow, const float* cov, const float* mask, int x
         } else {
             BlendOne<M>(dstRow + static_cast<size_t>(x0 + i) * 4, color * c);
         }
+    }
+}
+
+// ---- 实心色的"整段落像素"（0.13.x）----
+//
+// 一段覆盖率恒为 1 的像素，三种模式的写法：
+//   · SrcOver + 不透明色：直接 4 字节直写（= BlendOne 的 SrcOver 早退分支）；
+//   · Replace          ：同样 4 字节直写；
+//   · SrcOver + 半透明 ：out_c = src_c + Div255(dst_c * (255-srcA))。
+// 最后一种在 UI 里占比很高（卡片常用 0xCC/0xE6 的白/黑），逐像素要 4 次乘 + 4 次
+// Div255。而**一次绘制内 src 颜色是常数**，于是 Div255(v*inv) 只是一张 256 项的表
+// （按 inv 缓存，256 次整数运算），内层退化成 4 次查表 + 4 次加法 ——
+// 数值与 Div255 逐位相同（同一份 `(x+128+((x+128)>>8))>>8`）。
+// 覆盖率为 1 的一段像素。
+template <BlendMode M>
+inline void BlendSpanFull(uint8_t* d, int n, const Color& color, bool wordStore, uint32_t word,
+                          bool swarBlend) {
+    if (M == BlendMode::Replace || (M == BlendMode::SrcOver && wordStore)) {
+        for (int k = 0; k < n; ++k, d += 4) std::memcpy(d, &word, 4);
+        return;
+    }
+    if (M == BlendMode::SrcOver && swarBlend) {
+        // SWAR：一次处理 4 个通道。预乘 SrcOver 的半透明分支，
+        //   out_c = src_c + Div255(dst_c * inv)
+        // 两个 16 位半区分别乘 inv（每 lane ≤ 65025，不串位）→ 每个 lane 做一次
+        // 与 Div255 完全相同的 (x+128+((x+128)>>8))>>8 → 拼回 + 加 src（每 lane 和 ≤255，
+        // 不会进位串到邻居）。与逐通道版本**逐位相同**（差分测试兜着）。
+        const uint32_t srcWord = static_cast<uint32_t>(color.r) |
+                                 (static_cast<uint32_t>(color.g) << 8) |
+                                 (static_cast<uint32_t>(color.b) << 16) |
+                                 (static_cast<uint32_t>(color.a) << 24);
+        const uint32_t inv = static_cast<uint32_t>(255 - color.a);
+        auto div255x2 = [](uint32_t x) {
+            const uint32_t t = x + 0x00800080u;   // 每 lane +128
+            return (((t + ((t >> 8) & 0x00FF00FFu)) >> 8) & 0x00FF00FFu);
+        };
+        for (int k = 0; k < n; ++k, d += 4) {
+            uint32_t dv;
+            std::memcpy(&dv, d, 4);
+            const uint32_t lo = div255x2((dv & 0x00FF00FFu) * inv);
+            const uint32_t hi = div255x2(((dv >> 8) & 0x00FF00FFu) * inv);
+            const uint32_t out = (lo | (hi << 8)) + srcWord;
+            std::memcpy(d, &out, 4);
+        }
+        return;
+    }
+    for (int k = 0; k < n; ++k, d += 4) BlendOne<M>(d, color);
+}
+
+// 一次绘制内不变的那几个量，省得每行/每段重算。
+struct SolidWriter {
+    Color color;
+    bool wordStore = false;   // SrcOver + 不透明 / Replace：4 字节直写
+    bool swarBlend = false;   // SrcOver + 半透明：SWAR 一次算 4 个通道
+    uint32_t word = 0;
+
+    SolidWriter() = default;
+    explicit SolidWriter(BlendMode mode, const Color& c) : color(c) {
+        word = static_cast<uint32_t>(c.r) | (static_cast<uint32_t>(c.g) << 8) |
+               (static_cast<uint32_t>(c.b) << 16) | (static_cast<uint32_t>(c.a) << 24);
+        if (mode == BlendMode::Replace) {
+            wordStore = true;           // Replace 就是把 4 个字节写进去
+        } else if (mode == BlendMode::SrcOver) {
+            wordStore = (c.a == 255);
+            swarBlend = !wordStore;     // 半透明：走 SWAR 混合
+        }
+    }
+};
+
+// ---- 实心填充的"覆盖率就地混合"（0.13.x：圆角实心快路径用）----
+//
+// 与 RowSolid 的关系：**逐位相同的落像素语义**（同样的 c<=0 跳过、c>=1 省乘法、
+// BlendOne 分支），差别只有两点：
+//   ① 只处理 [tLo,tHi] 这一段的覆盖率数组（RasterEdges 只保证这一段有效），
+//      mask / alphaScale 由调用方保证是"无遮罩、1.0"——快路径的适用条件里已经卡死；
+//   ② **整像素段按 32 位字写**：SrcOver + 不透明源色时 BlendOne 写的就是 4 个字节
+//      r,g,b,255，与一次 uint32 存完全等价（小端下字节序一致，已在差分测试里逐字节验过）。
+//      这一条是"中段整宽直接走 32 位直写"的落点：大卡片一行的中段有几百像素，
+//      每像素 4 次字节存 → 1 次字存。
+//
+// 为什么值得单开一条而不是直接调 RowSolid：RowSolid 每像素都要判 mask/alphaScale
+// 两个循环不变量，而这里它们在快路径上恒为 nullptr/1.0，判一遍就够。
+template <BlendMode M>
+inline void CompositeRowDirect(uint8_t* dstRow, const float* cov, int tLo, int tHi, int x0,
+                               const SolidWriter& w) {
+    if (w.color.a == 0 && !ZeroAlphaMatters(M)) return;   // 循环不变量，提到外面
+    int i = tLo;
+    while (i <= tHi) {
+        const float c = cov[static_cast<size_t>(i)];
+        if (c <= 0.0f) {
+            ++i;
+            continue;
+        }
+        if (c >= 1.0f) {
+            // 整像素段：先扫出连续区间，再整段写
+            int j = i + 1;
+            while (j <= tHi && cov[static_cast<size_t>(j)] >= 1.0f) ++j;
+            BlendSpanFull<M>(dstRow + static_cast<size_t>(x0 + i) * 4u, j - i, w.color,
+                             w.wordStore, w.word, w.swarBlend);
+            i = j;
+            continue;
+        }
+        // 部分覆盖像素：只可能在一条边/一个角的端点上，每次绘制每行最多 2 个
+        BlendOne<M>(dstRow + static_cast<size_t>(x0 + i) * 4u, w.color * c);
+        ++i;
     }
 }
 
@@ -1108,6 +1241,265 @@ bool RasterizeRoundedTileCoverage(int radius, bool stroke, CoverageRect& out) {
     return true;
 }
 
+// ------------------------------------------------------------
+// 实心填充的"覆盖率就地混合"版本（0.13.x）
+//
+// 与 FillPath 的关系：**几何、覆盖率、落像素语义三者完全相同**，唯一差别是不再有
+// `Cover` 那块浮点缓冲（4 B/px × bbox 的清零 + 写入 + 读回）。覆盖率由同一份
+// `RasterEdges` 产出，逐行算完立刻混合进目标，于是：
+//   · 省掉 bbox 级 `v.assign(w*h, 0)`（大卡片 994×118 = 47 万字节的清零）；
+//   · 省掉覆盖率缓冲的写 + 读（每像素 8 B 的内存往返）；
+//   · 允许 `CompositeRowDirect` 把整像素段按 32 位字写（见那里的注释）。
+//
+// 适用条件（不满足就退回 FillPath，像素完全不变）：
+//   · 颜料是纯色（渐变/图片的颜料逐像素不同，不能按常数写）；
+//   · 变换只有平移（旋转/缩放时覆盖率与设备坐标的对应关系不再按行可解，
+//     走 FillPath 的通用路径）；
+//   · 没有 mask（mask 逐像素不同）。
+// 逐位相同的理由：覆盖率数组来自同一个 RasterEdges、同一套 8 子采样与差分
+// 前缀和；落像素走 CompositeRowDirect，它的每个分支与 RowSolid 一一对应
+// （c<=0 跳过、c>=1 省乘法、BlendOne 的同一套混合公式）。tests/test_raster.cpp
+// 的 TestRoundedFastPathDiff 用几十组随机矩形做逐字节比对来兜这条。
+template <BlendMode M>
+void FillPathSolidDirect(const RasterTarget& t, const std::vector<Polyline>& polys,
+                         const Color& color) {
+    const Rect bbox = PolysBounds(polys);
+    if (bbox.empty()) return;
+    int x0 = 0, y0 = 0, w = 0, h = 0;
+    // 与 FillPath 的 `cover.reset(bbox, clip ∩ surface.bounds())` 同一套取整
+    if (!ClipPixels(bbox, Rect::intersect(t.clip, t.surface->bounds()), x0, y0, w, h)) return;
+    std::vector<Edge>& edges = edgesScratch();
+    BuildEdges(polys, edges);
+    if (edges.empty()) return;
+    Surface& dst = *t.surface;
+    const int dh = dst.height();
+    RasterEdges(edges, FillRule::NonZero, x0, y0, w, h, kSubSamples, false,
+                [&dst, &color, x0, y0, dh](int yy, int tLo, int tHi, const float* cov) {
+                    const int py = y0 + yy;
+                    if (py < 0 || py >= dh) return;   // 理论上 clip 已挡住，留着兜底
+                    CompositeRowDirect<M>(dst.row(py), cov, tLo, tHi, x0, color);
+                });
+}
+
+// ---- 圆角矩形展平结果的单条缓存（0.13.x）----
+//
+// UI 里同一张卡片/按钮每帧都以**完全相同的尺寸**重画（布局不变、只有内容变），
+// 而"Path::addRoundedRect + 贝塞尔细分"每次要 0.5 µs 左右（实测：建 Path 170 ns +
+// flatten 375 ns，都在做小 vector 的 push_back/扩容）。这里把**设备空间**折线缓存
+// 一条：键是全部会影响点坐标的输入（矩形 x/y/w/h、半径、展平容差、平移 e/f），
+// 命中就完全跳过 Path 与细分。
+//
+// 为什么缓存是安全的：点坐标只由这些 float 决定，键用**逐位比较**；任何输入不同
+// 都会 miss。缓存只在单线程内（thread_local），且不持有指针（Polylines 自持内存）。
+struct RoundedPolyCache {
+    bool valid = false;
+    float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f, rad = 0.0f, tol = 0.0f, e = 0.0f, f = 0.0f;
+    std::vector<Polyline> polys;   // 设备空间
+};
+
+RoundedPolyCache& roundedPolyCache() {
+    static thread_local RoundedPolyCache cache;
+    return cache;
+}
+
+// ---- 融合版：前缀和 + 落像素一趟做完（0.13.x，给圆角实心快路径的上下圆角带用）----
+// 与 "RasterEdges 写 rowCov → CompositeRowDirect 再读" 的关系：覆盖率**同一个值**，
+// 只是不再把整行写进 rowCov 再读回来。整像素段（c 已经 ≥1）在这里表现为
+// "delta==0 且 acc==0 的连续像素"（前缀和不再变化 ⇒ 覆盖率恒为当前 run），
+// 于是可以直接快进整段并按 32 位字写。
+// 契约（与 RasterEdges<true> 配套）：本函数负责把 [tLo,tHi] 的 acc/delta 清回 0。
+template <BlendMode M>
+inline void CompositeRowFused(uint8_t* dstRow, float* acc, float* delta, int tLo, int tHi,
+                              int x0, const SolidWriter& w) {
+    const Color& color = w.color;
+    if (color.a == 0 && !ZeroAlphaMatters(M)) {
+        for (int i = tLo; i <= tHi; ++i) {
+            acc[i] = 0.0f;
+            delta[i] = 0.0f;
+        }
+        return;
+    }
+    // 落一段"覆盖率恒为 run"的连续像素（run 由调用方保证已经算好）。
+    auto emitRun = [&](int i, int j, float run) {
+        if (j <= i || run <= 0.0f) return;
+        const float c = run > 1.0f ? 1.0f : run;
+        uint8_t* d = dstRow + static_cast<size_t>(x0 + i) * 4u;
+        if (c >= 1.0f) {
+            BlendSpanFull<M>(d, j - i, color, w.wordStore, w.word, w.swarBlend);
+        } else {
+            const Color scaled = color * c;
+            for (int k = i; k < j; ++k, d += 4) BlendOne<M>(d, scaled);
+        }
+    };
+    float run = 0.0f;
+    int i = tLo;
+    while (i <= tHi) {
+        // 快进段：delta 与 acc 都是 0 ⇒ 前缀和不变 ⇒ 覆盖率恒等于当前 run。
+        // 圆角带的"中段整宽"就是这一段（一行 1000 像素里 900+ 属于它），
+        // 这里不做算术、也不写回（0 本来就是 0，下一行照样从 0 开始）。
+        // 注意必须**从头逐个确认**到第一个非零项为止：从右端往回扫虽然更快，
+        // 但会跳过中间可能存在的非零项（多跨度行），那是错的。
+        if (delta[i] == 0.0f && acc[i] == 0.0f) {
+            int j = i + 1;
+            while (j <= tHi && delta[j] == 0.0f && acc[j] == 0.0f) ++j;
+            emitRun(i, j, run);
+            i = j;
+            continue;
+        }
+        run += delta[i];
+        const float raw = acc[i] + run;
+        acc[i] = 0.0f;
+        delta[i] = 0.0f;
+        const float c = raw <= 0.0f ? 0.0f : (raw > 1.0f ? 1.0f : raw);
+        if (c <= 0.0f) {
+            ++i;
+            continue;
+        }
+        if (c >= 1.0f) {
+            // 整像素段：delta/acc 都为 0 的连续像素覆盖率恒等于当前 run（≥1）
+            int j = i + 1;
+            while (j <= tHi && delta[j] == 0.0f && acc[j] == 0.0f) {
+                acc[j] = 0.0f;
+                delta[j] = 0.0f;
+                ++j;
+            }
+            emitRun(i, j, run);
+            i = j;
+            continue;
+        }
+        BlendOne<M>(dstRow + static_cast<size_t>(x0 + i) * 4u, color * c);
+        ++i;
+    }
+}
+
+// ---- 圆角矩形"中段行"的解析落像素（0.13.x）----
+//
+// 圆角矩形在设备空间里分三段：上圆角带 / **中段（左右两条边是垂直线）** / 下圆角带。
+// 中段每一行里，扫描线只会产生两个交叉点 x0、x1，且这两条边是**垂直**的
+// （dyInv == 0），于是"8 次子采样"给出的端像素覆盖率就是同一个值的 8 次相加 ——
+// 这正是下面这几行在做的事，与 `addSpan` 的加法顺序**逐个对齐**：
+//   · 左端：8 × `(ia+1 - x0) * 1/8`；
+//   · 右端：8 × `(x1 - ib) * 1/8`（且只在 x1-ib > 0 时才加）；
+//   · 中段：8 条子扫描线的差分各 +1/8 / −1/8，前缀和恰好是 8 × 1/8 = 1.0（二进制精确），
+//     所以整像素的覆盖率**精确等于 1.0** —— 可以按 32 位字直写（BlendOne 在
+//     SrcOver + 不透明源色下写的就是 r,g,b,255 四个字节）。
+// 与 `RowSolid` 的逐位等价点：c<=0 跳过、c>=1 省掉通道乘法、其余走 color*c。
+//
+// 这样做把中段每一行从"8 次子采样 × 求交排序 + 整行前缀和"降到 O(1) 的端点计算 +
+// 一次整段直写 —— 大卡片 118 行里有 94 行是中段。
+template <BlendMode M>
+inline void CompositeRectRowDirect(uint8_t* dstRow, float xLeft, float xRight, int xClipLo,
+                                   int xClipHi, const SolidWriter& w) {
+    const Color& color = w.color;
+    // 裁剪：与 addSpan 的 lo=max(xa,minX) / hi=min(xb,maxX) 逐字对应。
+    // 卡片比窗口宽时（binUI 的常态）左右边界会被裁掉，这里必须照做，
+    // 否则会写到画布外 —— 早先的做法是"一旦被裁就整条退回扫描线"，
+    // 于是"大片被裁的卡片"全都吃不到这条快路径。
+    const float minX = static_cast<float>(xClipLo);
+    const float maxX = static_cast<float>(xClipHi);
+    if (xLeft < minX) xLeft = minX;
+    if (xRight > maxX) xRight = maxX;
+    if (xRight <= xLeft) return;
+    const int ia = static_cast<int>(std::floor(xLeft));
+    const int ib = static_cast<int>(std::floor(xRight));
+    if (ib < ia) return;
+    const float subWeight = 1.0f / static_cast<float>(kSubSamples);
+    const bool emptySrc = (color.a == 0 && !ZeroAlphaMatters(M));
+    if (emptySrc) return;
+    auto clamp01 = [](float c) { return c <= 0.0f ? 0.0f : (c > 1.0f ? 1.0f : c); };
+    auto put = [&](int px, float c) {
+        if (c <= 0.0f) return;
+        uint8_t* d = dstRow + static_cast<size_t>(px) * 4u;
+        if (c >= 1.0f) BlendOne<M>(d, color);
+        else BlendOne<M>(d, color * c);
+    };
+
+    if (ia == ib) {
+        // 整个跨度落在同一个像素里：8 × (xRight-xLeft)*1/8
+        const float t = (xRight - xLeft) * subWeight;
+        float c = 0.0f;
+        for (int s = 0; s < kSubSamples; ++s) c += t;
+        put(ia, clamp01(c));
+        return;
+    }
+    // 左端像素
+    const float tl = (static_cast<float>(ia + 1) - xLeft) * subWeight;
+    float cl = 0.0f;
+    for (int s = 0; s < kSubSamples; ++s) cl += tl;
+    put(ia, clamp01(cl));
+    // 中段整像素：覆盖率恒为 1.0
+    const int nMid = ib - ia - 1;
+    if (nMid > 0) {
+        BlendSpanFull<M>(dstRow + static_cast<size_t>(ia + 1) * 4u, nMid, color, w.wordStore,
+                         w.word, w.swarBlend);
+    }
+    // 右端像素
+    const float tr = xRight - static_cast<float>(ib);
+    if (tr > 0.0f) {
+        const float t = tr * subWeight;
+        float c = 0.0f;
+        for (int s = 0; s < kSubSamples; ++s) c += t;
+        put(ib, clamp01(c));
+    }
+}
+
+// 圆角实心填充的总入口：中段行解析直写，上下圆角带走同一套扫描线。
+// devRect/rad 由调用方按 path.h 的同一套规则算好（rad 已夹到短边一半）。
+template <BlendMode M>
+void FillRoundedSolidDirect(const RasterTarget& t, const std::vector<Polyline>& polys,
+                            const Rect& devRect, float rad, const SolidWriter& writer) {
+    const Rect bbox = PolysBounds(polys);
+    if (bbox.empty()) return;
+    int bx = 0, by = 0, bw = 0, bh = 0;
+    if (!ClipPixels(bbox, Rect::intersect(t.clip, t.surface->bounds()), bx, by, bw, bh)) return;
+    std::vector<Edge>& edges = edgesScratch();
+    BuildEdges(polys, edges);
+    if (edges.empty()) return;
+    Surface& dst = *t.surface;
+    const int dh = dst.height();
+    const int rowEnd = by + bh;
+
+    // 注意 yy 是**相对本次调用 y0** 的行号（上下两条带各自从自己的 y0 起算），
+    // 所以这里必须把该次调用的 y0 一起带进来 —— 早先写成外层 by 时，下带的覆盖率
+    // 被写到了上带的行上（像素差一目了然：整行都是同一个错值）。
+    auto makeBandSink = [&dst, &writer, bx, dh](int yBase) {
+        return [&dst, &writer, bx, yBase, dh](int yy, int tLo, int tHi, float* acc, float* delta) {
+            const int py = yBase + yy;
+            if (py < 0 || py >= dh) {
+                // 契约：即使这一行不落像素，也必须把累加器清回 0（下一行要用）
+                for (int i = tLo; i <= tHi; ++i) { acc[i] = 0.0f; delta[i] = 0.0f; }
+                return;
+            }
+            CompositeRowFused<M>(dst.row(py), acc, delta, tLo, tHi, bx, writer);
+        };
+    };
+
+    // 中段行区间 [midBegin, midEnd)：只有"整行都落在 y0+rad .. y1-rad 之间"的行才是
+    // 纯矩形截面；四条边还必须完整落在可见范围内（否则解析直写会写到裁剪区外）。
+    int midBegin = by, midEnd = by;   // 空区间 = 不做中段快路径
+    // 一行 [py,py+1) 完全落在中段的条件：py >= y0+rad 且 py+1 <= y1-rad
+    // → 起点 ceil(y0+rad)、终点 floor(y1-rad)（终点是"开区间上界"）。
+    // 写成 ceil(y1-rad) 会把"被下边切了一刀"的那一行也算进来 —— 实测像素差就到那一行。
+    const int candBegin = static_cast<int>(std::ceil(devRect.y + rad));
+    const int candEnd = static_cast<int>(std::floor(devRect.bottom() - rad));
+    if (candEnd > candBegin) {
+        midBegin = std::max(candBegin, by);
+        midEnd = std::min(candEnd, rowEnd);
+    }
+
+    if (midBegin > by)
+        RasterEdges<true>(edges, FillRule::NonZero, bx, by, bw, midBegin - by, kSubSamples,
+                          false, makeBandSink(by));
+    for (int py = midBegin; py < midEnd; ++py) {
+        // 中段的左右边界：垂直边在 8 条子扫描线上的 x 恒等于端点 x（dyInv == 0）
+        CompositeRectRowDirect<M>(dst.row(py), devRect.x, devRect.right(), bx, bx + bw,
+                                  writer);
+    }
+    if (midEnd < rowEnd)
+        RasterEdges<true>(edges, FillRule::NonZero, bx, midEnd, bw, rowEnd - midEnd,
+                          kSubSamples, false, makeBandSink(midEnd));
+}
+
 void FillPath(const RasterTarget& t, const Path& path, FillRule rule,
               const Paint& paint, const Transform& xf, float tolerancePx) {
     if (!t.valid() || path.empty()) return;
@@ -1122,6 +1514,83 @@ void FillPath(const RasterTarget& t, const Path& path, FillRule rule,
     if (cover.empty()) return;
     RasterPolys(polys, rule, false, cover, kSubSamples, false);
     Composite(t, cover, paint, inv, 1.0f);
+}
+
+// ------------------------------------------------------------
+// 描边的稀疏落像素（0.13.x）
+//
+// 1px 圆角环的覆盖率只落在"每行两小段"上，但原实现要为它：
+//   ① 分配并清零整个 bbox 的浮点覆盖率（994×118 = 470 KB/call）；
+//   ② 把整个 bbox 合成一遍（每行 994 个像素里只有 2~4 个非零）。
+// 这里把两笔都省掉：
+//   · 覆盖率写进**线程常驻**缓冲（保持"全零"不变量：用完把碰过的行段清回 0）；
+//   · 记录每块碰到的行段，合成只在段内做；同一行相邻/重叠的段先合并，
+//     所以重叠像素只合成一次（与 union 取 max 的语义一致）。
+// 覆盖率数值与 RasterPolys 的 union 分支**完全同一套**（同一份 RasterEdges、
+// 同样的 max），落像素走 CompositeRowDirect（与 RowSolid 逐位对应）。
+template <BlendMode M>
+void StrokePathSolidDirect(const RasterTarget& t, const std::vector<Polyline>& devPieces,
+                           const Rect& bbox, const SolidWriter& writer) {
+    int x0 = 0, y0 = 0, w = 0, h = 0;
+    if (!ClipPixels(bbox, Rect::intersect(t.clip, t.surface->bounds()), x0, y0, w, h)) return;
+
+    struct Span {
+        int yy;
+        int lo;
+        int hi;
+    };
+    static thread_local std::vector<float> buf;
+    static thread_local std::vector<Span> spans;
+    const size_t need = static_cast<size_t>(w) * static_cast<size_t>(h);
+    if (buf.size() < need) buf.assign(need, 0.0f);   // 扩容时清零；此后一直保持全零
+    Cover cover;
+    cover.attach(x0, y0, w, h, buf.data());
+    spans.clear();
+
+    std::vector<Edge>& edges = edgesScratch();
+    for (const Polyline& piece : devPieces) {
+        edges.clear();
+        AppendEdges(piece, edges);
+        if (edges.empty()) continue;
+        RasterEdges(edges, FillRule::NonZero, x0, y0, w, h, kSubSamples, false,
+                    [&cover](int yy, int tLo, int tHi, const float* cov) {
+                        float* dstRow = cover.row(yy);
+                        bool touched = false;
+                        for (int xi = tLo; xi <= tHi; ++xi) {
+                            const float c = cov[xi];
+                            if (c <= 0.0f) continue;
+                            if (c > dstRow[xi]) dstRow[xi] = c;   // union：取 max
+                            touched = true;
+                        }
+                        if (touched) spans.push_back(Span{yy, tLo, tHi});
+                    });
+    }
+    if (spans.empty()) return;
+
+    // 按 (行, 左端) 排序后合并重叠段：并集只合成一次
+    std::sort(spans.begin(), spans.end(), [](const Span& a, const Span& b) {
+        return a.yy != b.yy ? a.yy < b.yy : a.lo < b.lo;
+    });
+    Surface& dst = *t.surface;
+    const int dh = dst.height();
+    size_t s = 0;
+    while (s < spans.size()) {
+        const int yy = spans[s].yy;
+        int lo = spans[s].lo;
+        int hi = spans[s].hi;
+        size_t e = s + 1;
+        while (e < spans.size() && spans[e].yy == yy && spans[e].lo <= hi + 1) {
+            if (spans[e].hi > hi) hi = spans[e].hi;
+            ++e;
+        }
+        float* covRow = cover.row(yy);
+        const int py = y0 + yy;
+        if (py >= 0 && py < dh) {
+            CompositeRowDirect<M>(dst.row(py), covRow, lo, hi, x0, writer);
+        }
+        for (int xi = lo; xi <= hi; ++xi) covRow[xi] = 0.0f;   // 恢复"全零"不变量
+        s = e;
+    }
 }
 
 void StrokePath(const RasterTarget& t, const Path& path, const Paint& paint,
@@ -1159,6 +1628,32 @@ void StrokePath(const RasterTarget& t, const Path& path, const Paint& paint,
         devPieces.push_back(std::move(pl));
     }
     bbox = Rect(bbox.x - pad, bbox.y - pad, bbox.w + pad * 2.0f, bbox.h + pad * 2.0f);
+
+    // ---- 实心 + 平移 + 无 mask：稀疏落像素（0.13.x）----
+    // 描边覆盖率的面积利用率极低（1px 环只占 bbox 的百分之几），
+    // 这里不再按整个 bbox 分配/清零/合成。像素逐字节等同（差分测试兜着）。
+    static const bool noStrokeDirect = std::getenv("BIN2D_NO_STROKE_DIRECT") != nullptr;
+    if (!noStrokeDirect && t.mask == nullptr && xf.isTranslationOnly() &&
+        paint.kind == PaintKind::Solid) {
+        const SolidWriter writer(t.blend, paint.color);
+        switch (t.blend) {
+        case BlendMode::SrcOver:
+            StrokePathSolidDirect<BlendMode::SrcOver>(t, devPieces, bbox, writer);
+            return;
+        case BlendMode::Replace:
+            StrokePathSolidDirect<BlendMode::Replace>(t, devPieces, bbox, writer);
+            return;
+        case BlendMode::Erase:
+            StrokePathSolidDirect<BlendMode::Erase>(t, devPieces, bbox, writer);
+            return;
+        case BlendMode::Keep:
+            StrokePathSolidDirect<BlendMode::Keep>(t, devPieces, bbox, writer);
+            return;
+        case BlendMode::Additive:
+            StrokePathSolidDirect<BlendMode::Additive>(t, devPieces, bbox, writer);
+            return;
+        }
+    }
 
     Cover cover;
     cover.reset(bbox, Rect::intersect(t.clip, t.surface->bounds()));
@@ -1247,6 +1742,70 @@ void FillRoundedRect(const RasterTarget& t, const Rect& r, float radius,
             return;
         }
     }
+    // ---- 非整像素对齐 + 实心 + 平移 + 无 mask：覆盖率就地混合（0.13.x）----
+    // 上面那条"九宫格拆条"只在四条边都落在整像素上时才成立（中段才能按常数直写）。
+    // UI 里大量元素是 .5 / .25 像素位置（居中、百分比布局、DPI 1.25/1.5），它们
+    // 以前整条掉回"Cover 浮点缓冲 + 二次读回"，实测 2.7~4.3 ns/px（整对齐 0.43~0.84）。
+    // 这里不再拆条，而是**整个形状**走一条"算完一行覆盖率立刻混合"的扫描线：
+    // 覆盖率与 FillPath 逐位相同，落像素见 CompositeRowDirect。
+    static const bool noDirect = std::getenv("BIN2D_NO_RR_DIRECT") != nullptr;
+    static const bool directTrace = std::getenv("BIN2D_TRACE_RR_DIRECT") != nullptr;
+    if (directTrace) {
+        std::fprintf(stderr, "[rr-direct] x=%.1f y=%.1f %.1fx%.1f r=%.1f a=%d blend=%d trans=%d mask=%d solid=%d -> %s\n",
+                     r.x, r.y, r.w, r.h, radius, static_cast<int>(paint.color.a), static_cast<int>(t.blend), xf.isTranslationOnly() ? 1 : 0, t.mask ? 1 : 0,
+                     paint.kind == PaintKind::Solid ? 1 : 0,
+                     (!noDirect && t.mask == nullptr && xf.isTranslationOnly() &&
+                      paint.kind == PaintKind::Solid) ? "direct" : "full-path");
+    }
+    if (!noDirect && t.mask == nullptr && xf.isTranslationOnly() &&
+        paint.kind == PaintKind::Solid) {
+        // 与 path.h::addRoundedRect 同一套夹取：半径不超过短边一半
+        float rad = radius;
+        const float lim = std::min(r.w, r.h) * 0.5f;
+        if (rad > lim) rad = lim;
+        if (rad < 0.0f) rad = 0.0f;
+        const float kTol = 0.25f;
+        RoundedPolyCache& cache = roundedPolyCache();
+        const bool hit = cache.valid && cache.x == r.x && cache.y == r.y && cache.w == r.w &&
+                         cache.h == r.h && cache.rad == rad && cache.tol == kTol &&
+                         cache.e == xf.e && cache.f == xf.f;
+        if (!hit) {
+            Path p;
+            p.addRoundedRect(r, radius);   // 注意传**原始半径**：夹取在 Path 里做，与旧路径一致
+            if (p.empty()) {
+                if (rad <= 0.0f) return;   // 退化成空（r 为空已在上面挡掉）
+            } else {
+                cache.polys = FlattenToDevice(p, xf, kTol);
+                cache.valid = !cache.polys.empty();
+                cache.x = r.x; cache.y = r.y; cache.w = r.w; cache.h = r.h;
+                cache.rad = rad; cache.tol = kTol; cache.e = xf.e; cache.f = xf.f;
+            }
+        }
+        if (cache.valid) {
+            // 笔刷（字色/查表/直写标志）每次绘制算一次：半透明色的 Div255 查表也在里面
+            SolidWriter writer(t.blend, paint.color);
+            const Rect devRect(r.x + xf.e, r.y + xf.f, r.w, r.h);
+            switch (t.blend) {
+            case BlendMode::SrcOver:
+                FillRoundedSolidDirect<BlendMode::SrcOver>(t, cache.polys, devRect, rad, writer);
+                return;
+            case BlendMode::Replace:
+                FillRoundedSolidDirect<BlendMode::Replace>(t, cache.polys, devRect, rad, writer);
+                return;
+            case BlendMode::Erase:
+                FillRoundedSolidDirect<BlendMode::Erase>(t, cache.polys, devRect, rad, writer);
+                return;
+            case BlendMode::Keep:
+                FillRoundedSolidDirect<BlendMode::Keep>(t, cache.polys, devRect, rad, writer);
+                return;
+            case BlendMode::Additive:
+                FillRoundedSolidDirect<BlendMode::Additive>(t, cache.polys, devRect, rad,
+                                                            writer);
+                return;
+            }
+        }
+    }
+
     Path p;
     p.addRoundedRect(r, radius);
     FillPath(t, p, FillRule::NonZero, paint, xf);

@@ -3,6 +3,9 @@
 #include "bin2d/image.h"
 #include "bin2d/raster.h"
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <functional>
 #include <vector>
 #include "test_util.h"
 
@@ -774,6 +777,183 @@ static void TestBlurSigma() {
     }
 }
 
+// ------------------------------------------------------------
+// 圆角实心快路径：差分（新路径 vs 通用路径）+ 微基准
+//
+// 背景（0.13.x）：`FillRoundedRect` 在"平移 + 实心 + 无 mask"时不再落 Cover 浮点
+// 缓冲，而是逐行算完覆盖率就地混合；中段行（左右两条边是垂直线）进一步用解析式
+// 算端像素、中段整宽按 32 位直写。快路径唯一允许的差别是**更快**，像素必须逐字节
+// 相同 —— 所以这里拿同一个形状走 `FillPath`（通用路径，未被改动的参考实现）逐字节比。
+//
+// 覆盖的输入：0/.25/.37/.5/.83/.13 六种小数偏移 × 7 种半径（含 0 和药丸）×
+// 4 种颜色（不透明/半透明）× 6 种尺寸。差异必须为 0：如果哪天有人改了其中一条
+// 路径的覆盖率公式，这个测试会立刻红。
+static void TestRoundedFastPathDiff() {
+    const float offsets[] = {0.0f, 0.25f, 0.37f, 0.5f, 0.83f, 0.13f};
+    const float radii[] = {0.0f, 1.0f, 2.0f, 4.0f, 8.0f, 12.0f, 20.0f};
+    const uint32_t colors[] = {0xFFFF0000u, 0x803E8BFFu, 0x40123456u, 0xFFD8DEE9u};
+    const int sizes[][2] = {{11, 9}, {13, 14}, {40, 24}, {100, 40}, {120, 118}, {300, 120}};
+
+    int cases = 0, bad = 0, maxDelta = 0;
+    for (int si = 0; si < 6; ++si) {
+        for (int oi = 0; oi < 6; ++oi) {
+            for (int ri = 0; ri < 7; ++ri) {
+                for (int ci = 0; ci < 4; ++ci) {
+                    const float ox = offsets[oi];
+                    const float oy = offsets[(oi + 2) % 6];
+                    const Rect r(7.0f + ox, 5.0f + oy, static_cast<float>(sizes[si][0]),
+                                 static_cast<float>(sizes[si][1]));
+                    const float radius = radii[ri];
+                    const Paint paint = Paint::solid(Color::argb(colors[ci]));
+                    const Transform xf = Transform::translate(3.0f + ox, 2.0f + oy);
+
+                    Surface fast(340, 150), ref(340, 150);
+                    FillRoundedRect(MakeTarget(fast), r, radius, paint, xf);
+
+                    Path p;
+                    p.addRoundedRect(r, radius);
+                    FillPath(MakeTarget(ref), p, FillRule::NonZero, paint, xf);
+
+                    bool same = true;
+                    for (int y = 0; y < fast.height() && same; ++y) {
+                        const uint8_t* pa = fast.row(y);
+                        const uint8_t* pb = ref.row(y);
+                        for (int k = 0; k < fast.width() * 4; ++k) {
+                            const int d = std::abs(static_cast<int>(pa[k]) -
+                                                   static_cast<int>(pb[k]));
+                            if (d != 0) {
+                                same = false;
+                                if (d > maxDelta) maxDelta = d;
+                                break;
+                            }
+                        }
+                    }
+                    ++cases;
+                    if (!same) ++bad;
+                }
+            }
+        }
+    }
+    std::printf("  （差分 %d 组：不一致 %d 组，最大通道差 %d）\n", cases, bad, maxDelta);
+    CHECK(bad == 0, "raster: 圆角实心快路径与通用路径逐字节相同（非对齐/药丸/radius=0 全包）");
+    CHECK(maxDelta == 0, "raster: 快路径没有任何末位差（差分为 0，不是 ≤1）");
+}
+
+// 微基准：同一条形状走"快路径"与"通用路径"，纯 CPU 循环、同进程 A/B。
+// 只打印不判定 —— 机器被抢占时墙钟会放大，断言时间只会变成随机红。
+static double BenchBestMs(const std::function<void()>& fn, int iters) {
+    double best = 1e30;
+    for (int i = 0; i < iters; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        fn();
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        if (ms < best) best = ms;
+    }
+    return best;
+}
+
+static void TestRoundedFastPathSpeed() {
+    Surface s(1020, 684);
+    RasterTarget t = MakeTarget(s);
+    const Paint solid = Paint::solid(Color::argb(0xFF3E8BFF));
+
+    struct Case {
+        const char* name;
+        float x, y, w, h, r;
+    };
+    const Case cases[] = {
+        {"大卡片 994x118 r=12 非对齐", 12.37f, 40.83f, 994.0f, 118.0f, 12.0f},
+        {"卡片 300x120 r=12 非对齐", 100.25f, 50.5f, 300.0f, 120.0f, 12.0f},
+        {"小节点 80x40 r=8 非对齐", 200.37f, 300.13f, 80.0f, 40.0f, 8.0f},
+        {"药丸 190x40 r=20 非对齐", 100.5f, 400.5f, 190.0f, 40.0f, 20.0f},
+        {"大卡片 994x118 r=12 对齐", 12.0f, 40.0f, 994.0f, 118.0f, 12.0f},
+    };
+    std::printf("  %-26s %10s %10s %9s %9s\n", "圆角实心微基准", "快 ns/op", "通用 ns/op",
+                "快 ns/px", "通用 ns/px");
+    for (const Case& c : cases) {
+        const Rect r(c.x, c.y, c.w, c.h);
+        Path p;
+        p.addRoundedRect(r, c.r);
+        const long px = static_cast<long>(c.w) * static_cast<long>(c.h);
+        const double fast = BenchBestMs(
+                                [&] { FillRoundedRect(t, r, c.r, solid, Transform::identity()); },
+                                80) * 1e6;
+        const double ref =
+            BenchBestMs([&] { FillPath(t, p, FillRule::NonZero, solid, Transform::identity()); },
+                        80) * 1e6;
+        std::printf("  %-26s %10.0f %10.0f %9.2f %9.2f\n", c.name, fast, ref,
+                    fast / static_cast<double>(px), ref / static_cast<double>(px));
+    }
+    CHECK(true, "raster: 圆角实心快路径微基准（数字见上，不做时间断言）");
+}
+
+// 描边快路径的差分：新路径（无 mask → 稀疏落像素） vs 通用路径（有 mask → 原路径）。
+//
+// 技巧：给通用路径挂一张**全 1.0 的覆盖率遮罩**。它在 RowSolid 里只做 `c *= 1.0f`，
+// 逐位不变，于是"有 mask"与"无 mask"必须得到完全相同的像素 —— 这样不用给测试开口子，
+// 就能在同一次进程里比对两条实现。
+static void TestStrokeFastPathDiff() {
+    const float offsets[] = {0.0f, 0.25f, 0.37f, 0.5f, 0.83f};
+    const float widths[] = {0.6f, 1.0f, 2.0f, 3.5f};
+    const float radii[] = {0.0f, 4.0f, 12.0f, 25.2f};
+    const uint32_t colors[] = {0xFFFF0000u, 0x803E8BFFu, 0x033E8BFFu};
+    const int sizes[][2] = {{40, 24}, {120, 40}, {240, 118}};
+
+    int cases = 0, bad = 0, maxDelta = 0;
+    for (int si = 0; si < 3; ++si) {
+        for (int oi = 0; oi < 5; ++oi) {
+            for (int wi = 0; wi < 4; ++wi) {
+                for (int ri = 0; ri < 4; ++ri) {
+                    for (int ci = 0; ci < 3; ++ci) {
+                        const float ox = offsets[oi];
+                        const float oy = offsets[(oi + 2) % 5];
+                        const Rect r(9.0f + ox, 7.0f + oy, static_cast<float>(sizes[si][0]),
+                                     static_cast<float>(sizes[si][1]));
+                        Path p;
+                        p.addRoundedRect(r, radii[ri]);
+                        const Paint paint = Paint::solid(Color::argb(colors[ci]));
+                        StrokeStyle st;
+                        st.width = widths[wi];
+                        st.roundCap = (ci == 1);
+                        st.roundJoin = (wi % 2) == 0;
+                        const Transform xf = Transform::translate(2.0f + ox, 1.0f + oy);
+
+                        Surface fast(300, 160), ref(300, 160);
+                        RasterTarget ta = MakeTarget(fast);
+                        RasterTarget tb = MakeTarget(ref);
+                        // 通用路径：全 1.0 的遮罩（只多一次 c *= 1.0f，逐位不变）
+                        std::vector<float> ones(static_cast<size_t>(300) * 160, 1.0f);
+                        tb.mask = ones.data();
+
+                        StrokePath(ta, p, paint, st, xf);
+                        StrokePath(tb, p, paint, st, xf);
+
+                        bool same = true;
+                        for (int y = 0; y < fast.height() && same; ++y) {
+                            const uint8_t* pa = fast.row(y);
+                            const uint8_t* pb = ref.row(y);
+                            for (int k = 0; k < fast.width() * 4; ++k) {
+                                const int d = std::abs(static_cast<int>(pa[k]) -
+                                                       static_cast<int>(pb[k]));
+                                if (d != 0) {
+                                    same = false;
+                                    if (d > maxDelta) maxDelta = d;
+                                    break;
+                                }
+                            }
+                        }
+                        ++cases;
+                        if (!same) ++bad;
+                    }
+                }
+            }
+        }
+    }
+    std::printf("  （描边差分 %d 组：不一致 %d 组，最大通道差 %d）\n", cases, bad, maxDelta);
+    CHECK(bad == 0, "raster: 描边快路径与通用路径逐字节相同（宽/半径/端帽/连接 全包）");
+}
+
 int main() {
     TestRoundedTile();
     TestStrokeCoverage();
@@ -785,5 +965,8 @@ int main() {
     TestMinifyPrefilter();
     TestGradientDither();
     TestBlurSigma();
+    TestRoundedFastPathDiff();
+    TestRoundedFastPathSpeed();
+    TestStrokeFastPathDiff();
     return Bin2dTestSummary("test_raster");
 }
