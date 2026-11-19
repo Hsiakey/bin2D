@@ -225,8 +225,12 @@ uint64_t v = scene.version();   // 任何改动都要 scene.touch()；缓存阶�
 
 // 0.9.0：按组缓存。命中时贴上一帧的位图，像素与 draw() 逐像素相同
 SceneCache cache;
+cache.byteBudget = 32u << 20;   // 缓存位图总量上限（0 = 不限制；超了按最久未用淘汰）
+cache.partialRepaint = true;    // 组内脏矩形（默认开；false = 0.9.0 的整组重画）
+cache.partialMaxRatio = 0.55f;  // 脏区超过整组这个比例就退回整组重画
 scene.drawCached(out, cache);
-cache.stats();              // groups_total / hits / misses / entries / bytes
+cache.stats();              // groups_total / hits / misses / partials / entries / bytes
+                            // / evicted / partial_pixels / full_pixels
 item->touch();              // 改完 Shape 的 path/paint/stroke 后必须调（框架字段不用）
 ```
 

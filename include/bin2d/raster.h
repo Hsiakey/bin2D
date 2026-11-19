@@ -187,6 +187,8 @@ void BlurMask(uint8_t* mask, int w, int h, float radius);
 void BlendCoverageMask(const RasterTarget& t, const uint8_t* mask, int w, int h, int dstX,
                        int dstY, const Color& color);
 
+
+
 // 子采样数（竖直方向）。标准 8：覆盖率误差 ≤ 1/8 像素，成本约 8 次求交/行。
 constexpr int kSubSamples = 8;
 

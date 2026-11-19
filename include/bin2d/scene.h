@@ -88,9 +88,9 @@ public:
     uint64_t version() const { return version_; }
     void touch() { ++version_; }
 
-    // 本节点 + 子树的内容版本（框架字段 + 每个节点的 version() 混合而成）。
-    // Group 覆盖它把子节点混进来；Shape 的 path/paint 靠 touch() 表达。
-    virtual uint64_t contentVersion() const {
+    // 本节点**自身字段**（不含子节点）的版本哈希。脏矩形判定靠它区分
+    // "这个组自己变了（要全重画）"和"只是某个子节点变了（可以只重画那一块）"。
+    virtual uint64_t selfVersion() const {
         using namespace detail;
         uint64_t h = 0xCBF29CE484222325ull;
         h = HashMix(h, version_);
@@ -116,6 +116,9 @@ public:
         h = HashMix(h, static_cast<uint64_t>(shadow.color.toArgbStraight()));
         return h;
     }
+
+    // 本节点 + 子树的内容版本。默认等于自身；Group 覆盖它把子节点混进来。
+    virtual uint64_t contentVersion() const { return selfVersion(); }
 
     // 把当前节点的 transform/裁剪应用到画布上（子类进来第一件事就是调它）
     void applyState(Canvas& canvas) const {
@@ -276,7 +279,7 @@ public:
 };
 
 // ------------------------------------------------------------
-// 子树缓存（0.9.0）
+// 子树缓存（0.9.0；0.10.0 加组内脏矩形与字节上限）
 //
 // 缓存粒度 = **组**（不是节点）：一张卡片 5 个图元，逐个缓存 5 张位图既费内存又
 // 省不下合成；整组一张位图才划算。这也是 roadmap ⑤ 里"缓存粒度按图层不按节点"。
@@ -287,19 +290,37 @@ public:
 //
 // 版本契约（重要）：改 Shape 的 path/paint 之后必须 item.touch()；框架字段
 // （transform/opacity/blend/clip/shadow/子节点表）会自动参与哈希，不用手动 touch。
+//
+// 脏矩形（0.10.0）：条目还记每个子节点的"版本 + 设备包围盒"，组内容变化时只重画
+// 变化子节点的"旧 ∪ 新"包围盒（超过整组 partialMaxRatio 或结构变化则整组重画）。
+// 省下来的是栅格化；贴回仍按整组做（每帧清屏过，只贴脏区会漏内容）。
 // ------------------------------------------------------------
 class SceneCache {
 public:
     struct Stats {
         int groups_total = 0;   // 本帧遇到的"可缓存组"数
         int hits = 0;           // 直接贴上一帧位图的
-        int misses = 0;         // 重画并重新缓存的
+        int misses = 0;         // 内容变了、需要重画的
+        int partials = 0;       // 其中只重画了脏矩形的（0.10.0）
         int entries = 0;        // 当前常驻的缓存条目
+        int evicted = 0;        // 本帧因字节上限被淘汰的条目
         size_t bytes = 0;       // 常驻缓存位图总量
+        long long partial_pixels = 0;   // 本帧局部重画覆盖的像素数（诊断脏区效果）
+        long long full_pixels = 0;      // 本帧整组重画覆盖的像素数
     };
 
     // 可缓存组的最小设备面积（像素²）。太小的话贴一张位图的采样成本 >= 直接画。
     int minGroupArea = 4096;
+
+    // 缓存位图总量的软上限（字节，0 = 不限制）。超了就按"最久没被访问"淘汰条目
+    // （本帧用过的最后才动，所以抖动表现为"偶尔重画一次"，而不是每帧来回做）。
+    size_t byteBudget = 0;
+
+    // 组内容变了之后，脏区占整组面积的比例超过它就整组重画（局部重画不划算）。
+    float partialMaxRatio = 0.55f;
+
+    // 关掉 = 只做整组重画（0.9.0 的行为）。开关存在的意义：像素回归时两条路都能跑。
+    bool partialRepaint = true;
 
     void clear();
     const Stats& stats() const { return stats_; }
@@ -311,8 +332,16 @@ public:
         Surface surface;
         int ox = 0, oy = 0;
         int w = 0, h = 0;
-        uint64_t version = 0;
-        uint64_t stamp = 0;   // 最近一次被访问的帧号（用来淘汰没再出现的组）
+        uint64_t version = 0;        // 整组内容版本
+        uint64_t selfVersion = 0;    // 组自身字段（不含子节点）
+        uint64_t stamp = 0;          // 最近一次被访问的帧号
+        // 上次绘制时每个子节点的版本 + 设备包围盒：脏矩形靠它算
+        struct ChildStamp {
+            const void* ptr = nullptr;
+            uint64_t version = 0;
+            int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        };
+        std::vector<ChildStamp> children;
     };
     void BeginFrame();
     void EndFrame();

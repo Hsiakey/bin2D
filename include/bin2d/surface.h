@@ -98,6 +98,24 @@ public:
         }
     }
 
+    // 把一块矩形**覆盖式**写成给定颜色（0.10.0：脏矩形重画前先把脏区清成透明）。
+    // 注意不是 fillRect：fillRect 是 src-over 混合，清透明色在 over 语义下是空操作，
+    // 而"擦掉旧内容"必须真的写 0。整数边界向外取整，越界自动裁掉。
+    void clearRect(const Rect& r, const Color& c = Color::trans()) {
+        if (empty() || r.empty()) return;
+        const int x0 = std::max(0, static_cast<int>(std::floor(r.x)));
+        const int y0 = std::max(0, static_cast<int>(std::floor(r.y)));
+        const int x1 = std::min(width_, static_cast<int>(std::ceil(r.right())));
+        const int y1 = std::min(height_, static_cast<int>(std::ceil(r.bottom())));
+        if (x1 <= x0 || y1 <= y0) return;
+        for (int y = y0; y < y1; ++y) {
+            uint8_t* p = row(y) + static_cast<size_t>(x0) * 4;
+            for (int x = x0; x < x1; ++x, p += 4) {
+                p[0] = c.r; p[1] = c.g; p[2] = c.b; p[3] = c.a;
+            }
+        }
+    }
+
     // 整像素矩形填充（轴对齐，字体/条带/调试网格用；带 AA 的形状走 raster）
     void fillRect(const Rect& r, const Color& c) {
         if (empty() || c.a == 0 || r.empty()) return;

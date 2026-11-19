@@ -520,6 +520,66 @@ void MeasureSceneCache() {
                 uncached, 1000.0 / uncached, cached, 1000.0 / cached, uncached / cached);
     std::fprintf(stderr, "[缓存] 命中 %d/%d，常驻 %zu KB（%d 条）\n", cache.stats().hits,
                 cache.stats().groups_total, cache.stats().bytes / 1024, cache.stats().entries);
+
+    // ---- 脏矩形（0.10.0）：每帧只动卡片里的一个图标 ----
+    //
+    // 静态页面缓存就够；真实界面里"每秒都在变"的往往是少数卡片（加载指示器、进度、
+    // 光标）。这里分别让 1 张 / 10 张卡片的图标每帧挪 1px，比较三条路线：
+    // 全量重绘、整组缓存（内容一变就整组重画）、脏矩形缓存。
+    int animFrame = 0;
+    const auto benchAnimated = [&](SceneCache& c, int movingCards) {
+        const auto fn = [&] {
+            ++animFrame;
+            const float t = static_cast<float>(animFrame % 24);
+            for (int i = 0; i < movingCards; ++i) {
+                auto& g0 = *static_cast<Group*>(scene.root().children[static_cast<size_t>(i)].get());
+                auto& icon = *static_cast<Shape*>(g0.children[1].get());
+                icon.path.clear();
+                icon.path.addRoundedRect(Rect(12.0f + t, 12, 40, 40), 10.0f);
+                icon.touch();
+            }
+            scene.drawCached(target, c);
+        };
+        fn();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < frames; ++i) fn();
+        const auto t1 = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(t1 - t0).count() / frames;
+    };
+    for (int moving : {1, 10}) {
+        animFrame = 0;
+        SceneCache fullRepaint;
+        fullRepaint.partialRepaint = false;
+        const double fullMs = benchAnimated(fullRepaint, moving);
+        animFrame = 0;
+        SceneCache dirty;
+        const double dirtyMs = benchAnimated(dirty, moving);
+        const auto uncached = [&] {
+            const auto fn = [&] {
+                ++animFrame;
+                const float t = static_cast<float>(animFrame % 24);
+                for (int i = 0; i < moving; ++i) {
+                    auto& g0 = *static_cast<Group*>(
+                        scene.root().children[static_cast<size_t>(i)].get());
+                    auto& icon = *static_cast<Shape*>(g0.children[1].get());
+                    icon.path.clear();
+                    icon.path.addRoundedRect(Rect(12.0f + t, 12, 40, 40), 10.0f);
+                    icon.touch();
+                }
+                scene.draw(target);
+            };
+            fn();
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < frames; ++i) fn();
+            const auto t1 = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::milli>(t1 - t0).count() / frames;
+        }();
+        std::fprintf(stderr,
+                     "[缓存/脏区] %2d 张卡片每帧动图标：全量 %.2f ms / 整组重画 %.2f ms / 脏矩形 %.2f ms"
+                     "（相对整组 %.1f×，每帧重画 %lld px vs 整组 %lld px）\n",
+                     moving, uncached, fullMs, dirtyMs, fullMs / dirtyMs,
+                     dirty.stats().partial_pixels, fullRepaint.stats().full_pixels);
+    }
     Save(target, "quality_cache.png");
 }
 

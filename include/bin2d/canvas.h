@@ -138,6 +138,8 @@ public:
     void compositeSurface(const Surface& surface, int originX, int originY, float opacity,
                           BlendMode blend);
 
+
+
     // 当前绘制目标上"设备像素矩形"：图层里是层内的局部像素（含原点偏移）
     Rect deviceClip() const { return state().clipRect; }
 
