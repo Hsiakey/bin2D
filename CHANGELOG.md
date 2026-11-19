@@ -3,6 +3,70 @@
 本文件记录 bin2d 的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.19.0] - 2026-11-20
+
+**`DisplayList` 补齐圆角描边与圆角渐变，顺手修掉一个"半透明渐变被预乘两次"的真 bug。**
+
+```cpp
+list.fillRoundedGradient(box, 12.0f, 90.0f, from, to);   // 圆角卡片 + 底色渐变
+list.strokeRounded(box, 12.0f, 2.0f, Color::argb(0xFF3E8BFF));  // 向内 2px 环
+```
+
+这一轮之后，buttonshow 那种页面（圆角卡片 + 底色渐变 + 边框）里的每一种绘制原语
+都能进列表了 —— 上一版卡住"binUI 换成先记列表"的那半条，现在只剩圆角 AA 的统一。
+
+### 修掉的真 bug：半透明渐变被预乘两次
+
+`LinearGradientCorners()` 在 0.18.0 里是"当直通插值 → `Color::straight()` 预乘一次"，
+返回的是**预乘**色；而它唯一的调用方把结果当**顶点色**发给 binGPU，而 binGPU 的顶点色
+口径是 `frag.rgb = tex.rgb · vcol.rgb · vcol.a`（**直通**色、写的时候才预乘）。
+于是顶点色被预乘了两次：alpha = 0x80 的渐变，中段只发出 0x40。
+
+当时没被抓住，是因为 `gpuCompatible()` 挡的是"两端 alpha **不同**"——
+而这一类恰好是"两端 alpha **相同**但不透明"，从门缝里过去了。修正后函数直接收发
+**直通** 0xAARRGGBB（`uint32_t out[4]`），一次转换都不做。
+
+顺带把 `gpuCompatible()` 的理由写对了：CPU 的 `Paint::SampleStops` 在**预乘域**插值
+（CSS Color 4），binGPU 的顶点色在**直通域**插值 —— 0.18.0 的注释把两边说反了。
+两端 alpha 相同时两者等价（只差舍入），这才是"等 alpha 可以走 GPU"的真正理由。
+
+### 圆角描边 = 同心 1px 环叠层（`raster.h` 的 `RoundedStrokeLayer*`）
+
+```cpp
+const int n = RoundedStrokeLayerCount(w, h, radius, thickness);
+for (int k = 0; k < n; ++k) {
+    RoundedStrokeLayer L;
+    if (!BuildRoundedStrokeLayer(x, y, w, h, radius, thickness, k, L)) break;
+    // 第 k 层：外框缩 k、半径减 k，用半径 L.tile_radius 的 1px 环模板画九宫格
+}
+```
+
+为什么不是"把 1px 环模板沿 UV 拉伸成 N px"：圆弧那一段会被拉成椭圆弧，而且内圈的
+圆角半径不会跟着缩（画出来是"外圆内方"）。叠层是唯一正确的做法。
+
+这段几何宿主（binUI 的 `binui_paint.h`）里已经有一份（0.25.0 收的），这轮 bin2d 有了
+第二份 —— 所以单测钉的是**结构等价**：2px 描边的直边必须恰好是 2 列实心、第 3 列是
+底色；1px 恰好 1 列。这条判据与 AA 定义无关，两个执行体都得过。
+
+### 验收（`tests/test_display_list.cpp` 20 → 45 项，全过）
+
+| 页面 | 结论 |
+|---|---|
+| 圆角渐变（0°/45°/90°）+ 两端 alpha 相同的半透明渐变 | 纯色区 **差 1**（CPU/VK/D3D11/GL 一致） |
+| 圆角描边 1px / 2px / 3px / 直角退化 | 结构判据（列数）两个执行体都过 |
+| `gpuCompatible()`：等 alpha 渐变放行、淡出渐变退回、缩小贴图退回 | 5 条断言 |
+| 圆角弧上的差 | 52（两套圆角 AA 定义，与颜色数学无关，**另计**） |
+
+弧上那 52 不是这次的锅：这块的对比度（0x3E8BFF 对 0x101418）比 0.18.0 那张平涂圆角页
+（0x2A3038 对 0x101418）高得多，同样的覆盖率差被放大了。这也是为什么门禁只钉纯色区
+—— 把"颜色数学"和"圆的 AA 怎么算"混在一个数字里，两个结论都会失真。
+
+### 仍未进列表的东西
+
+仿射圆角（`fillRoundedXf`）、路径、图层组透明度、模糊、阴影环。
+还有已知的两处执行体分歧：圆角 AA 定义（要一次像素决策）、缩小贴图的滤波器
+（CPU 盒式 vs GPU 双线性）。
+
 ## [0.18.0] - 2026-11-20
 
 **`DisplayList` 补上渐变与染色贴图，并给出"这份列表能不能在 GPU 上跑完"的**前置**判断。**

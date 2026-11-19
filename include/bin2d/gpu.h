@@ -270,6 +270,14 @@ public:
     // 半径相同的形状在 UI 里是绝大多数（10/12/14 这几档），所以按半径分组就能一次发完：
     // 实测 234 个逐个画 20.4 ms，批量只有几毫秒，差的全是调用开销。
     bool drawRoundedRects(float radius, const Rect* rects, size_t count, Color color);
+    // 圆角**描边**（0.19.0）：thickness 是向内叠的层数，形状 = 同心 1px 环的并集
+    // （见 raster.h 的 RoundedStrokeLayer）。每层半径不同 → 每层一张模板，
+    // 所以这里是"叠层"而不是"一次批量"。半径 <= 0 或 thickness <= 0 退化成 fillRect 的直角四边。
+    bool drawRoundedStroke(const Rect& r, float radius, float thickness, Color color);
+    // 圆角**渐变**（0.19.0）：九宫格 + 四角色。四色由 LinearGradientCorners 给（预乘），
+    // 而线性渐变在屏幕空间是仿射函数 → 这是精确解，不是条带逼近。
+    bool drawRoundedGradient(const Rect& r, float radius, float angleDeg, const Color& from,
+                             const Color& to);
 
     // 圆角覆盖率模板（按整数半径缓存，描边是另一套 1px 环模板）。
     // 内容 = bin2d 的解析式覆盖率，四通道都填成同一个值（与 binUI 三端的老模板同一口径）。

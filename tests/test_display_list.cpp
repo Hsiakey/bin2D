@@ -87,6 +87,36 @@ void BuildRoundedPage(DisplayList& list) {
     }
 }
 
+// 圆角渐变 + 半透明渐变（两端 alpha 相同）：θ 四角色在**直通域**插值，而两端 alpha 相同
+// 时直通域插值与预乘域插值等价 ⇒ 这一页可以当门禁（≤1）。
+void BuildRoundedGradPage(DisplayList& list) {
+    list.clearRect(Rect(0, 0, 240, 160), Color::argb(0xFF101418));
+    list.fillRoundedGradient(Rect(10, 10, 140, 40), 12.0f, 90.0f, Color::argb(0xFF3E8BFF),
+                             Color::argb(0xFF2FBF9A));
+    list.fillRoundedGradient(Rect(10, 60, 140, 40), 14.0f, 45.0f, Color::argb(0xFFFF6B6B),
+                             Color::argb(0xFFFFD166));
+    list.fillRoundedGradient(Rect(10, 110, 100, 40), 8.0f, 0.0f, Color::argb(0xFF101418),
+                             Color::argb(0xFF8090FF));
+    // 两端 alpha **都不到 255**：0.18.0 这里被预乘了两次（0x80 的中段只发出 0x40），
+    // 而 gpuCompatible 只挡住了"两端 alpha 不同"，恰好漏掉这一类。
+    list.fillGradient(Rect(160, 10, 70, 40), 180.0f, Color::argb(0x80FF8040),
+                      Color::argb(0x8010A0FF));
+    list.fillRoundedGradient(Rect(160, 60, 70, 40), 10.0f, 135.0f, Color::argb(0xB0FF8040),
+                             Color::argb(0xB010A0FF));
+    // 半径退化：两个执行体都走直角四角带色
+    list.fillRoundedGradient(Rect(160, 110, 70, 40), 0.0f, 0.0f, Color::argb(0xFF3E8BFF),
+                             Color::argb(0xFFFFD166));
+}
+
+// 圆角描边：1px / 2px / 3px 各一条，外加一个"半径退化"的直角框
+void BuildRingPage(DisplayList& list) {
+    list.clearRect(Rect(0, 0, 240, 160), Color::argb(0xFF101418));
+    list.strokeRounded(Rect(16, 16, 100, 40), 12.0f, 2.0f, Color::argb(0xFF3E8BFF));
+    list.strokeRounded(Rect(130, 16, 100, 40), 12.0f, 1.0f, Color::argb(0xFFFFFFFF));
+    list.strokeRounded(Rect(16, 70, 100, 40), 20.0f, 3.0f, Color::argb(0xFF2FBF9A));
+    list.strokeRounded(Rect(130, 70, 100, 40), 0.0f, 2.0f, Color::argb(0xFFFFD166));
+}
+
 }  // namespace
 
 int main() {
@@ -212,6 +242,152 @@ int main() {
         std::sort(cpuMs.begin(), cpuMs.end());
         std::printf("  CPU 执行体：%zu 个圆角 %6.2f ms\n", list.size(), cpuMs[cpuMs.size() / 2]);
         CHECK(cpuMs[cpuMs.size() / 2] >= 0.0, "display_list: CPU 执行体计时完成");
+    }
+
+    // ---------- ④ 圆角渐变 + 淡出渐变：可以当门禁（预乘仿射 ⇒ 精确） ----------
+    {
+        DisplayList list;
+        BuildRoundedGradPage(list);
+        CHECK(list.size() >= 6, "display_list: 圆角渐变页记下了条目");
+        std::string why;
+        CHECK(list.gpuCompatible(&why), "display_list: 等 alpha 的渐变（含半透明）可以走 GPU");
+        if (!why.empty()) std::printf("    原因：%s\n", why.c_str());
+        // 淡出（两端 alpha 不同）必须被挡住：两个执行体的插值域不同
+        DisplayList fade;
+        fade.fillGradient(Rect(0, 0, 40, 40), 180.0f, Color::argb(0xFFFF8040),
+                          Color::argb(0x00FF8040));
+        why.clear();
+        CHECK(!fade.gpuCompatible(&why), "display_list: 两端 alpha 不同的渐变整份退回 CPU");
+        Surface cpu(W, H);
+        {
+            Canvas c(cpu);
+            list.execute(c);
+        }
+        const struct { const char* name; BgpuBackendKind kind; } backends[] = {
+            {"cpu", BGPU_BACKEND_CPU},
+            {"vulkan", BGPU_BACKEND_VULKAN},
+            {"d3d11", BGPU_BACKEND_D3D11},
+            {"gl", BGPU_BACKEND_GL},
+        };
+        for (const auto& b : backends) {
+            GpuCompositor gpu;
+            if (!gpu.create(W, H, b.kind)) continue;
+            BgpuTexture rt = gpu.acquireTarget(W, H);
+            Surface gpuOut;
+            const bool ok = list.execute(gpu, rt, 0xFF101418u) && gpu.readTarget(rt, gpuOut);
+            if (rt) gpu.recycle(rt);
+            CHECK(ok, "display_list: 圆角渐变页 GPU 执行体跑通");
+            if (!ok) continue;
+            const int diff = MaxChannelDiff(cpu, gpuOut);
+            std::printf("  [%s] 圆角渐变页：最大通道差 %d\n", b.name, diff);
+            // 门禁只钉**纯色区**（把圆角弧让出去）：弧上两个执行体用的是两套圆角 AA
+            // 定义（bin2d 内部的遗留分歧），那与"四角带色 + 双线性插值"是两件事，
+            // 混在一起会把这个页面的结论搅浑。弧上的差单独报数。
+            struct GradItem { float x, y, w, h, r; };
+            const GradItem items[] = {
+                {10, 10, 140, 40, 12}, {10, 60, 140, 40, 14}, {10, 110, 100, 40, 8},
+                {160, 10, 70, 40, 0},  {160, 60, 70, 40, 10}, {160, 110, 70, 40, 0},
+            };
+            auto inArc = [&](int px, int py) {
+                const float cx = static_cast<float>(px) + 0.5f;
+                const float cy = static_cast<float>(py) + 0.5f;
+                for (const GradItem& it : items) {
+                    if (it.r <= 0.5f) continue;
+                    if (cx < it.x - 1.0f || cx > it.x + it.w + 1.0f) continue;
+                    if (cy < it.y - 1.0f || cy > it.y + it.h + 1.0f) continue;
+                    const float qx = std::min(std::max(cx, it.x + it.r), it.x + it.w - it.r);
+                    const float qy = std::min(std::max(cy, it.y + it.r), it.y + it.h - it.r);
+                    const float dx = cx - qx, dy = cy - qy;
+                    const float rr = it.r + 2.0f;
+                    if (dx * dx + dy * dy <= rr * rr) return true;
+                }
+                return false;
+            };
+            int worstSolid = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    if (inArc(x, y)) continue;
+                    const Color ca = cpu.get(x, y), cb = gpuOut.get(x, y);
+                    worstSolid = std::max({worstSolid, std::abs(int(ca.r) - int(cb.r)),
+                                           std::abs(int(ca.g) - int(cb.g)),
+                                           std::abs(int(ca.b) - int(cb.b)),
+                                           std::abs(int(ca.a) - int(cb.a))});
+                }
+            std::printf("    纯色区最大通道差 %d（弧上的差是圆角 AA 定义，另计）\n", worstSolid);
+            CHECK(worstSolid <= 2, "display_list: 圆角渐变/半透明渐变的颜色数学一致（纯色区 ≤2）");
+        }
+    }
+
+    // ---------- ⑤ 圆角描边：结构门禁（环的厚度 / 位置），AA 差只报数 ----------
+    {
+        DisplayList list;
+        BuildRingPage(list);
+        Surface cpu(W, H);
+        {
+            Canvas c(cpu);
+            list.execute(c);
+        }
+        // 结构：2px 描边的左直边（y = 36 在直边段）必须是 x=16,17 两条实心、x=18 是底色
+        // 注意判据不能看 alpha —— 背景是不透明的，每个像素 alpha 都是 255。
+        auto near = [](const Surface& s, int x, int y, uint32_t argb) {
+            const Color c = s.get(x, y);
+            const Color w = Color::argb(argb);
+            const int d = std::max({std::abs(int(c.r) - int(w.r)), std::abs(int(c.g) - int(w.g)),
+                                    std::abs(int(c.b) - int(w.b))});
+            return d <= 2;
+        };
+        const uint32_t bg = 0xFF101418u, blue = 0xFF3E8BFFu, white = 0xFFFFFFFFu;
+        CHECK(near(cpu, 16, 36, blue) && near(cpu, 17, 36, blue),
+              "display_list: CPU 描边 2px 的内侧 2 列是实心");
+        CHECK(near(cpu, 18, 36, bg), "display_list: CPU 描边 2px 不会溢出到第 3 列");
+        CHECK(near(cpu, 130, 36, white), "display_list: CPU 描边 1px 只有 1 列");
+        CHECK(near(cpu, 131, 36, bg), "display_list: CPU 描边 1px 不会变成 2 列");
+
+        GpuCompositor gpu;
+        if (gpu.create(W, H, BGPU_BACKEND_CPU)) {
+            BgpuTexture rt = gpu.acquireTarget(W, H);
+            Surface gpuOut;
+            if (list.execute(gpu, rt, 0xFF101418u) && gpu.readTarget(rt, gpuOut)) {
+                // 同一条结构判据在 GPU 执行体上也必须成立 —— 这是"环几何"的门禁，
+                // 与 AA 定义无关（AA 只影响边界像素的覆盖率，不影响哪几列有颜色）。
+                CHECK(near(gpuOut, 16, 36, blue) && near(gpuOut, 17, 36, blue),
+                      "display_list: GPU 描边 2px 的内侧 2 列是实心");
+                CHECK(near(gpuOut, 18, 36, bg), "display_list: GPU 描边 2px 不会溢出到第 3 列");
+                CHECK(near(gpuOut, 130, 36, white), "display_list: GPU 描边 1px 只有 1 列");
+                CHECK(near(gpuOut, 131, 36, bg), "display_list: GPU 描边 1px 不会变成 2 列");
+                std::printf("  [cpu] 描边页：最大通道差 %d（描边 AA 定义不同，不是门禁）\n",
+                            MaxChannelDiff(cpu, gpuOut));
+            }
+            if (rt) gpu.recycle(rt);
+        }
+        CHECK(true, "display_list: 描边页两条执行体都出图");
+    }
+
+    // ---------- ⑥ gpuCompatible：缩小的贴图必须整份退回 CPU ----------
+    {
+        DisplayList list;
+        const Surface big = MakeTile(32, 32);
+        list.drawImage(big, Rect(0, 0, 64, 64));                     // 放大：OK
+        std::string why;
+        CHECK(list.gpuCompatible(&why), "display_list: 放大的贴图可以走 GPU 执行体");
+
+        DisplayList small;
+        small.drawImage(big, Rect(0, 0, 8, 8));                      // 缩小 4×：不许
+        why.clear();
+        CHECK(!small.gpuCompatible(&why), "display_list: 缩小的贴图整份退回 CPU");
+        CHECK(!why.empty(), "display_list: 退回时给得出原因");
+
+        DisplayList same;
+        // 源窗口 32×32×0.5 = 16×16 摆进 8×8：缩小 2×，同样不许
+        same.drawImage(big, Rect(0, 0, 8, 8), Rect(0, 0, 0.5f, 0.5f));
+        why.clear();
+        CHECK(!same.gpuCompatible(&why), "display_list: 子矩形也是按真实窗口判缩小");
+
+        DisplayList up;
+        // 源窗口 16×16 摆进 32×32：放大，可以走 GPU
+        up.drawImage(big, Rect(0, 0, 32, 32), Rect(0, 0, 0.5f, 0.5f));
+        why.clear();
+        CHECK(up.gpuCompatible(&why), "display_list: 放大（含子窗口）可以走 GPU 执行体");
     }
 
     return Bin2dTestSummary("test_display_list");

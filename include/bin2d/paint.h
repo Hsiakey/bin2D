@@ -317,11 +317,20 @@ inline Paint FadePaint(const Paint& src, float k) {
 // "投影长度最大"的端点取法），否则"同一个渐变用两条执行体画"就会整体偏移。
 //
 // 输出顺序：左上、右上、左下、右下（与顶点 TL,TR,BL,BR 同序）。
-// **只对不透明两端精确**：两端 alpha 不同时，正确做法是在预乘空间插值
-// （CSS Color 4），而那要 CPU 侧也改成预乘插值 —— 见 CHANGELOG 的说明。
+//
+// **输入输出都是直通 0xAARRGGBB**（binGPU 顶点色的口径：`frag.rgb = tex.rgb·vcol.rgb·vcol.a`，
+// 也就是"在直通域插值、写的时候才预乘"）。
+//
+// 这条口径决定了本函数的**适用边界**：直通域插值只有两端 alpha **相同**时，
+// 才等于 CPU 逐像素那条路（`Paint::SampleStops` 在**预乘**域插值）。两端 alpha 不同时
+// 两者是不同定义 —— 所以 DisplayList 的 `gpuCompatible()` 会把那种列表整份退回 CPU。
+//
+// 0.18.0 这里有两个错叠在一起：先当直通插值、再 `Color::straight` 预乘一次（得到预乘色），
+// 然后把预乘色当顶点色发出去（binGPU 又预乘一次）⇒ **两端 alpha 都不到 255 的渐变被
+// 预乘两次**。当时只挡住了"两端 alpha 不同"，恰好把这一类放过去了。0.19.0 起直接收发直通色。
 // ------------------------------------------------------------
-inline void LinearGradientCorners(const Rect& box, float degrees, const Color& from,
-                                  const Color& to, Color out[4]) {
+inline void LinearGradientCorners(const Rect& box, float degrees, uint32_t fromArgb,
+                                  uint32_t toArgb, uint32_t out[4]) {
     constexpr float kPi = 3.14159265358979323846f;
     const float a = degrees * kPi / 180.0f;
     const float dx = std::sin(a), dy = -std::cos(a);
@@ -330,13 +339,16 @@ inline void LinearGradientCorners(const Rect& box, float degrees, const Color& f
     const float sy = box.cy() - dy * len * 0.5f;
     const float xs[4] = {box.x, box.right(), box.x, box.right()};
     const float ys[4] = {box.y, box.y, box.bottom(), box.bottom()};
+    auto ch = [&](int shift, float t) {
+        const float c0 = static_cast<float>((fromArgb >> shift) & 0xFFu);
+        const float c1 = static_cast<float>((toArgb >> shift) & 0xFFu);
+        uint32_t v = static_cast<uint32_t>(c0 + (c1 - c0) * t + 0.5f);
+        return v > 255u ? 255u : v;
+    };
     for (int i = 0; i < 4; ++i) {
         float t = len > 1e-6f ? (((xs[i] - sx) * dx + (ys[i] - sy) * dy) / len) : 0.0f;
         t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
-        out[i] = Color::straight(static_cast<uint8_t>(from.r + (to.r - from.r) * t + 0.5f),
-                                 static_cast<uint8_t>(from.g + (to.g - from.g) * t + 0.5f),
-                                 static_cast<uint8_t>(from.b + (to.b - from.b) * t + 0.5f),
-                                 static_cast<uint8_t>(from.a + (to.a - from.a) * t + 0.5f));
+        out[i] = (ch(24, t) << 24) | (ch(16, t) << 16) | (ch(8, t) << 8) | ch(0, t);
     }
 }
 } // namespace bin2d

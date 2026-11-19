@@ -44,6 +44,8 @@ public:
             FillRect = 1,  // color 填充
             FillRounded = 2, // 圆角矩形填充（radius 夹到 min(w,h)/2）
             FillGradient = 6, // 线性渐变（CSS 角度；四角颜色由 bin2d 算）
+            FillRoundedGradient = 7, // 圆角 + 线性渐变（九宫格 + 四角色）
+            FillRing = 8, // 圆角描边（向内 thickness 层的同心环并集）
             FillImage = 3, // 贴图（预乘 Surface 当纹理，uv 是归一化子矩形）
             ClipPush = 4, // 压一个矩形裁剪（与当前裁剪求交）
             ClipPop = 5,  // 回到 depth（绝对深度）
@@ -52,9 +54,10 @@ public:
         Rect rect;
         Rect uv{0.0f, 0.0f, 1.0f, 1.0f};
         float radius = 0.0f;
-        float angle = 0.0f;          // FillGradient：CSS 角度（0 = 自下而上，90 = 自左向右）
+        float angle = 0.0f;          // FillGradient / FillRoundedGradient：CSS 角度
+        float thickness = 0.0f;      // FillRing：向内叠多少层（1px 一层）
         uint32_t color = 0;          // 0xAARRGGBB 直通（与 binGPU 顶点色同口径）
-        uint32_t color2 = 0;         // FillGradient 的另一端
+        uint32_t color2 = 0;         // FillGradient / FillRoundedGradient 的另一端
         const Surface* image = nullptr;   // FillImage
         uint32_t tint = 0xFFFFFFFFu;      // FillImage 的染色（直通；默认原色）
     };
@@ -85,6 +88,14 @@ public:
     // 线性渐变（CSS 语义）：角度、两端色。四角颜色由 bin2d 的 LinearGradientCorners 算，
     // 所以"四边形 + 顶点色"与"逐像素求值"是同一个解（仿射函数在三角形上插值精确）。
     void fillGradient(const Rect& r, float angleDeg, const Color& from, const Color& to);
+    // 圆角 + 渐变（0.19.0）：一条 op 覆盖"圆角卡片 + 底色渐变"这个 UI 里最常见的组合。
+    // 两个执行体的形状都是圆角矩形，颜色都是**预乘空间**的线性渐变 —— 同一条定义，
+    // 所以淡出渐变（两端 alpha 不同）在这里也是精确的，不再需要退回 CPU。
+    void fillRoundedGradient(const Rect& r, float radius, float angleDeg, const Color& from,
+                             const Color& to);
+    // 圆角描边（0.19.0）：向内叠 thickness 层 1px 环（口径见 raster.h 的 RoundedStrokeLayer）。
+    // 这是 UI 里边框的**唯一**形状来源 —— 不是"描边外扩"，别改成外扩（那会改变像素）。
+    void strokeRounded(const Rect& r, float radius, float thickness, const Color& c);
     // 子矩形贴图：uv 是源图的归一化窗口（0..1）
     void drawImage(const Surface& image, const Rect& dst, const Rect& uv = Rect(0, 0, 1, 1),
                    const Color& tint = Color::white());

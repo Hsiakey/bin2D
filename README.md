@@ -68,11 +68,19 @@ ctest --test-dir build --output-on-failure
 
 ## 状态
 
+**0.19.0（2026-11-20）**：`DisplayList` 补上**圆角描边**（`strokeRounded`，同心 1px 环
+叠层）与**圆角渐变**（`fillRoundedGradient`，九宫格 + 四角色）。至此 UI 里的三种主要
+原语（圆角卡片 / 底色渐变 / 边框）都能进列表。顺手修掉一个真 bug：`LinearGradientCorners()`
+以前返回**预乘**色，而 binGPU 的顶点色是**直通**色 —— 于是 alpha 0x80 的渐变被预乘两次，
+中段只发出 0x40；当时 `gpuCompatible()` 只挡了"两端 alpha 不同"，恰好放过这一类。
+修正后等 alpha 的渐变（含半透明）纯色区差 **1**，四个后端一致。
+
 **0.18.0（2026-11-20）**：`DisplayList` 补上**线性渐变**与**染色贴图**，并加了
 `gpuCompatible()` 前置判断（不能跑就整份交回 CPU，不画半帧）。渐变的四角颜色由
 `LinearGradientCorners()` 算 —— 屏幕空间的线性渐变是坐标的仿射函数，三角形插值对它
 精确，所以"四角色四边形"与"逐像素求值"是同一个解，实测差 **≤1**（只有 8 位舍入）。
-两端 alpha 不同的渐变被 `gpuCompatible()` 挡住（那要在预乘空间插值，是**定义**不同）。
+两端 alpha 不同的渐变被 `gpuCompatible()` 挡住：CPU 在**预乘域**插值（CSS Color 4），
+而 binGPU 的顶点色在**直通域**插值 —— 那是**定义**不同，不是舍入。
 
 **0.17.0（2026-11-20）**：**`DisplayList`** —— 一份绘制语义（矩形 / 圆角 / 1:1 贴图 /
 矩形裁剪），两个执行体（bin2d 的光栅、binGPU）。验收是"同一份列表跑两条路"：

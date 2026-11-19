@@ -903,8 +903,83 @@ bool GpuCompositor::drawRoundedRect(const Rect& r, float radius, Color color) {
     if (rc != BGPU_OK) { fail("bingpu_cmd_draw_rounded_rect", rc); return false; }
     return true;
 }
-bool GpuCompositor::readTarget(BgpuTexture target, Surface& out) {
-    if (!device_ || !target) return false;
+
+// 圆角描边（0.19.0）：同心 1px 环叠层。层数/每层几何来自 raster.h 的
+// RoundedStrokeLayerCount / BuildRoundedStrokeLayer —— 与宿主 binUI 的 BuildRoundedLayer
+// 是**同一套口径**（那边 0.25.0 已经收成一份），所以"bin2d 执行体"和"binUI 的 GL/VK/D3D11"
+// 画出来的描边是同一批像素。
+//
+// 为什么逐层调 bingpu_cmd_draw_rounded_rect 而不是批量：每层半径不同 → 每层一张模板，
+// 绑纹理就变了，合批没有意义（层数一般也就 1~2 层）。
+bool GpuCompositor::drawRoundedStroke(const Rect& r, float radius, float thickness,
+                                      Color color) {
+    if (!ready() || !targetBound_ || r.w <= 0.0f || r.h <= 0.0f) return false;
+    if (thickness <= 0.0f) return true;
+    const float rf = std::min(radius, std::min(r.w, r.h) * 0.5f);
+    if (rf <= 0.0f) {
+        // 半径退化：直角描边 = 四条矩形（与宿主 strokeRounded 的直角分支同一条）
+        const float t = thickness;
+        return drawRect(Rect(r.x, r.y, r.w, std::min(t, r.h)), color) &&
+               drawRect(Rect(r.x, r.y + r.h - std::min(t, r.h), r.w, std::min(t, r.h)), color) &&
+               drawRect(Rect(r.x, r.y + t, std::min(t, r.w), std::max(0.0f, r.h - 2.0f * t)),
+                        color) &&
+               drawRect(Rect(r.x + r.w - std::min(t, r.w), r.y + t, std::min(t, r.w),
+                             std::max(0.0f, r.h - 2.0f * t)),
+                        color);
+    }
+    const int layers = RoundedStrokeLayerCount(r.w, r.h, radius, thickness);
+    const uint32_t argb = color.toArgbStraight();
+    bool ok = true;
+    for (int k = 0; k < layers && ok; ++k) {
+        RoundedStrokeLayer L;
+        if (!BuildRoundedStrokeLayer(r.x, r.y, r.w, r.h, radius, thickness, k, L)) break;
+        BgpuTexture tile = roundedTile(L.tile_radius, true);
+        if (!tile) { fail("roundedTile(stroke)", BGPU_ERR_BACKEND_FAILED); return false; }
+        const BgpuResult rc = bingpu_cmd_draw_rounded_rect(
+            cmd_, tile, L.rect.x, L.rect.y, L.rect.w, L.rect.h, L.radius,
+            RoundedTileSize(L.tile_radius), argb);
+        if (rc != BGPU_OK) { fail("bingpu_cmd_draw_rounded_rect(stroke)", rc); ok = false; }
+    }
+    return ok;
+}
+
+// 圆角渐变（0.19.0）：九宫格 + 四角直通色。色由 LinearGradientCorners 从**直通**两端
+// 插出来（binGPU 顶点色的口径就是直通域插值），几何展开是 binGPU 的
+// bingpu_cmd_draw_rounded_rect_grad —— 于是"线性渐变在屏幕空间是仿射函数"这一点被直接吃掉。
+// 两端 alpha 必须相同，否则这条路与 CPU 的预乘域插值不是同一个定义（见 gpuCompatible）。
+bool GpuCompositor::drawRoundedGradient(const Rect& r, float radius, float angleDeg,
+                                        const Color& from, const Color& to) {
+    if (!ready() || !targetBound_ || r.w <= 0.0f || r.h <= 0.0f) return false;
+    const uint32_t fromArgb = from.toArgbStraight(), toArgb = to.toArgbStraight();
+    uint32_t corners[4];
+    LinearGradientCorners(r, angleDeg, fromArgb, toArgb, corners);
+    const float rf = std::min(radius, std::min(r.w, r.h) * 0.5f);
+    if (rf < 0.5f) {
+        // 半径退化：直角渐变 = 一个四角带色四边形，直接走 draw_quads
+        BgpuTexture white = whiteTexture();
+        if (!white) return false;
+        (void)bingpu_cmd_set_texture(cmd_, white, samplerNearest_);
+        const float x0 = r.x, y0 = r.y, x1 = r.right(), y1 = r.bottom();
+        const BgpuVertex v[4] = {
+            {x0, y0, 0.0f, 0.5f, 0.5f, corners[0]},
+            {x1, y0, 0.0f, 0.5f, 0.5f, corners[1]},
+            {x0, y1, 0.0f, 0.5f, 0.5f, corners[2]},
+            {x1, y1, 0.0f, 0.5f, 0.5f, corners[3]},
+        };
+        const BgpuResult rq = bingpu_cmd_draw_quads(cmd_, v, 1);
+        if (rq != BGPU_OK) { fail("bingpu_cmd_draw_quads(grad)", rq); return false; }
+        return true;
+    }
+    const int tileRadius = std::max(1, static_cast<int>(std::lround(rf)));
+    BgpuTexture tile = roundedTile(tileRadius, false);
+    if (!tile) return false;
+    const BgpuResult rc = bingpu_cmd_draw_rounded_rect_grad(
+        cmd_, tile, r.x, r.y, r.w, r.h, rf, RoundedTileSize(tileRadius), corners);
+    if (rc != BGPU_OK) { fail("bingpu_cmd_draw_rounded_rect_grad", rc); return false; }
+    return true;
+}
+
+bool GpuCompositor::readTarget(BgpuTexture target, Surface& out) {    if (!device_ || !target) return false;
     BgpuTextureInfo info{};
     info.struct_size = sizeof(info);
     if (bingpu_texture_info(target, &info) != BGPU_OK) { fail("bingpu_texture_info", BGPU_ERR_INVALID_ARGUMENT); return false; }

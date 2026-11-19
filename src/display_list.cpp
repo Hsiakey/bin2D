@@ -36,18 +36,9 @@ Rect Intersect(const Rect& a, const Rect& b) {
     return Rect(x0, y0, std::max(0.0f, x1 - x0), std::max(0.0f, y1 - y0));
 }
 
-// 与 binGPU 的顶点色口径一致：0xAARRGGBB 直通 → 预乘（整数、(c*a)/255）。
-// 只在渐变四角用；两端 alpha 相同的渐变，先预乘再插值与"先插值再预乘"等价。
-uint32_t Premul(uint32_t c) {
-    const uint32_t a = (c >> 24) & 0xFFu;
-    if (a == 255u) return c;
-    if (a == 0u) return 0u;
-    const uint32_t r = (((c >> 16) & 0xFFu) * a) / 255u;
-    const uint32_t g = (((c >> 8) & 0xFFu) * a) / 255u;
-    const uint32_t b = ((c & 0xFFu) * a) / 255u;
-    return (a << 24) | (r << 16) | (g << 8) | b;
-}
-
+// 与 binGPU 的顶点色口径一致：0xAARRGGBB 直通 → 预乘。四角色现在由
+// LinearGradientCorners 直接给出**预乘**的 Color，靠 Color::toArgbPremul() 转成顶点色
+// —— 不再走"反预乘再预乘"那一圈（那一圈每次都会掉 1 个色阶）。
 bool RoundClip(const Rect& r, int* x, int* y, int* w, int* h) {
     // scissor 取整：与 binGPU 的口径一致（像素对齐，不留半像素缝）
     const int x0 = static_cast<int>(std::floor(r.x + 0.5f));
@@ -108,6 +99,36 @@ void DisplayList::fillGradient(const Rect& r, float angleDeg, const Color& from,
     ops_.push_back(op);
 }
 
+void DisplayList::fillRoundedGradient(const Rect& r, float radius, float angleDeg,
+                                      const Color& from, const Color& to) {
+    if (r.w <= 0.0f || r.h <= 0.0f) return;
+    if (from.a == 0 && to.a == 0) return;
+    Op op;
+    op.kind = Op::FillRoundedGradient;
+    op.rect = r;
+    op.radius = radius;
+    op.angle = angleDeg;
+    op.color = from.toArgbStraight();
+    op.color2 = to.toArgbStraight();
+    if (!(radius > 0.5f)) {
+        // 半径退化：两个执行体都会走直角路径，记成 FillGradient 省一次判断
+        op.kind = Op::FillGradient;
+        op.radius = 0.0f;
+    }
+    ops_.push_back(op);
+}
+
+void DisplayList::strokeRounded(const Rect& r, float radius, float thickness, const Color& c) {
+    if (r.w <= 0.0f || r.h <= 0.0f || c.a == 0 || thickness <= 0.0f) return;
+    Op op;
+    op.kind = Op::FillRing;
+    op.rect = r;
+    op.radius = radius;
+    op.thickness = thickness;
+    op.color = c.toArgbStraight();
+    ops_.push_back(op);
+}
+
 void DisplayList::drawImage(const Surface& image, const Rect& dst, const Rect& uv,
                             const Color& tint) {
     if (image.empty() || dst.w <= 0.0f || dst.h <= 0.0f || tint.a == 0) return;
@@ -120,15 +141,34 @@ void DisplayList::drawImage(const Surface& image, const Rect& dst, const Rect& u
     ops_.push_back(op);
 }
 
-// GPU 执行体的能力边界（现在**只有一条**）：两端 alpha 不同的渐变。
-// 半透明渐变要在预乘空间里插值（CSS Color 4），而 bin2d 的逐像素路径是直通插值 ——
-// 两条路的差别不是舍入，是定义。所以这种列表整份退回 CPU 执行体，而不是悄悄画错。
+// GPU 执行体的能力边界。**两条**，都是"两个执行体不是同一个数学"的地方：
+//
+// ① 两端 alpha **不同**的渐变。binGPU 的顶点色是直通色，`frag.rgb = tex.rgb·vcol.rgb·vcol.a`
+//    —— 也就是**在直通域插值、写的时候才预乘**；而 CPU 的 `Paint::SampleStops` 在**预乘域**
+//    插值（CSS Color 4）。两端 alpha 相同时两者等价（只差舍入），不同时是**定义**不同。
+//    （0.18.0 这里写的是另一条理由 —— "CPU 是直通插值"。真相是反的：CPU 走预乘，
+//     真正被这条挡住的其实是"直通域插值"的 GPU，而且那时四角色自己还被多预乘了一次。）
+// ② 缩小的贴图：CPU 的 Surface 采样器放大时双线性、缩小时走盒式预滤波；GPU 执行体现在
+//    只有双线性点采样 + 无 mipmap。缩小越多差得越远（边缘整级差异）。
+//
+// 两条都是"整份退回 CPU"，不是"画得差不多"。
 bool DisplayList::gpuCompatible(std::string* reason) const {
     for (const Op& op : ops_) {
-        if (op.kind != Op::FillGradient) continue;
-        const uint32_t a0 = (op.color >> 24) & 0xFFu, a1 = (op.color2 >> 24) & 0xFFu;
-        if (a0 != a1) {
-            if (reason) *reason = "半透明渐变（两端 alpha 不同）只在 CPU 执行体上保证精确";
+        if (op.kind == Op::FillGradient || op.kind == Op::FillRoundedGradient) {
+            const uint32_t a0 = (op.color >> 24) & 0xFFu, a1 = (op.color2 >> 24) & 0xFFu;
+            if (a0 != a1) {
+                if (reason)
+                    *reason = "两端 alpha 不同的渐变：CPU 在预乘域插值、GPU 在直通域插值";
+                return false;
+            }
+            continue;
+        }
+        if (op.kind != Op::FillImage || !op.image) continue;
+        const float srcW = static_cast<float>(op.image->width()) * op.uv.w;
+        const float srcH = static_cast<float>(op.image->height()) * op.uv.h;
+        if (srcW > op.rect.w * (1.0f + 1e-3f) || srcH > op.rect.h * (1.0f + 1e-3f)) {
+            if (reason)
+                *reason = "缩小的贴图：CPU 走盒式预滤波、GPU 走双线性，两者不是同一个滤波器";
             return false;
         }
     }
@@ -188,6 +228,54 @@ void DisplayList::execute(Canvas& canvas, Stats* stats) const {
             ++st.quads;
             ++st.draws;
             break;
+        case Op::FillRoundedGradient:
+            canvas.fillRounded(op.rect, op.radius,
+                               Paint::linearAngle(op.rect, op.angle, Color::argb(op.color),
+                                                  Color::argb(op.color2)));
+            ++st.ops;
+            ++st.quads;
+            ++st.draws;
+            break;
+        case Op::FillRing: {
+            // 与宿主 binUI 的 BinUI2D::strokeRounded **逐条相同**（0.19.0 起 bin2d 自己也有
+            // 一份，因为列表要能在 CPU 执行体上跑）：binUI 的描边是"向内叠层"，等价于
+            // "内缩 t/2 的矩形 + 居中描边 t"。这条等价关系是像素门禁验过的，别改成外扩。
+            const float t = op.thickness;
+            if (op.radius <= 0.0f) {
+                canvas.fillRect(Rect(op.rect.x, op.rect.y, op.rect.w, t), Color::argb(op.color));
+                canvas.fillRect(Rect(op.rect.x, op.rect.y + op.rect.h - t, op.rect.w, t),
+                                Color::argb(op.color));
+                canvas.fillRect(Rect(op.rect.x, op.rect.y + t, t, op.rect.h - 2.0f * t),
+                                Color::argb(op.color));
+                canvas.fillRect(Rect(op.rect.x + op.rect.w - t, op.rect.y + t, t,
+                                     op.rect.h - 2.0f * t),
+                                Color::argb(op.color));
+                ++st.quads;
+                st.quads += 3;
+            } else {
+                const float in = t * 0.5f;
+                const Rect outer(op.rect.x + in, op.rect.y + in, op.rect.w - t, op.rect.h - t);
+                const float rr = std::min(op.radius, std::min(op.rect.w, op.rect.h) * 0.5f) - in;
+                if (outer.w > 0.0f && outer.h > 0.0f) {
+                    if (rr <= 0.0f) {
+                        canvas.fillRect(outer, Color::argb(op.color));
+                    } else {
+                        Path path;
+                        path.addRoundedRect(outer, rr);
+                        StrokeStyle style;
+                        style.width = t;
+                        style.roundCap = false;
+                        style.squareCap = false;
+                        style.roundJoin = true;
+                        canvas.strokePath(path, Paint::solid(Color::argb(op.color)), style);
+                    }
+                }
+                ++st.quads;
+            }
+            ++st.ops;
+            ++st.draws;
+            break;
+        }
         case Op::FillImage:
             canvas.drawSurface(*op.image, op.rect, op.uv, Color::argb(op.tint));
             ++st.ops;
@@ -318,16 +406,43 @@ bool DisplayList::execute(GpuCompositor& gpu, BgpuTexture target, uint32_t clear
             boundValid = false;
             ++st.ops;
             break;
+        case Op::FillRoundedGradient:
+            if (!flush()) { ok = false; break; }
+            if (!gpu.drawRoundedGradient(op.rect, op.radius, op.angle, Color::argb(op.color),
+                                         Color::argb(op.color2))) {
+                error_ = gpu.lastError();
+                ok = false;
+                break;
+            }
+            st.quads += 1;
+            st.draws++;
+            st.binds++;
+            boundValid = false;
+            ++st.ops;
+            break;
+        case Op::FillRing:
+            if (!flush()) { ok = false; break; }
+            if (!gpu.drawRoundedStroke(op.rect, op.radius, op.thickness,
+                                       Color::argb(op.color))) {
+                error_ = gpu.lastError();
+                ok = false;
+                break;
+            }
+            st.quads += 1;
+            st.draws++;
+            st.binds++;
+            boundValid = false;
+            ++st.ops;
+            break;
         case Op::FillGradient: {
             if (!flush()) { ok = false; break; }
             if (!bindWhite()) { ok = false; break; }
-            Color corners[4];
-            LinearGradientCorners(op.rect, op.angle, Color::argb(op.color),
-                                  Color::argb(op.color2), corners);
-            const uint32_t c0 = Premul(corners[0].toArgbStraight());
-            const uint32_t c1 = Premul(corners[1].toArgbStraight());
-            const uint32_t c2 = Premul(corners[2].toArgbStraight());
-            const uint32_t c3 = Premul(corners[3].toArgbStraight());
+            uint32_t corners[4];
+            LinearGradientCorners(op.rect, op.angle, op.color, op.color2, corners);
+            const uint32_t c0 = corners[0];
+            const uint32_t c1 = corners[1];
+            const uint32_t c2 = corners[2];
+            const uint32_t c3 = corners[3];
             const float x0 = op.rect.x, y0 = op.rect.y;
             const float x1 = op.rect.right(), y1 = op.rect.bottom();
             pending.verts.push_back(BgpuVertex{x0, y0, 0.0f, 0.5f, 0.5f, c0});
