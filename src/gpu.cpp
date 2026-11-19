@@ -330,26 +330,40 @@ void GpuCompositor::fail(std::string& error, const char* what, BgpuResult result
 }
 
 bool GpuCompositor::create(int width, int height, BgpuBackendKind backend) {
+    return createInternal(width, height, backend, nullptr, false);
+}
+
+bool GpuCompositor::createWindow(void* nativeWindow, int width, int height,
+                                 BgpuBackendKind backend) {
+    if (!nativeWindow) { error_ = "createWindow: nativeWindow 为空"; return false; }
+    return createInternal(width, height, backend, nativeWindow, true);
+}
+
+bool GpuCompositor::createInternal(int width, int height, BgpuBackendKind backend,
+                                   void* nativeWindow, bool windowed) {
     destroy();
     if (width <= 0 || height <= 0) return false;
     width_ = width;
     height_ = height;
     backend_ = backend;
+    windowed_ = windowed;
 
     BgpuDeviceDesc dd{};
     dd.struct_size = sizeof(dd);
     dd.backend = backend;
-    dd.native_window = nullptr;
+    dd.native_window = nativeWindow;
     dd.width = static_cast<uint32_t>(width);
     dd.height = static_cast<uint32_t>(height);
-    dd.flags = BGPU_DEVICE_HEADLESS | BGPU_DEVICE_VALIDATE;
+    // 窗口版不能带 HEADLESS（headless 后端没有呈现路径），其余校验照旧
+    dd.flags = BGPU_DEVICE_VALIDATE |
+               (windowed ? 0u : static_cast<uint32_t>(BGPU_DEVICE_HEADLESS));
     dd.msaa_samples = 1;
     BgpuResult r = bingpu_device_create(&dd, &device_);
     if (r != BGPU_OK) { fail("bingpu_device_create", r); destroy(); return false; }
 
     BgpuSwapchainDesc sd{};
     sd.struct_size = sizeof(sd);
-    sd.native_window = nullptr;      // 无窗口：frame_read 出图
+    sd.native_window = nativeWindow;   // nullptr = 无窗口：frame_read 出图
     sd.width = static_cast<uint32_t>(width);
     sd.height = static_cast<uint32_t>(height);
     sd.format = BGPU_FORMAT_RGBA8;
@@ -416,6 +430,7 @@ void GpuCompositor::destroy() {
         device_ = 0;
     }
     width_ = height_ = 0;
+    windowed_ = false;
     target_ = 0;
     stats_ = Stats{};
 }
@@ -630,6 +645,10 @@ BgpuResult GpuCompositor::recordLayers(const Layer* layers, size_t count) {
 }
 
 bool GpuCompositor::compose(const Layer* layers, size_t count, Surface& out) {
+    return composeInternal(layers, count, &out);
+}
+
+bool GpuCompositor::composeInternal(const Layer* layers, size_t count, Surface* out) {
     if (!ready() || (!layers && count)) return false;
     resetStats();
 
@@ -657,7 +676,8 @@ bool GpuCompositor::compose(const Layer* layers, size_t count, Surface& out) {
     r = bingpu_frame_end(swapchain_, cmd_);
     if (r != BGPU_OK) { fail("bingpu_frame_end", r); return false; }
     target_ = 0;
-    return readBack(out);
+    if (!out) return true;    // 窗口呈现：像素已经 present 出去，不付回读的钱
+    return readBack(*out);
 }
 
 bool GpuCompositor::composeTo(const Layer* layers, size_t count, BgpuTexture target) {
@@ -733,6 +753,22 @@ bool GpuCompositor::composeOne(const Surface& src, Surface& out) {
     layer.dst = Rect(0.0f, 0.0f, static_cast<float>(src.width()),
                      static_cast<float>(src.height()));
     const bool ok = compose(&layer, 1, out);
+    recycle(tex);
+    return ok;
+}
+
+// 窗口呈现：整张 Surface 铺满交换链 → present。不回读（省 92 万像素的往返）。
+bool GpuCompositor::presentSurface(const Surface& src) {
+    if (!windowed_) { error_ = "presentSurface: 这个合成器不是窗口版（用 createWindow）"; return false; }
+    if (!ready() || src.empty()) return false;
+    BgpuTexture tex = acquire(src.width(), src.height());
+    if (!tex) return false;
+    if (!upload(tex, src)) { recycle(tex); return false; }
+    Layer layer;
+    layer.texture = tex;
+    layer.dst = Rect(0.0f, 0.0f, static_cast<float>(src.width()),
+                     static_cast<float>(src.height()));
+    const bool ok = composeInternal(&layer, 1, nullptr);
     recycle(tex);
     return ok;
 }

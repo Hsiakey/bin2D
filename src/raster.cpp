@@ -1293,6 +1293,65 @@ void DrawSurface(const RasterTarget& t, const Surface& image, const Rect& dstLoc
         return;
     }
 
+    // ---------------- ①b UV 子矩形 + 1:1 + 整纹素对齐 ----------------
+    // 字形就是这条路：一屏几百个 12×16 的小四边形，每个都走一次"分配三条查表 +
+    // 逐像素 4 邻域加权"太贵（实测约 25 µs/字形，整屏文字 → 20 ms）。
+    //
+    // 为什么可以退化成直接取纹素：采样点落在纹素**中心**时，双线性的两个权重
+    // 都是 0 —— 加权求和的结果就是那一个纹素，一位不差。判据是"UV 子矩形的
+    // 起始落在整纹素上、且尺寸与目标矩形 1:1"，这正好是字形图集的形状。
+    if (!t.mask && axisAligned && nearest == false &&
+        std::fabs(xf.a - 1.0f) < 1e-4f && std::fabs(xf.d - 1.0f) < 1e-4f) {
+        const float fsw = static_cast<float>(sw), fsh = static_cast<float>(sh);
+        const float tw = srcUv.w * fsw, th = srcUv.h * fsh;
+        const float sx0f = srcUv.x * fsw, sy0f = srcUv.y * fsh;
+        const float sxr = std::round(sx0f), syr = std::round(sy0f);
+        if (std::fabs(tw - dstLocal.w) < 1e-3f && std::fabs(th - dstLocal.h) < 1e-3f &&
+            std::fabs(sx0f - sxr) < 1e-3f && std::fabs(sy0f - syr) < 1e-3f) {
+            const int sx0 = static_cast<int>(sxr), sy0 = static_cast<int>(syr);
+            const int dwid = static_cast<int>(std::lround(dstLocal.w));
+            const int dhei = static_cast<int>(std::lround(dstLocal.h));
+            const int dx = static_cast<int>(std::lround(devRect.x));
+            const int dy = static_cast<int>(std::lround(devRect.y));
+            const bool plainTint = tint.r == 255 && tint.g == 255 && tint.b == 255 && tint.a == 255;
+            auto blitSub = [&](auto modeTag) {
+                constexpr BlendMode M = decltype(modeTag)::value;
+                for (int py = y0; py < y1; ++py) {
+                    const int ry = py - dy;
+                    if (ry < 0 || ry >= dhei) continue;
+                    const int sy = sy0 + ry;
+                    if (sy < 0 || sy >= sh) continue;
+                    const uint8_t* s = srcSurface.row(sy);
+                    uint8_t* d = dst.row(py);
+                    for (int px = x0; px < x1; ++px) {
+                        const int rx = px - dx;
+                        if (rx < 0 || rx >= dwid) continue;
+                        const int sx = sx0 + rx;
+                        if (sx < 0 || sx >= sw) continue;
+                        const uint8_t* sp = s + static_cast<size_t>(sx) * 4;
+                        uint8_t* dp = d + static_cast<size_t>(px) * 4;
+                        Color c(sp[0], sp[1], sp[2], sp[3]);
+                        if (!plainTint) {
+                            c = Color(Div255(static_cast<uint32_t>(c.r) * tint.r),
+                                      Div255(static_cast<uint32_t>(c.g) * tint.g),
+                                      Div255(static_cast<uint32_t>(c.b) * tint.b),
+                                      Div255(static_cast<uint32_t>(c.a) * tint.a));
+                        }
+                        BlendOne<M>(dp, c);
+                    }
+                }
+            };
+            switch (t.blend) {
+            case BlendMode::SrcOver: blitSub(std::integral_constant<BlendMode, BlendMode::SrcOver>{}); break;
+            case BlendMode::Replace: blitSub(std::integral_constant<BlendMode, BlendMode::Replace>{}); break;
+            case BlendMode::Erase: blitSub(std::integral_constant<BlendMode, BlendMode::Erase>{}); break;
+            case BlendMode::Keep: blitSub(std::integral_constant<BlendMode, BlendMode::Keep>{}); break;
+            case BlendMode::Additive: blitSub(std::integral_constant<BlendMode, BlendMode::Additive>{}); break;
+            }
+            return;
+        }
+    }
+
     // ---------------- ② 轴对齐缩放：查表 ----------------
     if (axisAligned) {
         const int spanW = x1 - x0;

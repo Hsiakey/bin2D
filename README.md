@@ -110,6 +110,14 @@ ctest --test-dir build --output-on-failure
 宿主三个 GPU 后端各自手写了一份一样的有符号距离循环，改一处就差一圈像素；现在
 三端共用 bin2d 这一份（binUI 0.23.0 接入，像素一位没动）。
 
+**0.11.0（2026-11-19）**：**窗口呈现**（`GpuCompositor::createWindow` +
+`presentSurface`）—— 一张 Surface 直接送进真实窗口的交换链、不回读，这就是
+"bin2d 的后端交给 binGPU"的落点。另外给 `DrawSurface` 加了**图集 1:1 快路径**：
+UV 落在整纹素边界且 1:1 时，采样点在纹素中心，双线性退化成取一个纹素，字形
+从 25 µs 降到几个 µs；顺带修掉 `u*(sw-1)` 在 1:1 下偏 0.4 纹素的精度问题
+（binUI 侧文字用例最大通道差 171 → 79）。features 页 900×932：全屏 23.6 ms，
+脏区 120×40 **3.56 ms**、900×60 **1.13 ms**。
+
 **0.10.1（2026-11-19）**：修 `Canvas::clipRect` 的坐标系 —— 它用裸 `state().xf` 映射，
 落像素却用 `deviceTransform()`（xf 再减层原点），两者在图层里差一个 origin，症状是
 "层内第一次 `clipRect` 就把内容裁成 0×0"。`clipPath` 一直是按 `deviceTransform` 算的，

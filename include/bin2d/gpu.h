@@ -153,8 +153,16 @@ public:
     // 建设备 + 交换链 + 5 个混合管线 + 2 个采样器 + cmd。
     // 后端不可用时返回 false（error() 里有原因），调用方据此跳过而不是当失败。
     bool create(int width, int height, BgpuBackendKind backend = BGPU_BACKEND_CPU);
+    // 窗口版（0.11.0）：绑定一个**真实窗口**的交换链，present 直接上屏。
+    // 与 create 的差别只有两处 —— native_window 从 nullptr 换成窗口句柄、设备
+    // 不再带 BGPU_DEVICE_HEADLESS。headless 后端（NULL / CPU）在这里必然失败
+    // （它们没有呈现路径），调用方据此退回"CPU 出图 + 系统贴屏"。
+    bool createWindow(void* nativeWindow, int width, int height,
+                      BgpuBackendKind backend = BGPU_BACKEND_GL);
     void destroy();
     bool ready() const { return device_ != 0 && swapchain_ != 0 && cmd_ != 0; }
+    // 是不是窗口版（决定 presentSurface 能不能用）
+    bool windowed() const { return windowed_; }
 
     int width() const { return width_; }
     int height() const { return height_; }
@@ -186,6 +194,13 @@ public:
     // 单层满幅（= 老 GpuBridge::render 的等价物，走池子免得每帧新建纹理）
     bool composeOne(const Surface& src, Surface& out);
 
+    // ---- 窗口呈现（0.11.0）：一张 Surface 铺满交换链并 present，**不回读** ----
+    // 这是"上层 UI 库把 CPU 光栅结果交给 GPU 上屏"的唯一入口。与 composeOne 的
+    // 区别是省掉 frame_read：1280×720 一帧省掉 92 万像素的反预乘 + 92 万像素的
+    // 回读带宽，窗口路径不需要那份像素。
+    // 只能在 createWindow() 之后调（error() 会说明）。
+    bool presentSurface(const Surface& src);
+
     // ---- 离屏渲染目标：合到显存里，不回读 ----
     // 回读（frame_read/texture_read）是 Surface→Surface 这条接口的固有成本：
     // 1280×720 一帧要反预乘 92 万像素再预乘一遍。图层套图层、或者"中间结果不需要
@@ -211,18 +226,24 @@ private:
     };
     static void fail(std::string& error, const char* what, BgpuResult result);
     void fail(const char* what, BgpuResult result) { fail(error_, what, result); }
+    // create / createWindow 的共同实现（唯一差别是 native_window 与 HEADLESS 位）
+    bool createInternal(int width, int height, BgpuBackendKind backend,
+                        void* nativeWindow, bool windowed);
     BgpuPipeline pipelineFor(BlendMode mode) const;
     bool findPooled(int w, int h, uint32_t flags, PoolEntry* out);
     BgpuTexture acquireInternal(int w, int h, uint32_t flags);
     void dropLive(BgpuTexture texture);
     // 记一帧的图层（调用方已经 begin_render 好目标）；内部按状态合批
     BgpuResult recordLayers(const Layer* layers, size_t count);
+    // compose 的主体：out 为 nullptr 时不回读（窗口呈现走这条）
+    bool composeInternal(const Layer* layers, size_t count, Surface* out);
     void resetStats() { stats_ = Stats{}; }
     bool readBack(Surface& out);
 
     BgpuDevice device_ = 0;
     BgpuSwapchain swapchain_ = 0;
     BgpuCmd cmd_ = 0;
+    bool windowed_ = false;   // createWindow 建过：presentSurface 可用
     BgpuPipeline pipelines_[5] = {0, 0, 0, 0, 0};   // 下标 = BlendMode 的枚举值
     BgpuSampler samplerLinear_ = 0;
     BgpuSampler samplerNearest_ = 0;
