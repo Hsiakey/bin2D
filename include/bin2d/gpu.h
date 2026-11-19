@@ -313,6 +313,12 @@ private:
     bool createInternal(int width, int height, BgpuBackendKind backend,
                         void* nativeWindow, bool windowed, bool vsync);
     BgpuPipeline pipelineFor(BlendMode mode) const;
+    // 解析圆角（0.21.0）用的另一套管线的取用/绑定。`shapePipelines_` 为空 = 后端没有
+    // BGPU_CAP_SHAPE，所有 drawRounded* 退回覆盖率模板那条路。
+    BgpuPipeline shapePipelineFor(BlendMode mode) const;
+    bool shapesAvailable() const { return shapePipelines_[0] != 0; }
+    bool bindPipeline(BgpuPipeline p);
+    bool drawShapeQuads(const BgpuShapeVertex* verts, uint32_t quads, BlendMode mode);
     bool findPooled(int w, int h, uint32_t flags, PoolEntry* out);
     BgpuTexture acquireInternal(int w, int h, uint32_t flags);
     void dropLive(BgpuTexture texture);
@@ -328,6 +334,11 @@ private:
     BgpuCmd cmd_ = 0;
     bool windowed_ = false;   // createWindow 建过：presentSurface 可用
     BgpuPipeline pipelines_[5] = {0, 0, 0, 0, 0};   // 下标 = BlendMode 的枚举值
+    // 解析圆角专用管线（BGPU_PIPE_SHAPE + BGPU_VERTEX_SHAPE）。下标同上。
+    // 后端没有 BGPU_CAP_SHAPE 时这五个保持 0，圆角自动退回覆盖率模板。
+    BgpuPipeline shapePipelines_[5] = {0, 0, 0, 0, 0};
+    // 当前绑着的管线（只用来省掉重复的 set_pipeline；0 = 未知，下次一定重绑）
+    BgpuPipeline curPipe_ = 0;
     BgpuSampler samplerLinear_ = 0;
     BgpuSampler samplerNearest_ = 0;
     BgpuTexture target_ = 0;   // 帧内借用，不持有

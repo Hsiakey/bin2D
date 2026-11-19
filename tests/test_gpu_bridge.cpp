@@ -381,19 +381,21 @@ bool RunCompositor(const char* label, BgpuBackendKind kind) {
     return pass;
 }
 
-// ---- 2D 图元（0.16.0）：binGPU 的九宫格铺的是不是**模板本身** ----
+// ---- 2D 图元（0.16.0 起；0.21.0 改成解析圆角）----
 //
-// 这一条考的是 binGPU 的责任：给定一张覆盖率模板，把圆角矩形铺满、不留缝、不越界，
-// 角片 1:1、中段拉伸。所以判据是"设备上画出来的像素 == 模板里的覆盖率"（**逐像素精确**），
-// 而不是和 bin2d 的直填结果比 —— 那两个是**两套 AA 定义**（模板是解析 SDF，直填是
-// 8 子采样扫描线），弧边天生差几个电平。跨实现的距离单独打印，当仪表不当门禁
-// （与 Makefile 里 bin2d-vs-gl 的口径一致）。
+// 0.20.0 及以前：binGPU 的九宫格铺的是 CPU 生成的覆盖率模板，所以判据是
+// "设备上画出来的像素 == 模板里的覆盖率"。
+// **0.21.0 起**：bin2d 在有 BGPU_CAP_SHAPE 时直接发 36 字节的形状顶点，圆角的
+// AA 数学在 binGPU 的片元着色器里算（SDF）。于是权威变成了**闭式公式**，判据是：
+//   ① 左上角区逐像素 == 闭式 SDF（≤1，8 位量化）
+//   ② 直边段是满覆盖（不能把弧采进来）
+//   ③ 矩形外面一个像素都不许动
+//   ④ 与 bin2d 直填的差只打印、不当门禁 —— 那是两套 AA 定义（SDF vs 8 子采样扫描线），
+//      弧边上天生差几个电平；钉死它等于禁止将来改进任何一边。
 bool RunPrimParity(const char* label, BgpuBackendKind kind) {
     const int W = 96, H = 64;
     const int R = 8;
-    const int T = RoundedTileSize(R);
-    const Rect a(8, 8, 80, 48), b(20, 18, 40, 20), sq(4, 4, 10, 10);
-    const Rect probe(8, 8, 40, 32);   // 只用来验九宫格的那个（不透明、整数位置）
+    const Rect probe(8, 8, 40, 32);   // 整数位置、不透明：只考"形状 + AA"，不考相位
 
     GpuCompositor comp;
     if (!comp.create(W, H, kind)) {
@@ -412,42 +414,45 @@ bool RunPrimParity(const char* label, BgpuBackendKind kind) {
         return false;
     }
 
-    CoverageRect cov;
-    if (!RasterizeRoundedTileCoverage(R, false, cov) || cov.w != T || cov.h != T) {
-        std::printf("  [%s] FAIL：模板导出失败\n", label);
-        return false;
-    }
-
-    // ① 四个角片：1:1，逐像素等于模板
-    int cornerBad = 0;
-    for (int k = 0; k < R; ++k) {
-        for (int j = 0; j < R; ++j) {
-            const uint8_t want[4][1] = {{0}};
-            (void)want;
-            const struct { int dx, dy, u, v; } cells[4] = {
-                {j, k, j, k},                                  // 左上
-                {(int)probe.w - 1 - j, k, T - 1 - j, k},        // 右上
-                {j, (int)probe.h - 1 - k, j, T - 1 - k},        // 左下
-                {(int)probe.w - 1 - j, (int)probe.h - 1 - k, T - 1 - j, T - 1 - k},   // 右下
-            };
-            for (const auto& q : cells) {
-                const uint8_t wantCov = cov.v[static_cast<size_t>(q.v) * cov.w + q.u];
-                const uint8_t gotA = out.get((int)probe.x + q.dx, (int)probe.y + q.dy).a;
-                if (gotA != wantCov) ++cornerBad;
+    // ① 左上角区 vs 闭式 SDF（R×R 全部像素都在判据里，弧上每一格都过一遍）
+    {
+        const float cx = probe.x + probe.w * 0.5f, cy = probe.y + probe.h * 0.5f;
+        const float hx = probe.w * 0.5f, hy = probe.h * 0.5f;
+        const float r = (float)R;
+        int bad = 0, worst = 0, partial = 0;
+        for (int y = (int)probe.y; y < (int)probe.y + R; ++y) {
+            for (int x = (int)probe.x; x < (int)probe.x + R; ++x) {
+                const float px = static_cast<float>(x) + 0.5f - cx;
+                const float py = static_cast<float>(y) + 0.5f - cy;
+                const float qx = std::fabs(px) - hx + r;
+                const float qy = std::fabs(py) - hy + r;
+                const float mx = qx > 0.0f ? qx : 0.0f, my = qy > 0.0f ? qy : 0.0f;
+                const float m = qx > qy ? qx : qy;
+                const float d = std::sqrt(mx * mx + my * my) + (m < 0.0f ? m : 0.0f) - r;
+                float cov = 0.5f - d;
+                cov = cov < 0.0f ? 0.0f : (cov > 1.0f ? 1.0f : cov);
+                const int want = static_cast<int>(cov * 255.0f + 0.5f);
+                if (want > 0 && want < 255) ++partial;
+                const int got = out.get(x, y).a;
+                const int dv = got > want ? got - want : want - got;
+                if (dv > worst) worst = dv;
+                if (dv > 1) ++bad;
             }
         }
+        std::printf("  [%s] %s 角区 vs 闭式 SDF：最大差 %d（含 %d 个半覆盖格）\n", label,
+                    comp.backendName(), worst, partial);
+        CHECK(bad == 0, "gpu: 解析圆角的角区逐像素等于闭式 SDF（≤1）");
+        CHECK(partial >= 4, "gpu: 角区里有过渡带（判据不是全 0/全 255 的空判据）");
     }
-    CHECK(cornerBad == 0, "gpu: 圆角九宫格的四角片 1:1 等于模板覆盖率");
 
-    // ② 中段：取模板正中那个像素（直边段），不能把弧采进来
+    // ② 直边段：满覆盖
     {
-        const uint8_t wantMid = cov.v[static_cast<size_t>(T / 2) * cov.w + T / 2];
         int midBad = 0;
-        for (int x = R + 1; x < (int)probe.w - R - 1; x += 5) {
-            const uint8_t got = out.get((int)probe.x + x, (int)probe.y + (int)probe.h / 2).a;
-            if (got != wantMid) ++midBad;
+        for (int x = (int)probe.x + R + 1; x < (int)probe.right() - R - 1; x += 5) {
+            if (out.get(x, (int)probe.y).a != 255) ++midBad;                  // 上边
+            if (out.get(x, (int)probe.bottom() - 1).a != 255) ++midBad;       // 下边
         }
-        CHECK(midBad == 0, "gpu: 圆角九宫格的中段拉伸取模板直边段");
+        CHECK(midBad == 0, "gpu: 解析圆角的直边段是满覆盖");
     }
 
     // ③ 矩形外面一个像素都不许动
@@ -463,10 +468,7 @@ bool RunPrimParity(const char* label, BgpuBackendKind kind) {
         CHECK(leak == 0, "gpu: 圆角矩形不越界");
     }
 
-    // ④ **门禁**（0.20.0 起）：与 bin2d 直填逐像素相同。
-    // 0.19.0 及以前这里是"仪表"——因为模板走解析 SDF、直填走扫描线，两套 AA 定义，
-    // 弧边本来就差。0.20.0 模板改成由 CPU 光栅自己生成，于是这一条变成可以钉死的
-    // 判据：**同一条页面在两个执行体上必须是同一批像素**（容差 1 = 覆盖率的 8 位量化）。
+    // ④ 仪表（不是门禁）：与 bin2d 直填的距离 = 两套 AA 定义在弧上的差
     {
         Surface ref(W, H);
         {
@@ -475,12 +477,9 @@ bool RunPrimParity(const char* label, BgpuBackendKind kind) {
             c.fillRounded(probe, (float)R, Color::argb(0xFFFFFFFF));
         }
         const int d = MaxChannelDiff(ref, out);
-        std::printf("  [%s] %s 九宫格 vs bin2d 直填：最大通道差 %d\n", label, comp.backendName(), d);
-        CHECK(d <= 1, "gpu: 圆角矩形与 bin2d 直填逐像素相同（≤1）");
+        std::printf("  [%s] %s 解析 AA vs bin2d 扫描线：最大通道差 %d（两套定义，不是门禁）\n",
+                    label, comp.backendName(), d);
     }
-    (void)a;
-    (void)b;
-    (void)sq;
     return true;
 }
 // 预乘直传（0.27.3）：纹理按 BGPU_TEXTURE_PREMULTIPLIED 建，上传时后端**不得**再预乘一遍。

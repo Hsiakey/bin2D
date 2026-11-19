@@ -380,6 +380,34 @@ bool GpuCompositor::createInternal(int width, int height, BgpuBackendKind backen
         }
     }
 
+    // 解析圆角（0.21.0）：圆角的 AA **数学**在 binGPU 的片元着色器里算（SDF），
+    // 所以这里多建五条 36 字节顶点的管线。后端不报 BGPU_CAP_SHAPE 时全部留 0，
+    // drawRounded* 自动退回覆盖率模板 —— 一条能力位门控，两条路都通。
+    {
+        BgpuCaps caps{};
+        caps.struct_size = sizeof(caps);
+        const bool haveCaps = (bingpu_device_caps(device_, &caps) == BGPU_OK);
+        const bool canShape = haveCaps && (caps.flags & BGPU_CAP_SHAPE) != 0;
+        if (canShape) {
+            for (int i = 0; i < 5; ++i) {
+                BgpuPipelineDesc pd{};
+                pd.struct_size = sizeof(pd);
+                pd.vertex_layout = BGPU_VERTEX_SHAPE;
+                pd.blend = static_cast<BgpuBlend>(i);
+                pd.flags = BGPU_PIPE_SHAPE;   // 必须与 BGPU_VERTEX_SHAPE 成对
+                const BgpuResult sr = bingpu_pipeline_create(device_, &pd, &shapePipelines_[i]);
+                if (sr != BGPU_OK) {
+                    char what[80];
+                    std::snprintf(what, sizeof(what),
+                                  "bingpu_pipeline_create(shape, blend=%d)", i);
+                    fail(what, sr);
+                    destroy();
+                    return false;
+                }
+            }
+        }
+    }
+
     BgpuSamplerDesc samd{};
     samd.struct_size = sizeof(samd);
     samd.min_filter = BGPU_FILTER_LINEAR;
@@ -423,7 +451,12 @@ void GpuCompositor::destroy() {
         if (samplerLinear_) { bingpu_sampler_destroy(device_, samplerLinear_); samplerLinear_ = 0; }
         for (int i = 0; i < 5; ++i) {
             if (pipelines_[i]) { bingpu_pipeline_destroy(device_, pipelines_[i]); pipelines_[i] = 0; }
+            if (shapePipelines_[i]) {
+                bingpu_pipeline_destroy(device_, shapePipelines_[i]);
+                shapePipelines_[i] = 0;
+            }
         }
+        curPipe_ = 0;
         if (swapchain_) { bingpu_swapchain_destroy(device_, swapchain_); swapchain_ = 0; }
         bingpu_device_destroy(device_);
         device_ = 0;
@@ -432,6 +465,42 @@ void GpuCompositor::destroy() {
     windowed_ = false;
     target_ = 0;
     stats_ = Stats{};
+}
+
+BgpuPipeline GpuCompositor::shapePipelineFor(BlendMode mode) const {
+    const int i = static_cast<int>(ToBgpuBlend(mode));
+    return (i >= 0 && i < 5) ? shapePipelines_[i] : 0;
+}
+
+// 绑管线（幂等）。只为了省掉"同一帧里连着几十个圆角各切一次管线"的开销；
+// 每次切换都要记进 curPipe_，所以任何绕过这里的 set_pipeline 必须同步清掉它
+// （beginTarget 就是那样做的）。
+bool GpuCompositor::bindPipeline(BgpuPipeline p) {
+    if (!p) {
+        error_ = "bindPipeline: 管线为空";
+        return false;
+    }
+    if (p == curPipe_) return true;
+    const BgpuResult r = bingpu_cmd_set_pipeline(cmd_, p);
+    if (r != BGPU_OK) { fail("bingpu_cmd_set_pipeline", r); return false; }
+    curPipe_ = p;
+    return true;
+}
+
+// 解析圆角：一批 36 字节顶点交给 binGPU，AA 数学在片元里算。
+// 画完**立刻**把 2D 管线绑回去 —— display_list 的合批路径直接调
+// bingpu_cmd_draw_quads，它认的是 2D 布局的管线（布局不匹配会被 API 层拒掉）。
+bool GpuCompositor::drawShapeQuads(const BgpuShapeVertex* verts, uint32_t quads,
+                                   BlendMode mode) {
+    if (!shapesAvailable()) return false;
+    if (!bindPipeline(shapePipelineFor(mode))) return false;
+    const BgpuResult rc = bingpu_cmd_draw_shapes(cmd_, verts, quads);
+    if (rc != BGPU_OK) {
+        fail("bingpu_cmd_draw_shapes", rc);
+        return false;
+    }
+    // 还原成合成器的默认 2D 管线（下一个矩形批次/贴图要用）
+    return bindPipeline(pipelineFor(BlendMode::SrcOver));
 }
 
 BgpuPipeline GpuCompositor::pipelineFor(BlendMode mode) const {
@@ -818,7 +887,8 @@ bool GpuCompositor::beginTarget(BgpuTexture target, uint32_t clearArgb) {
                                   static_cast<float>(th));
     (void)bingpu_cmd_set_scissor(cmd_, 0, 0, tw, th);
     (void)bingpu_cmd_set_affine(cmd_, nullptr);   // 顶点就是目标像素
-    (void)bingpu_cmd_set_pipeline(cmd_, pipelineFor(BlendMode::SrcOver));
+    curPipe_ = 0;   // 新 pass：后端的状态全清了，缓存的"当前管线"作废
+    if (!bindPipeline(pipelineFor(BlendMode::SrcOver))) return false;
     targetBound_ = target;
     return true;
 }
@@ -895,12 +965,33 @@ bool GpuCompositor::drawRect(const Rect& r, Color color) {
 bool GpuCompositor::drawRoundedRects(float radius, const Rect* rects, size_t count,
                                      Color color) {
     if (!ready() || !targetBound_ || !rects || count == 0) return false;
+    const uint32_t argb = color.toArgbStraight();
+    // 解析圆角（0.21.0）：N 个圆角就是 N 个四边形、**一次** draw_shapes。
+    // 顶点序沿用 TL,TR,BL,BR；局部坐标在顶点处取 ±half，片元里线性插值（精确）。
+    if (shapesAvailable()) {
+        std::vector<BgpuShapeVertex> verts;
+        verts.reserve(count * 4);
+        for (size_t i = 0; i < count; ++i) {
+            const Rect& r = rects[i];
+            if (r.w <= 0.0f || r.h <= 0.0f) continue;
+            const float rf = std::min(radius, std::min(r.w, r.h) * 0.5f);
+            if (rf < 0.5f) continue;   // 半径退化：调用方该用 drawRect
+            const float hx = r.w * 0.5f, hy = r.h * 0.5f;
+            const float x0 = r.x, x1 = r.x + r.w, y0 = r.y, y1 = r.y + r.h;
+            verts.push_back(BgpuShapeVertex{x0, y0, -hx, -hy, hx, hy, rf, 0.0f, argb});
+            verts.push_back(BgpuShapeVertex{x1, y0, hx, -hy, hx, hy, rf, 0.0f, argb});
+            verts.push_back(BgpuShapeVertex{x0, y1, -hx, hy, hx, hy, rf, 0.0f, argb});
+            verts.push_back(BgpuShapeVertex{x1, y1, hx, hy, hx, hy, rf, 0.0f, argb});
+        }
+        if (verts.empty()) return true;
+        return drawShapeQuads(verts.data(), static_cast<uint32_t>(verts.size() / 4u),
+                              BlendMode::SrcOver);
+    }
     const int tileRadius = std::max(1, static_cast<int>(std::lround(radius)));
     BgpuTexture tile = roundedTile(tileRadius, false);
     if (!tile) return false;
     std::vector<BgpuRoundedRect> batch;
     batch.reserve(count);
-    const uint32_t argb = color.toArgbStraight();
     for (size_t i = 0; i < count; ++i) {
         const Rect& r = rects[i];
         if (r.w <= 0.0f || r.h <= 0.0f) continue;
@@ -919,6 +1010,20 @@ bool GpuCompositor::drawRoundedRect(const Rect& r, float radius, Color color) {
     if (!ready() || !targetBound_ || r.w <= 0.0f || r.h <= 0.0f) return false;
     const float rf = std::min(radius, std::min(r.w, r.h) * 0.5f);
     if (rf < 0.5f) return drawRect(r, color);   // 半径小于半像素：视觉上就是直角
+    // 解析圆角（0.21.0）：一个四边形、一次 draw_shapes，AA 在片元里算。
+    // 注意半径走的是**浮点** rf —— 模板那条路要四舍五入成整数，弧上会差半像素。
+    if (shapesAvailable()) {
+        const uint32_t argb = color.toArgbStraight();
+        const float hx = r.w * 0.5f, hy = r.h * 0.5f;
+        const float x0 = r.x, x1 = r.x + r.w, y0 = r.y, y1 = r.y + r.h;
+        const BgpuShapeVertex v[4] = {
+            {x0, y0, -hx, -hy, hx, hy, rf, 0.0f, argb},
+            {x1, y0, hx, -hy, hx, hy, rf, 0.0f, argb},
+            {x0, y1, -hx, hy, hx, hy, rf, 0.0f, argb},
+            {x1, y1, hx, hy, hx, hy, rf, 0.0f, argb},
+        };
+        return drawShapeQuads(v, 1, BlendMode::SrcOver);
+    }
     const int tileRadius = std::max(1, static_cast<int>(std::lround(rf)));
     BgpuTexture tile = roundedTile(tileRadius, false);
     if (!tile) return drawRect(r, color);       // 模板起不来：别让形状凭空消失
@@ -953,6 +1058,22 @@ bool GpuCompositor::drawRoundedStroke(const Rect& r, float radius, float thickne
                drawRect(Rect(r.x + r.w - std::min(t, r.w), r.y + t, std::min(t, r.w),
                              std::max(0.0f, r.h - 2.0f * t)),
                         color);
+    }
+    // 解析圆角（0.21.0）：环带同样是一个四边形 —— 距离场里 `|d + t/2| - t/2` 就是
+    // "到带子中心线的距离"，所以边框不用生成任何模板。
+    // 这里厚度与半径都用**浮点**原值：模板那条路必须四舍五入成整数厚度、整数半径，
+    // 1.4px 的边框会被画成 1px（弧上更明显）；SDF 没有这个限制。
+    if (shapesAvailable()) {
+        const uint32_t argb = color.toArgbStraight();
+        const float hx = r.w * 0.5f, hy = r.h * 0.5f;
+        const float x0 = r.x, x1 = r.x + r.w, y0 = r.y, y1 = r.y + r.h;
+        const BgpuShapeVertex v[4] = {
+            {x0, y0, -hx, -hy, hx, hy, rf, thickness, argb},
+            {x1, y0, hx, -hy, hx, hy, rf, thickness, argb},
+            {x0, y1, -hx, hy, hx, hy, rf, thickness, argb},
+            {x1, y1, hx, hy, hx, hy, rf, thickness, argb},
+        };
+        return drawShapeQuads(v, 1, BlendMode::SrcOver);
     }
     const int tileRadius = std::max(1, static_cast<int>(std::lround(rf)));
     int th = static_cast<int>(std::lround(thickness));
@@ -993,6 +1114,20 @@ bool GpuCompositor::drawRoundedGradient(const Rect& r, float radius, float angle
         const BgpuResult rq = bingpu_cmd_draw_quads(cmd_, v, 1);
         if (rq != BGPU_OK) { fail("bingpu_cmd_draw_quads(grad)", rq); return false; }
         return true;
+    }
+    // 解析圆角（0.21.0）：四角直通色直接给四个顶点 —— 片元里 `颜色 × cov`，
+    // 而线性渐变在屏幕空间是仿射函数，被四边形上的线性插值精确复现，
+    // 所以弧上的覆盖率与渐变色各管各的、不会互相污染。不需要模板、不需要白纹理。
+    if (shapesAvailable()) {
+        const float hx = r.w * 0.5f, hy = r.h * 0.5f;
+        const float x0 = r.x, x1 = r.x + r.w, y0 = r.y, y1 = r.y + r.h;
+        const BgpuShapeVertex v[4] = {
+            {x0, y0, -hx, -hy, hx, hy, rf, 0.0f, corners[0]},
+            {x1, y0, hx, -hy, hx, hy, rf, 0.0f, corners[1]},
+            {x0, y1, -hx, hy, hx, hy, rf, 0.0f, corners[2]},
+            {x1, y1, hx, hy, hx, hy, rf, 0.0f, corners[3]},
+        };
+        return drawShapeQuads(v, 1, BlendMode::SrcOver);
     }
     const int tileRadius = std::max(1, static_cast<int>(std::lround(rf)));
     BgpuTexture tile = roundedTile(tileRadius, false);

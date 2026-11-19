@@ -178,6 +178,13 @@ binUI 现在自带一份"半成品 bin2d"：路径几何在 `include/binui_path.
 "冗余状态剔除由后端负责"（§6.2）。bin2d 一帧的 `set_texture`/`draw_quads` 次数和 binUI 同量级，
 如果每次调用都查对象表，合成省下来的时间会被摊销掉。
 
+**0.21.0 的补记（这条诉求后来变了）**：圆角最终还是向 binGPU 要了新原语 ——
+`BGPU_VERTEX_SHAPE` + `bingpu_cmd_draw_shapes`（binGPU 0.12.0 / ABI 4）。原因不是
+bin2d 想少写代码，而是**圆角的 AA 数学不该跑在 CPU 上**：0.16–0.20 那几版是 CPU 生成一张
+覆盖率位图、GPU 只做九宫格采样，于是每换一个圆角半径/厚度就要重算并上传一张纹理，
+而且半径与厚度被迫取整。新原语让「形状语义」留在 bin2d（它决定画什么），
+「怎么把这个形状画好」留给 binGPU（距离场、覆盖率、混合）—— 与 §2 的分工一致。
+
 **present 三态（binGPU §6.3）跟 bin2d 基本无关**：bin2d 是离屏/HEADLESS 的，呈现是 UI 库的事。
 
 ---
