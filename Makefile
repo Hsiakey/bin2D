@@ -50,8 +50,8 @@ ifeq ($(BINGPU_LIB),)
     GPU_OBJS :=
     GPU_TEST :=
 else
-    GPU_OBJS := $(OBJ_DIR)/gpu.o
-    GPU_TEST := $(TEST_DIR)/test_gpu_bridge$(EXT)
+    GPU_OBJS := $(OBJ_DIR)/gpu.o $(OBJ_DIR)/display_list.o
+    GPU_TEST := $(TEST_DIR)/test_gpu_bridge$(EXT) $(TEST_DIR)/test_display_list$(EXT)
 endif
 
 TESTS := $(TEST_DIR)/test_geometry$(EXT) $(TEST_DIR)/test_raster$(EXT) \
@@ -77,6 +77,9 @@ $(LIB_A): $(LIB_OBJS) $(GPU_OBJS)
 	ar rcs $@ $^
 
 # GPU 胶水层：绑定 ../binGPU/include/bingpu.h（C 头）
+$(OBJ_DIR)/display_list.o: $(SRC_DIR)/display_list.cpp
+	$(CXX) $(CXXFLAGS) $(INC) -I../binGPU/include -c $< -o $@
+
 $(OBJ_DIR)/gpu.o: $(SRC_DIR)/gpu.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INC) -I../binGPU/include -c $< -o $@
@@ -91,6 +94,11 @@ $(TEST_DIR)/%$(EXT): tests/%.cpp $(LIB_A)
 	$(CXX) $(CXXFLAGS) $(INC) $< $(LIB_A) $(RTLINK) $(LDFLAGS) -o $@
 
 $(TEST_DIR)/test_gpu_bridge$(EXT): tests/test_gpu_bridge.cpp $(LIB_A) $(GPU_OBJS) $(BINGPU_LIB)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INC) -I../binGPU/include $< $(LIB_A) $(BINGPU_LIB) \
+	    $(RTLINK) $(LDFLAGS) -o $@
+
+$(TEST_DIR)/test_display_list$(EXT): tests/test_display_list.cpp $(LIB_A) $(GPU_OBJS) $(BINGPU_LIB)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INC) -I../binGPU/include $< $(LIB_A) $(BINGPU_LIB) \
 	    $(RTLINK) $(LDFLAGS) -o $@

@@ -810,23 +810,50 @@ bool GpuCompositor::endTarget() {
     return true;
 }
 
+BgpuTexture GpuCompositor::whiteTexture() {
+    if (!device_) return 0;
+    if (white_) return white_;
+    const uint8_t px[4] = {255, 255, 255, 255};
+    BgpuTextureDesc td{};
+    td.struct_size = sizeof(td);
+    td.width = 1;
+    td.height = 1;
+    td.format = BGPU_FORMAT_RGBA8;
+    if (bingpu_texture_create(device_, &td, &white_) != BGPU_OK) { white_ = 0; return 0; }
+    if (bingpu_texture_upload(white_, nullptr, px, 0) != BGPU_OK) {
+        bingpu_texture_destroy(device_, white_);
+        white_ = 0;
+        return 0;
+    }
+    return white_;
+}
+
+bool GpuCompositor::drawImageQuad(const Surface& src, const Rect& dst, const Rect& uv) {
+    if (!ready() || !targetBound_ || src.empty() || dst.w <= 0.0f || dst.h <= 0.0f) return false;
+    BgpuTexture tex = acquire(src.width(), src.height());
+    if (!tex) return false;
+    if (!upload(tex, src)) { recycle(tex); return false; }
+    const BgpuResult rb = bingpu_cmd_set_texture(cmd_, tex, samplerLinear_);
+    if (rb != BGPU_OK) { recycle(tex); fail("bingpu_cmd_set_texture(image)", rb); return false; }
+    const uint32_t argb = 0xFFFFFFFFu;
+    const float x0 = dst.x, y0 = dst.y, x1 = dst.right(), y1 = dst.bottom();
+    const BgpuVertex v[4] = {
+        {x0, y0, 0.0f, uv.x, uv.y, argb},
+        {x1, y0, 0.0f, uv.right(), uv.y, argb},
+        {x0, y1, 0.0f, uv.x, uv.bottom(), argb},
+        {x1, y1, 0.0f, uv.right(), uv.bottom(), argb},
+    };
+    const BgpuResult r2 = bingpu_cmd_draw_quads(cmd_, v, 1);
+    recycle(tex);
+    if (r2 != BGPU_OK) { fail("bingpu_cmd_draw_quads(image)", r2); return false; }
+    return true;
+}
+
 bool GpuCompositor::drawRect(const Rect& r, Color color) {
     if (!ready() || !targetBound_ || r.w <= 0.0f || r.h <= 0.0f) return false;
-    if (!white_) {
-        const uint8_t px[4] = {255, 255, 255, 255};
-        BgpuTextureDesc td{};
-        td.struct_size = sizeof(td);
-        td.width = 1;
-        td.height = 1;
-        td.format = BGPU_FORMAT_RGBA8;
-        if (bingpu_texture_create(device_, &td, &white_) != BGPU_OK) return false;
-        if (bingpu_texture_upload(white_, nullptr, px, 0) != BGPU_OK) {
-            bingpu_texture_destroy(device_, white_);
-            white_ = 0;
-            return false;
-        }
-    }
-    (void)bingpu_cmd_set_texture(cmd_, white_, samplerNearest_);
+    BgpuTexture white = whiteTexture();
+    if (!white) return false;
+    (void)bingpu_cmd_set_texture(cmd_, white, samplerNearest_);
     const uint32_t argb = color.toArgbStraight();
     const float x0 = r.x, y0 = r.y, x1 = r.right(), y1 = r.bottom();
     const BgpuVertex v[4] = {

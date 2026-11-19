@@ -275,6 +275,13 @@ public:
     // 内容 = bin2d 的解析式覆盖率，四通道都填成同一个值（与 binUI 三端的老模板同一口径）。
     // 显存由合成器持有，destroy() 时统一释放。
     BgpuTexture roundedTile(int radius, bool stroke = false);
+    // 1×1 全白（直角矩形、合批的四边形都用它当纹理，配合顶点色）
+    BgpuTexture whiteTexture();
+    // 贴一张预乘 Surface 到 dst（uv 是归一化子矩形）。内部走纹理池 + 预乘零拷贝上传。
+    bool drawImageQuad(const Surface& src, const Rect& dst, const Rect& uv);
+    // 命令句柄：给"自己发一批四边形"的调用方（DisplayList 的合批执行体）用。
+    // 注意拿到之后要自己保证 begin_render 已经打开（beginTarget）。
+    BgpuCmd cmdHandle() const { return cmd_; }
     // 等 GPU 把已提交的工作做完。正常渲染**不要**调（那是在等流水线）；
     // 基准测试和截图前必须调 —— 否则量到的是"命令录制时间"，不是"画完的时间"。
     bool waitIdle();
