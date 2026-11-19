@@ -3,6 +3,41 @@
 本文件记录 bin2d 的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.15.0] - 2026-11-20
+
+**`GpuCompositor` 有了帧节拍：策略在这一层给，闸门在 binGPU 算。**（接 binGPU 0.9.0）
+
+### 为什么 knob 在 bin2d、闸门在 binGPU
+
+- "这个画布最多一秒出多少帧"是**绘制策略** → 绘制语义层（bin2d / bin3d）；
+- "现在离下一拍还差多久"要问刷新率、present mode、present 真实耗时 → 设备层。
+
+所以这里是**转发**，不是第二份实现：
+
+```cpp
+bin2d::GpuCompositor g;
+g.setPacePolicy(BGPU_PACE_STANDARD);   // 必须在 createWindow **之前**
+g.createWindow(hwnd, w, h, backend, /*vsync=*/true);
+// 每帧：
+g.paceFrameBegin();                    // 锚点 = 帧开始（不是 present 开始）
+...
+g.presentSurface(surface);             // 内部把 present 真实耗时喂给节拍器
+if (g.paceWaitUs() > 0) sleep(g.paceWaitUs());
+```
+
+- `paceFrameBegin()` / `paceFrameEnd(presentMs)`：由调用方包一帧。锚点用**帧开始**
+  而不是 present 开始 —— 否则外壳量到的帧间隔会跟着绘制耗时抖（绘制 9 ms 的帧，
+  present 起点固定，帧起点就会 −9 ms 地漂）。不包时 `presentSurface` 会自己补一次。
+- `paceWaitUs()` **不带 now 参数**：节拍状态是合成器用自己那份时钟喂进去的，
+  换一份时钟进来就等于换了时间原点。
+- 建链时按策略决定 vsync：`unlimited` / 目标帧率 > 刷新率时**强制关 vsync**，
+  否则 present 会把帧率钉在刷新率上，"240 fps" 就是一句空话。
+
+### 修复
+
+`presentSurface` 里测的是**只有 compose 那一段**的耗时（不含 upload）——节拍器要用它
+判断"present 到底有没有在等垂直同步"，把 upload 算进去会把判据带偏。
+
 ## [0.14.0] - 2026-11-20
 
 **非整像素对齐的圆角实心填充不再走浮点覆盖缓冲**；合成器上屏改成**预乘零拷贝直传**。

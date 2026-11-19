@@ -169,6 +169,39 @@ public:
     // present 会不会自己掐拍（= bingpu_swapchain_info 的 present_paces_frames）。
     // 外壳据此决定还要不要自己按帧率节流；没建设备/交换链时返回 false。
     bool presentPacesFrames() const;
+
+    // ---- 帧节拍（0.15.0）：**knob 在这里，闸门在 binGPU** ----
+    //
+    // 分工的理由见 include/bingpu.h 的"帧节拍器"那段；这里只说为什么 knob 该是 bin2d 的：
+    //   · "这个画布最多一秒出多少帧"是**绘制策略**，属于绘制语义层（bin2d / bin3d）；
+    //   · 而"现在离下一拍还差多久"要问的是刷新率、present mode、present 真实耗时，
+    //     全是设备层的事 —— 由 binGPU 算，这里只转发。
+    // 所以这三个调用是"策略向下传、闸门向上要"，没有第二份节拍逻辑。
+    //
+    // 注意：**要在 createWindow() 之前设策略**。交换链的垂直同步位是建链时定的，
+    // 策略要求"跑得比刷新快"（unlimited / 240）时必须关 vsync，建完链再改就得重建。
+    bool setPacePolicy(BgpuPacePolicy policy);
+    BgpuPacePolicy pacePolicy() const;
+    // 生效的目标帧间隔（ms）；0 = 不掐拍。给的是**实际能跑到**的那个数：
+    // 120 Hz 屏上选 90 fps 会四舍五入成 120，这里就报 8.33 而不是 11.11。
+    double paceFrameMs() const;
+    // 现在离下一拍还差多少微秒；0 = 立刻可以画。
+    // **不带 now 参数**是故意的：节拍状态是合成器用自己那份时钟喂进去的
+    // （presentSurface 里量 present 耗时），换一份时钟进来就等于换了时间原点，
+    // pacer 里的 next_us 立刻变成垃圾 —— 这个坑犯不起，所以干脆不让调用方传。
+    int64_t paceWaitUs() const;
+    // 一帧开始（画之前调）。**外壳应该在自己的 beginFrame 里调一次**：
+    // 节拍锚在"帧开始"，不是"present 开始" —— 否则外壳量到的帧间隔会跟着绘制耗时抖
+    // （绘制 9 ms 的帧，present 起点固定，帧起点就会 −9 ms 地漂）。
+    // 调用方不调时 presentSurface 会自己补一次（锚点退化成 present 起点，仍然能用）。
+    void paceFrameBegin();
+    // 一帧结束（present 返回之后）。presentSurface 会自己调；走贴屏/GDI 那条路时
+    // 由调用方调（present_ms 传 0：贴屏不阻塞，节拍器按"从本拍开始算一格"处理）。
+    void paceFrameEnd(double presentMs);
+    // 这个策略下 vsync 该不该开（unlimited / 目标帧率 > 刷新率 → 不该开）
+    bool paceWantsVsync() const;
+    int displayRefreshHz() const;      // 0 = 探测不到
+    double paceRefreshMs() const;      // 0 = 探测不到
     void destroy();
     bool ready() const { return device_ != 0 && swapchain_ != 0 && cmd_ != 0; }
     // 是不是窗口版（决定 presentSurface 能不能用）
@@ -265,6 +298,10 @@ private:
     BgpuBackendKind backend_ = BGPU_BACKEND_AUTO;
     Stats stats_{};
     std::string error_;
+    // 帧节拍状态（每窗口一份）。放在合成器里而不是调用方手里，
+    // 是因为它要喂"本拍 present 真实耗时"，而那只有 presentSurface 自己量得到。
+    BgpuPacer pace_{};
+    double refreshMs_ = 0.0;   // 建链时探到的刷新周期；0 = 探测不到（按 60 算）
 };
 
 } // namespace bin2d

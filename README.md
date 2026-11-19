@@ -68,6 +68,13 @@ ctest --test-dir build --output-on-failure
 
 ## 状态
 
+**0.15.0（2026-11-20）**：`GpuCompositor` 有**帧节拍**了 —— 策略在这一层给
+（`setPacePolicy`，档位 standard/unlimited/240/120/90/60/30），闸门在 **binGPU** 算
+（`bingpu_pace_*`：刷新率、present mode、present 真实耗时只有设备层知道）。
+`paceFrameBegin/presentSurface/paceWaitUs` 三件套即可，外壳只负责睡到点。
+建链时按策略决定 vsync（目标帧率 > 刷新率就强制关掉，否则"240 fps"是空话）。
+上层可见的变化：同样一帧 CPU 光栅（9 ms）从 56 fps 变成 **93–96 fps** ——
+"标准"不再把装不下的帧凑整成 60。
 **0.1.1（2026-11-15）**：性能轮。六项单线程吞吐合计 **4.03×**（190.56 → 47.33 ns/px，
 圆角矩形 2.51 ns/px、星形路径 1.53 ns/px、512² 图层合成 4.94 ns/px），像素结果不变；
 94 项断言全绿，GPU 桥往返最大通道差 0。基线与方法见 [docs/perf.md](docs/perf.md)。下一步是把上层 UI 库的路径渲染迁到 bin2d（验收 = 三端像素基准 0 diff），

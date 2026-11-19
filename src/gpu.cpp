@@ -12,11 +12,21 @@
 #include "bin2d/gpu.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
 namespace bin2d {
+
+// 节拍用的时钟：单调、与墙钟无关。只在 presentSurface 里前后各读一次，
+// 所以"一次 now() 要 ~40µs"的老问题（见 binUI 的 docs/frame_pacing.md）在这里
+// 不成立 —— 那不是热循环里的逐调用计时。
+static int64_t PaceNowUs() {
+    using namespace std::chrono;
+    static const auto epoch = steady_clock::now();
+    return duration_cast<microseconds>(steady_clock::now() - epoch).count();
+}
 
 // 结果码的名字本地化：binGPU 的 bingpu_result_name 不是每个后端构建都会导出
 // （CPU 后端这份就没有），而错误文案对调试很重要 —— 自己映射一遍，少一个链接依赖。
@@ -309,6 +319,24 @@ bool GpuCompositor::createInternal(int width, int height, BgpuBackendKind backen
     height_ = height;
     backend_ = backend;
     windowed_ = windowed;
+
+    // 节拍器先起来：交换链的垂直同步位要按**策略**决定，建完链再改就得重建。
+    // 策略是调用方在 createWindow 之前设的；这里只补"刷新率 + 当前窗口"。
+    {
+        // pace_ 是零初始化的；struct_size==0 说明还没 init 过，策略按默认（STANDARD）
+        const int savedPolicy = pace_.struct_size == sizeof(BgpuPacer)
+                                    ? pace_.policy
+                                    : static_cast<int>(BGPU_PACE_STANDARD);
+        bingpu_pace_init(&pace_, nativeWindow);
+        bingpu_pace_set_policy(&pace_, static_cast<BgpuPacePolicy>(savedPolicy));
+        const int hz = pace_.refresh_hz;
+        refreshMs_ = hz > 1 ? 1000.0 / static_cast<double>(hz) : 0.0;
+        if (windowed && vsync && !bingpu_pace_wants_vsync(&pace_)) {
+            // 策略要跑得比刷新快（unlimited / 240）→ 垂直同步必须关掉，
+            // 否则 present 会把帧率钉在刷新率上，"240 fps" 就是一句空话。
+            vsync = false;
+        }
+    }
 
     BgpuDeviceDesc dd{};
     dd.struct_size = sizeof(dd);
@@ -730,17 +758,47 @@ bool GpuCompositor::composeOne(const Surface& src, Surface& out) {
 bool GpuCompositor::presentSurface(const Surface& src) {
     if (!windowed_) { error_ = "presentSurface: 这个合成器不是窗口版（用 createWindow）"; return false; }
     if (!ready() || src.empty()) return false;
+    // 节拍：把"本拍什么时候开始"告诉 binGPU，present 返回后再告诉它"结束了、present 花了多久"。
+    // present 耗时要单独量（不含 upload），不然"它到底有没有在等垂直同步"就判不准 ——
+    // 见 bingpu_pace_frame_end 的说明。
+    // 调用方若已经用 paceFrameBegin() 开过这一帧（外壳的 beginFrame），就别把锚点
+    // 挪到 present 起点上 —— 见 gpu.h 里那条注释。
+    if (pace_.frame_open == 0) bingpu_pace_frame_begin(&pace_, PaceNowUs());
     BgpuTexture tex = acquire(src.width(), src.height());
-    if (!tex) return false;
-    if (!upload(tex, src)) { recycle(tex); return false; }
+    if (!tex) { bingpu_pace_frame_end(&pace_, PaceNowUs(), 0.0); return false; }
+    if (!upload(tex, src)) {
+        recycle(tex);
+        bingpu_pace_frame_end(&pace_, PaceNowUs(), 0.0);
+        return false;
+    }
     Layer layer;
     layer.texture = tex;
     layer.dst = Rect(0.0f, 0.0f, static_cast<float>(src.width()),
                      static_cast<float>(src.height()));
+    const int64_t t0 = PaceNowUs();
     const bool ok = composeInternal(&layer, 1, nullptr);
+    const int64_t t1 = PaceNowUs();
     recycle(tex);
+    bingpu_pace_frame_end(&pace_, t1, static_cast<double>(t1 - t0) / 1000.0);
     return ok;
 }
+
+// ---- 帧节拍（knob 在 bin2d，闸门在 binGPU） ----
+bool GpuCompositor::setPacePolicy(BgpuPacePolicy policy) {
+    if (pace_.struct_size != sizeof(BgpuPacer)) bingpu_pace_init(&pace_, nullptr);
+    const BgpuResult r = bingpu_pace_set_policy(&pace_, policy);
+    if (r != BGPU_OK) { error_ = bingpu_last_error(); return false; }
+    return true;
+}
+
+BgpuPacePolicy GpuCompositor::pacePolicy() const { return bingpu_pace_policy(&pace_); }
+double GpuCompositor::paceFrameMs() const { return bingpu_pace_frame_ms(&pace_); }
+int64_t GpuCompositor::paceWaitUs() const { return bingpu_pace_wait_us(&pace_, PaceNowUs()); }
+void GpuCompositor::paceFrameBegin() { bingpu_pace_frame_begin(&pace_, PaceNowUs()); }
+void GpuCompositor::paceFrameEnd(double presentMs) { bingpu_pace_frame_end(&pace_, PaceNowUs(), presentMs); }
+bool GpuCompositor::paceWantsVsync() const { return bingpu_pace_wants_vsync(&pace_) != 0; }
+int GpuCompositor::displayRefreshHz() const { return pace_.refresh_hz > 1 ? pace_.refresh_hz : 0; }
+double GpuCompositor::paceRefreshMs() const { return refreshMs_; }
 
 bool RenderViaGpu(const Surface& src, Surface& out, std::string* error) {
     GpuBridge bridge;
