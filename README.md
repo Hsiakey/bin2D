@@ -110,6 +110,12 @@ ctest --test-dir build --output-on-failure
 宿主三个 GPU 后端各自手写了一份一样的有符号距离循环，改一处就差一圈像素；现在
 三端共用 bin2d 这一份（binUI 0.23.0 接入，像素一位没动）。
 
+**0.10.1（2026-11-19）**：修 `Canvas::clipRect` 的坐标系 —— 它用裸 `state().xf` 映射，
+落像素却用 `deviceTransform()`（xf 再减层原点），两者在图层里差一个 origin，症状是
+"层内第一次 `clipRect` 就把内容裁成 0×0"。`clipPath` 一直是按 `deviceTransform` 算的，
+这次补齐。**这是 binUI 接 bin2d 后端时踩出来的**（binUI 0.26.0：`opacity` 用例
+48.9% → 0% 不同像素）。新增回归 `test_composite::TestClipRectInsideLayer`。
+
 **0.10.0（2026-11-19）**：路线图 ⑤ 收尾 —— **组内真脏矩形** + **缓存字节上限**。
 脏区由"每个子节点的版本 + 设备包围盒（含描边/投影/AA）"算出，超过整组 55% 退回整组重画；
 结构变化一律整组。实测：每帧动 1 张卡片 1.51 → **1.32 ms**，动 10 张 3.76 → **1.65 ms（2.3×）**，

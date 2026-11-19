@@ -49,7 +49,12 @@ void Canvas::concat(const Transform& xf) { state().xf = state().xf * xf; }
 void Canvas::setTransform(const Transform& xf) { state().xf = xf; }
 
 void Canvas::clipRect(const Rect& r) {
-    const Rect dev = state().xf.mapBounds(r);
+    // 局部矩形 → 设备空间必须走 deviceTransform()（= xf 再减掉层原点），
+    // 而不是裸 state().xf：图层里的落像素坐标是 xf.apply(x) - origin，裁剪矩形
+    // 若按 xf 映射，就会与 clipRect 自身所在的空间差一个 origin ——
+    // 表现是"层内第一次 pushClip 把内容裁成 0×0"（整个层空白）。
+    // clipPath 一直是按 deviceTransform 算的，这里补齐同一条口径。
+    const Rect dev = deviceTransform().mapBounds(r);
     state().clipRect = Rect::intersect(state().clipRect, dev);
 }
 

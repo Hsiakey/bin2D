@@ -3,6 +3,24 @@
 本文件记录 bin2d 的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.10.1] - 2026-11-19
+
+**修 `Canvas::clipRect` 在图层里的坐标系**。这条是 binUI 接 bin2d 后端时踩出来的
+（binUI 0.26.0 的 `BinUI2D`），症状是"图层里第一次 `clipRect` 就把内容裁成 0×0"，
+整个层空白 —— 表现为整块页面只剩第一个面板。
+
+### Fixed
+
+- `Canvas::clipRect` 改用 `deviceTransform()`（= `xf` 再减掉层原点）映射局部矩形，
+  与落像素走同一条口径。原来用裸 `state().xf`，在根层（origin = 0）看不出问题，
+  进了图层就与 `state().clipRect` 所在的空间差一个 origin。
+  `clipPath` 一直用的是 `deviceTransform` —— 这次补齐了同一条口径。
+- 新增回归测试 `test_composite::TestClipRectInsideLayer`（4 项断言）：
+  层内 `clipRect` 传同一块矩形时必须保留整层，而不是裁空。
+
+影响面（binUI 侧实测）：`opacity` 像素用例 48.9% → **0%** 不同像素，
+`svg-filter` 45.3% → 13.8%。
+
 ## [0.10.0] - 2026-11-19
 
 **路线图 ⑤ 收尾：组内真脏矩形 + 缓存字节上限**。0.9.0 的缓存只会"整组重画"，

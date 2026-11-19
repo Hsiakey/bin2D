@@ -199,6 +199,28 @@ static void TestClipRect() {    Surface s(50, 50);
     CHECK(s.get(5, 5).r == 0, "composite: 矩形裁剪外部");
 }
 
+// 层内矩形裁剪（0.10.1 修）：clipRect 一度用裸 state().xf 映射，而落像素用
+// deviceTransform()（xf 再减层原点）。在图层里两者差一个 origin，于是"层内第一次
+// clipRect 就把内容裁成 0×0"，整层空白。上面 TestClipRect 在根层测，测不出来。
+static void TestClipRectInsideLayer() {
+    Surface s(100, 100);
+    Canvas canvas(s);
+    canvas.clear(Color::black());
+
+    const bool ok = canvas.pushLayer(Rect(20, 20, 60, 60), 1.0f);
+    CHECK(ok, "composite: 层内裁剪 —— 图层可以建立");
+    // 层内传的坐标是**父级设备坐标**（落像素时内部再减掉层原点 (20,20)）——
+    // 这也是 binUI 那类"传屏幕坐标"的调用方依赖的口径。
+    canvas.clipRect(Rect(20, 20, 60, 60));
+    canvas.fillRect(Rect(20, 20, 60, 60), Color::white());
+    canvas.popLayer();
+
+    CHECK(s.get(50, 50).r == 255, "composite: 层内 clipRect 不吞掉内容（整层可见）");
+    CHECK(s.get(25, 25).r == 255, "composite: 层内 clipRect 保留左上角");
+    CHECK(s.get(75, 75).r == 255, "composite: 层内 clipRect 保留右下角");
+    CHECK(s.get(10, 10).r == 0, "composite: 层外坐标仍然没被画到");
+}
+
 int main() {
     TestBlendModes();
     TestGroupOpacity();
@@ -206,5 +228,6 @@ int main() {
     TestNestedLayers();
     TestLayerBlendModes();
     TestClipRect();
+    TestClipRectInsideLayer();
     return Bin2dTestSummary("test_composite");
 }
