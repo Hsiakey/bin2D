@@ -828,14 +828,15 @@ BgpuTexture GpuCompositor::whiteTexture() {
     return white_;
 }
 
-bool GpuCompositor::drawImageQuad(const Surface& src, const Rect& dst, const Rect& uv) {
+bool GpuCompositor::drawImageQuad(const Surface& src, const Rect& dst, const Rect& uv,
+                                 const Color& tint) {
     if (!ready() || !targetBound_ || src.empty() || dst.w <= 0.0f || dst.h <= 0.0f) return false;
     BgpuTexture tex = acquire(src.width(), src.height());
     if (!tex) return false;
     if (!upload(tex, src)) { recycle(tex); return false; }
     const BgpuResult rb = bingpu_cmd_set_texture(cmd_, tex, samplerLinear_);
     if (rb != BGPU_OK) { recycle(tex); fail("bingpu_cmd_set_texture(image)", rb); return false; }
-    const uint32_t argb = 0xFFFFFFFFu;
+    const uint32_t argb = tint.toArgbStraight();
     const float x0 = dst.x, y0 = dst.y, x1 = dst.right(), y1 = dst.bottom();
     const BgpuVertex v[4] = {
         {x0, y0, 0.0f, uv.x, uv.y, argb},

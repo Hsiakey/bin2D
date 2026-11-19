@@ -51,7 +51,7 @@ Surface MakeTile(int w, int h) {
 }
 
 // 一页"卡片列表"：矩形 + 贴图（无圆角 → 两条路必须逐像素相同）
-void BuildFlatPage(DisplayList& list, const Surface& tile, const Rect& clip) {
+void BuildFlatPage(DisplayList& list, const Surface& tile, const Rect& clip, bool withGradient = false) {
     list.clearRect(Rect(0, 0, 240, 160), Color::argb(0xFF101418));
     for (int i = 0; i < 6; ++i) {
         const float y = 8.0f + i * 22.0f;
@@ -61,6 +61,16 @@ void BuildFlatPage(DisplayList& list, const Surface& tile, const Rect& clip) {
         // 这个**另一条**分歧上（CPU 侧做了缩小的预滤波），那属于采样策略，不属执行体。
         list.drawImage(tile, Rect(30, y + 3, 12, 12), Rect(0.0f, 0.0f, 0.375f, 0.375f));
         list.drawImage(tile, Rect(46, y + 3, 12, 12), Rect(0.5f, 0.5f, 0.375f, 0.375f));  // 子矩形
+    }
+    // 渐变单独一页：两端不透明时两条路的**定义**相同，只有四角色的 8 位舍入（≤1）。
+    // 半透明渐变不进这一页（两端 alpha 不同要在预乘空间插值，见 gpuCompatible）。
+    if (withGradient) {
+        list.fillGradient(Rect(8, 60, 100, 14), 0.0f, Color::argb(0xFF3E8BFF),
+                          Color::argb(0xFF2FBF9A));
+        list.fillGradient(Rect(120, 60, 100, 14), 90.0f, Color::argb(0xFFFF6B6B),
+                          Color::argb(0xFFFFD166));
+        list.fillGradient(Rect(8, 80, 212, 20), 45.0f, Color::argb(0xFF101418),
+                          Color::argb(0xFF8090FF));
     }
     list.pushClip(clip);
     for (int i = 0; i < 40; ++i) {
@@ -124,9 +134,38 @@ int main() {
                 // 真实 GPU 后端必须**精确**相同；binGPU 的 CPU 后端是参考实现，
                 // 它自己的 8 位舍入允许差 1（与 test_gpu_bridge 的口径一致）。
                 const int tol = (b.kind == BGPU_BACKEND_CPU) ? 1 : 0;
-                CHECK(diff <= tol, "display_list: 矩形+贴图页两个执行体逐像素相同");
+                CHECK(diff <= tol, "display_list: 矩形+贴图+渐变页两个执行体逐像素相同（≤1）");
                 CHECK(st.draws < st.ops, "display_list: 相邻同类项真的合批了（提交次数 < 条目数）");
             }
+        }
+    }
+
+    // ---------- ①b 渐变页：只有四角色的 8 位舍入 ----------
+    {
+        DisplayList list;
+        BuildFlatPage(list, tile, Rect(20, 20, 120, 100), /*withGradient=*/true);
+        Surface cpu(W, H);
+        {
+            Canvas c(cpu);
+            list.execute(c);
+        }
+        const struct { const char* name; BgpuBackendKind kind; } backends[] = {
+            {"cpu", BGPU_BACKEND_CPU},
+            {"vulkan", BGPU_BACKEND_VULKAN},
+            {"d3d11", BGPU_BACKEND_D3D11},
+            {"gl", BGPU_BACKEND_GL},
+        };
+        for (const auto& b : backends) {
+            GpuCompositor gpu;
+            if (!gpu.create(W, H, b.kind)) continue;
+            BgpuTexture rt = gpu.acquireTarget(W, H);
+            Surface gpuOut;
+            const bool ok = list.execute(gpu, rt, 0xFF101418u) && gpu.readTarget(rt, gpuOut);
+            if (rt) gpu.recycle(rt);
+            if (!ok) { CHECK(false, "display_list: 渐变页 GPU 执行体跑通"); continue; }
+            const int diff = MaxChannelDiff(cpu, gpuOut);
+            std::printf("  [%s] 渐变页：最大通道差 %d（四角色 8 位舍入）\n", b.name, diff);
+            CHECK(diff <= 1, "display_list: 渐变页两个执行体差 ≤1（同一数学，只有舍入）");
         }
     }
 

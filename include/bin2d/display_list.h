@@ -43,6 +43,7 @@ public:
             Clear = 0,    // 清成 color（Replace）
             FillRect = 1,  // color 填充
             FillRounded = 2, // 圆角矩形填充（radius 夹到 min(w,h)/2）
+            FillGradient = 6, // 线性渐变（CSS 角度；四角颜色由 bin2d 算）
             FillImage = 3, // 贴图（预乘 Surface 当纹理，uv 是归一化子矩形）
             ClipPush = 4, // 压一个矩形裁剪（与当前裁剪求交）
             ClipPop = 5,  // 回到 depth（绝对深度）
@@ -51,8 +52,11 @@ public:
         Rect rect;
         Rect uv{0.0f, 0.0f, 1.0f, 1.0f};
         float radius = 0.0f;
+        float angle = 0.0f;          // FillGradient：CSS 角度（0 = 自下而上，90 = 自左向右）
         uint32_t color = 0;          // 0xAARRGGBB 直通（与 binGPU 顶点色同口径）
-        const Surface* image = nullptr;
+        uint32_t color2 = 0;         // FillGradient 的另一端
+        const Surface* image = nullptr;   // FillImage
+        uint32_t tint = 0xFFFFFFFFu;      // FillImage 的染色（直通；默认原色）
     };
 
     // 执行体的观察值：合批有没有生效看 draws，纹理换了多少次看 binds。
@@ -68,6 +72,9 @@ public:
 
     void clear() { ops_.clear(); }
     bool empty() const { return ops_.empty(); }
+    // 这份列表能不能在 GPU 执行体上完整跑完？不能时 reason 说明第一个卡的条目。
+    // 有了它调用方可以"先问再执行"（比如整帧退回 CPU），而不是执行到一半才失败。
+    bool gpuCompatible(std::string* reason = nullptr) const;
     size_t size() const { return ops_.size(); }
     const Op& at(size_t i) const { return ops_[i]; }
 
@@ -75,8 +82,12 @@ public:
     void clearRect(const Rect& r, const Color& c);
     void fillRect(const Rect& r, const Color& c);
     void fillRounded(const Rect& r, float radius, const Color& c);
+    // 线性渐变（CSS 语义）：角度、两端色。四角颜色由 bin2d 的 LinearGradientCorners 算，
+    // 所以"四边形 + 顶点色"与"逐像素求值"是同一个解（仿射函数在三角形上插值精确）。
+    void fillGradient(const Rect& r, float angleDeg, const Color& from, const Color& to);
     // 子矩形贴图：uv 是源图的归一化窗口（0..1）
-    void drawImage(const Surface& image, const Rect& dst, const Rect& uv = Rect(0, 0, 1, 1));
+    void drawImage(const Surface& image, const Rect& dst, const Rect& uv = Rect(0, 0, 1, 1),
+                   const Color& tint = Color::white());
     // 矩形裁剪：返回压之后的深度；popClipTo(深度) 回到那个深度
     int pushClip(const Rect& r);
     void popClipTo(int depth);

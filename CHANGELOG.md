@@ -3,6 +3,45 @@
 本文件记录 bin2d 的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.18.0] - 2026-11-20
+
+**`DisplayList` 补上渐变与染色贴图，并给出"这份列表能不能在 GPU 上跑完"的**前置**判断。**
+
+```cpp
+list.fillGradient(Rect(8, 60, 100, 14), 0.0f, Color::argb(0xFF3E8BFF), Color::argb(0xFF2FBF9A));
+list.drawImage(atlas, dst, uv, Color::argb(0xB0FFFFFF));   // 带染色的贴图
+
+if (list.gpuCompatible(&why)) list.execute(gpu, target, clear);   // 先问再动
+else                          list.execute(canvas);              // 整份退回 CPU
+```
+
+### 渐变的四角色为什么是一个**精确解**
+
+屏幕空间的线性渐变色是坐标的**仿射函数**，三角形上的线性插值对仿射函数精确。
+所以"一个四角各取一次色的四边形"和"逐像素求值"在数学上完全相等 —— 差的只有
+四角色的 8 位舍入（实测 **≤1**）。新增 `LinearGradientCorners()` 就是这个取色，
+轴与 `Paint::linearAngle` 同一份 CSS 口径（0° 向上顺时针、端点按"投影长度最大"）。
+
+**但有一个例外被挡在门外**：两端 alpha 不同的渐变要在**预乘空间**插值（CSS Color 4），
+而逐像素那条路是直通插值 —— 那是**定义**不同，不是舍入。所以
+`gpuCompatible()` 会把这种列表整份判给 CPU 执行体，而不是悄悄画错。
+
+### 验收（`tests/test_display_list.cpp` 16 → 20 项）
+
+| 页面 | CPU 执行体 vs GPU 执行体 |
+|---|---|
+| 矩形 + 1:1 贴图（子矩形 UV、嵌套裁剪） | **Vulkan / D3D11 / GL 差 0**；binGPU 的 CPU 后端差 1 |
+| 加上三块不透明渐变（0°/90°/45°） | 全部后端差 **1**（四角色 8 位舍入，不是门禁外的近似） |
+| 带圆角 | 差 12（两套圆角 AA 定义，仪表） |
+
+### 还没进列表的东西（每加一个都要配一次像素对拍）
+
+粗描边（同心环叠层，要按层取不同模板）、圆角渐变（九宫格 + 四角色）、
+仿射圆角、路径、图层组透明度、模糊。
+**这件事直接卡住"binUI 换成先记列表"**：buttonshow 有边框（粗描边），
+所以它现在整帧不满足 `gpuCompatible()`；而没有粗描边/圆角渐变的页面，
+换成列表又要先统一圆角 AA（否则圆角弧边会变 12 个电平）。
+
 ## [0.17.0] - 2026-11-20
 
 **`DisplayList`：一份绘制语义，两个执行体。** 这是"语义与执行分开"的落点。

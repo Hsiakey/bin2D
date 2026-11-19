@@ -278,7 +278,8 @@ public:
     // 1×1 全白（直角矩形、合批的四边形都用它当纹理，配合顶点色）
     BgpuTexture whiteTexture();
     // 贴一张预乘 Surface 到 dst（uv 是归一化子矩形）。内部走纹理池 + 预乘零拷贝上传。
-    bool drawImageQuad(const Surface& src, const Rect& dst, const Rect& uv);
+    bool drawImageQuad(const Surface& src, const Rect& dst, const Rect& uv,
+                       const Color& tint = Color::white());
     // 命令句柄：给"自己发一批四边形"的调用方（DisplayList 的合批执行体）用。
     // 注意拿到之后要自己保证 begin_render 已经打开（beginTarget）。
     BgpuCmd cmdHandle() const { return cmd_; }

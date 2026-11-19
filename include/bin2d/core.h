@@ -23,9 +23,9 @@ namespace bin2d {
 // 版本
 // ------------------------------------------------------------
 #define BIN2D_VERSION_MAJOR 0
-#define BIN2D_VERSION_MINOR 16
+#define BIN2D_VERSION_MINOR 17
 #define BIN2D_VERSION_PATCH 0
-#define BIN2D_VERSION_STRING "0.17.0"
+#define BIN2D_VERSION_STRING "0.18.0"
 
 // ------------------------------------------------------------
 // 基本几何

@@ -304,4 +304,39 @@ inline Paint FadePaint(const Paint& src, float k) {
     p.tint = p.tint * k;
     return p;
 }
+
+// ------------------------------------------------------------
+// 线性渐变的**四角颜色**（0.17.0）：给"用四边形画渐变"的执行体用
+//
+// 为什么这是一个精确解而不是近似：
+//   屏幕空间的线性渐变色是坐标的**仿射函数**，而三角形上的线性插值对仿射函数
+//   是精确的。所以"一个四角各取一次色的四边形"和"逐像素求值"在数学上完全相等
+//   （差的只有 8 位舍入）。GPU 与 CPU 两条路因此可以共用同一条语义。
+//
+// 与 `Paint::linearAngle` 的轴完全同一口径（同一个 CSS 角度约定、同一个
+// "投影长度最大"的端点取法），否则"同一个渐变用两条执行体画"就会整体偏移。
+//
+// 输出顺序：左上、右上、左下、右下（与顶点 TL,TR,BL,BR 同序）。
+// **只对不透明两端精确**：两端 alpha 不同时，正确做法是在预乘空间插值
+// （CSS Color 4），而那要 CPU 侧也改成预乘插值 —— 见 CHANGELOG 的说明。
+// ------------------------------------------------------------
+inline void LinearGradientCorners(const Rect& box, float degrees, const Color& from,
+                                  const Color& to, Color out[4]) {
+    constexpr float kPi = 3.14159265358979323846f;
+    const float a = degrees * kPi / 180.0f;
+    const float dx = std::sin(a), dy = -std::cos(a);
+    const float len = std::fabs(dx) * box.w + std::fabs(dy) * box.h;
+    const float sx = box.cx() - dx * len * 0.5f;
+    const float sy = box.cy() - dy * len * 0.5f;
+    const float xs[4] = {box.x, box.right(), box.x, box.right()};
+    const float ys[4] = {box.y, box.y, box.bottom(), box.bottom()};
+    for (int i = 0; i < 4; ++i) {
+        float t = len > 1e-6f ? (((xs[i] - sx) * dx + (ys[i] - sy) * dy) / len) : 0.0f;
+        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        out[i] = Color::straight(static_cast<uint8_t>(from.r + (to.r - from.r) * t + 0.5f),
+                                 static_cast<uint8_t>(from.g + (to.g - from.g) * t + 0.5f),
+                                 static_cast<uint8_t>(from.b + (to.b - from.b) * t + 0.5f),
+                                 static_cast<uint8_t>(from.a + (to.a - from.a) * t + 0.5f));
+    }
+}
 } // namespace bin2d

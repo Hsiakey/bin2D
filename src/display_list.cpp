@@ -36,6 +36,18 @@ Rect Intersect(const Rect& a, const Rect& b) {
     return Rect(x0, y0, std::max(0.0f, x1 - x0), std::max(0.0f, y1 - y0));
 }
 
+// 与 binGPU 的顶点色口径一致：0xAARRGGBB 直通 → 预乘（整数、(c*a)/255）。
+// 只在渐变四角用；两端 alpha 相同的渐变，先预乘再插值与"先插值再预乘"等价。
+uint32_t Premul(uint32_t c) {
+    const uint32_t a = (c >> 24) & 0xFFu;
+    if (a == 255u) return c;
+    if (a == 0u) return 0u;
+    const uint32_t r = (((c >> 16) & 0xFFu) * a) / 255u;
+    const uint32_t g = (((c >> 8) & 0xFFu) * a) / 255u;
+    const uint32_t b = ((c & 0xFFu) * a) / 255u;
+    return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
 bool RoundClip(const Rect& r, int* x, int* y, int* w, int* h) {
     // scissor 取整：与 binGPU 的口径一致（像素对齐，不留半像素缝）
     const int x0 = static_cast<int>(std::floor(r.x + 0.5f));
@@ -83,14 +95,44 @@ void DisplayList::fillRounded(const Rect& r, float radius, const Color& c) {
     ops_.push_back(op);
 }
 
-void DisplayList::drawImage(const Surface& image, const Rect& dst, const Rect& uv) {
-    if (image.empty() || dst.w <= 0.0f || dst.h <= 0.0f) return;
+void DisplayList::fillGradient(const Rect& r, float angleDeg, const Color& from,
+                               const Color& to) {
+    if (r.w <= 0.0f || r.h <= 0.0f) return;
+    if (from.a == 0 && to.a == 0) return;
+    Op op;
+    op.kind = Op::FillGradient;
+    op.rect = r;
+    op.angle = angleDeg;
+    op.color = from.toArgbStraight();
+    op.color2 = to.toArgbStraight();
+    ops_.push_back(op);
+}
+
+void DisplayList::drawImage(const Surface& image, const Rect& dst, const Rect& uv,
+                            const Color& tint) {
+    if (image.empty() || dst.w <= 0.0f || dst.h <= 0.0f || tint.a == 0) return;
     Op op;
     op.kind = Op::FillImage;
     op.rect = dst;
     op.uv = uv;
     op.image = &image;
+    op.tint = tint.toArgbStraight();
     ops_.push_back(op);
+}
+
+// GPU 执行体的能力边界（现在**只有一条**）：两端 alpha 不同的渐变。
+// 半透明渐变要在预乘空间里插值（CSS Color 4），而 bin2d 的逐像素路径是直通插值 ——
+// 两条路的差别不是舍入，是定义。所以这种列表整份退回 CPU 执行体，而不是悄悄画错。
+bool DisplayList::gpuCompatible(std::string* reason) const {
+    for (const Op& op : ops_) {
+        if (op.kind != Op::FillGradient) continue;
+        const uint32_t a0 = (op.color >> 24) & 0xFFu, a1 = (op.color2 >> 24) & 0xFFu;
+        if (a0 != a1) {
+            if (reason) *reason = "半透明渐变（两端 alpha 不同）只在 CPU 执行体上保证精确";
+            return false;
+        }
+    }
+    return true;
 }
 
 int DisplayList::pushClip(const Rect& r) {
@@ -138,8 +180,16 @@ void DisplayList::execute(Canvas& canvas, Stats* stats) const {
             ++st.quads;
             ++st.draws;
             break;
+        case Op::FillGradient:
+            canvas.fillRect(op.rect, Paint::linearAngle(op.rect, op.angle,
+                                                        Color::argb(op.color),
+                                                        Color::argb(op.color2)));
+            ++st.ops;
+            ++st.quads;
+            ++st.draws;
+            break;
         case Op::FillImage:
-            canvas.drawSurface(*op.image, op.rect, op.uv, Color::white());
+            canvas.drawSurface(*op.image, op.rect, op.uv, Color::argb(op.tint));
             ++st.ops;
             ++st.quads;
             ++st.draws;
@@ -177,6 +227,7 @@ bool DisplayList::execute(GpuCompositor& gpu, BgpuTexture target, uint32_t clear
                           Stats* stats) const {
     error_.clear();
     Stats st;
+    if (!gpuCompatible(&error_)) return false;   // 先问再动：不留半帧
     if (!gpu.beginTarget(target, clearArgb)) {
         error_ = gpu.lastError();
         return false;
@@ -267,9 +318,29 @@ bool DisplayList::execute(GpuCompositor& gpu, BgpuTexture target, uint32_t clear
             boundValid = false;
             ++st.ops;
             break;
+        case Op::FillGradient: {
+            if (!flush()) { ok = false; break; }
+            if (!bindWhite()) { ok = false; break; }
+            Color corners[4];
+            LinearGradientCorners(op.rect, op.angle, Color::argb(op.color),
+                                  Color::argb(op.color2), corners);
+            const uint32_t c0 = Premul(corners[0].toArgbStraight());
+            const uint32_t c1 = Premul(corners[1].toArgbStraight());
+            const uint32_t c2 = Premul(corners[2].toArgbStraight());
+            const uint32_t c3 = Premul(corners[3].toArgbStraight());
+            const float x0 = op.rect.x, y0 = op.rect.y;
+            const float x1 = op.rect.right(), y1 = op.rect.bottom();
+            pending.verts.push_back(BgpuVertex{x0, y0, 0.0f, 0.5f, 0.5f, c0});
+            pending.verts.push_back(BgpuVertex{x1, y0, 0.0f, 0.5f, 0.5f, c1});
+            pending.verts.push_back(BgpuVertex{x0, y1, 0.0f, 0.5f, 0.5f, c2});
+            pending.verts.push_back(BgpuVertex{x1, y1, 0.0f, 0.5f, 0.5f, c3});
+            ++pending.quads;
+            ++st.ops;
+            break;
+        }
         case Op::FillImage: {
             if (!flush()) { ok = false; break; }
-            if (!gpu.drawImageQuad(*op.image, op.rect, op.uv)) {
+            if (!gpu.drawImageQuad(*op.image, op.rect, op.uv, Color::argb(op.tint))) {
                 error_ = gpu.lastError();
                 ok = false;
                 break;
@@ -283,7 +354,8 @@ bool DisplayList::execute(GpuCompositor& gpu, BgpuTexture target, uint32_t clear
         }
         case Op::ClipPush:
             if (!flush()) { ok = false; break; }
-            clips.push_back(Clip{op.rect});
+            // 求交语义与 Canvas::clipRect 一致：嵌套裁剪只会更小
+            clips.push_back(Clip{clips.empty() ? op.rect : Intersect(clips.back().rect, op.rect)});
             if (!applyClip()) ok = false;
             break;
         case Op::ClipPop: {
