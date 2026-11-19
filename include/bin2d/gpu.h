@@ -254,6 +254,27 @@ public:
     bool composeTo(const Layer* layers, size_t count, BgpuTexture target);
     // 把目标纹理读回成预乘 Surface（只在真的要 CPU 侧像素时调）
     bool readTarget(BgpuTexture target, Surface& out);
+
+    // ---- 直接往渲染目标发 2D 图元（0.16.0）：bin2d 的语义，binGPU 的几何 ----
+    //
+    // 这是"bin2d 的 Canvas 将来跑在 binGPU 上"的第一块地基：形状语义（圆角半径、
+    // 覆盖率怎么算）仍然是 bin2d 的（`RasterizeRoundedTileCoverage` 是唯一一份解析式），
+    // 而"拆成几个四边形、怎么合批、走哪个后端"交给 binGPU（`bingpu_cmd_draw_rounded_rect`）。
+    // 于是同一份代码在 CPU / VK / GL / D3D11 上都能画，像素由同一张覆盖率模板保证。
+    bool beginTarget(BgpuTexture target, uint32_t clearArgb = 0);
+    bool endTarget();
+    bool drawRect(const Rect& r, Color color);
+    // 圆角实心。radius 会被夹到 min(w,h)/2；radius <= 0 时退化成直角四边形。
+    bool drawRoundedRect(const Rect& r, float radius, Color color);
+    // **批量**：同一半径的 N 个圆角矩形，一次绑定、一次 draw_quads。
+    // 半径相同的形状在 UI 里是绝大多数（10/12/14 这几档），所以按半径分组就能一次发完：
+    // 实测 234 个逐个画 20.4 ms，批量只有几毫秒，差的全是调用开销。
+    bool drawRoundedRects(float radius, const Rect* rects, size_t count, Color color);
+
+    // 圆角覆盖率模板（按整数半径缓存，描边是另一套 1px 环模板）。
+    // 内容 = bin2d 的解析式覆盖率，四通道都填成同一个值（与 binUI 三端的老模板同一口径）。
+    // 显存由合成器持有，destroy() 时统一释放。
+    BgpuTexture roundedTile(int radius, bool stroke = false);
     // 等 GPU 把已提交的工作做完。正常渲染**不要**调（那是在等流水线）；
     // 基准测试和截图前必须调 —— 否则量到的是"命令录制时间"，不是"画完的时间"。
     bool waitIdle();
@@ -302,6 +323,15 @@ private:
     // 是因为它要喂"本拍 present 真实耗时"，而那只有 presentSurface 自己量得到。
     BgpuPacer pace_{};
     double refreshMs_ = 0.0;   // 建链时探到的刷新周期；0 = 探测不到（按 60 算）
+    // 覆盖率模板缓存：(radius, stroke) → 纹理。键用整数半径 —— 模板是位图，只能整数。
+    struct TileEntry {
+        int radius = 0;
+        bool stroke = false;
+        BgpuTexture texture = 0;
+    };
+    std::vector<TileEntry> tiles_;
+    BgpuTexture white_ = 0;    // 1×1 全白（直角矩形用）
+    BgpuTexture targetBound_ = 0;   // beginTarget 里正在画的目标（诊断/断言用）
 };
 
 } // namespace bin2d

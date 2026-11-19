@@ -68,6 +68,13 @@ ctest --test-dir build --output-on-failure
 
 ## 状态
 
+**0.16.0（2026-11-20）**：`GpuCompositor` 能**直接画 2D 图元**了 ——
+`beginTarget` / `drawRect` / `drawRoundedRect` / `endTarget`。形状语义在这边
+（覆盖率模板是唯一一份解析式，按整数半径缓存），几何展开在 binGPU（九宫格）。
+四个后端各跑一遍，判据是"设备像素 == 模板覆盖率"**逐像素精确**。
+顺带量出 bin2d 内部**两套**圆角 AA 定义（扫描线 8 子采样 vs 解析 SDF），
+弧边差 48 电平 —— 因为两个 golden 是分开的，"逐像素相同"从来没跨过实现比过。
+
 **0.15.0（2026-11-20）**：`GpuCompositor` 有**帧节拍**了 —— 策略在这一层给
 （`setPacePolicy`，档位 standard/unlimited/240/120/90/60/30），闸门在 **binGPU** 算
 （`bingpu_pace_*`：刷新率、present mode、present 真实耗时只有设备层知道）。

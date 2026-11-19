@@ -404,6 +404,12 @@ bool GpuCompositor::createInternal(int width, int height, BgpuBackendKind backen
 
 void GpuCompositor::destroy() {
     if (device_) {
+        // 2D 图元用的覆盖率模板 + 白纹素：和池里的块一样，谁建的谁销毁。
+        for (const TileEntry& t : tiles_)
+            if (t.texture) bingpu_texture_destroy(device_, t.texture);
+        tiles_.clear();
+        if (white_) { bingpu_texture_destroy(device_, white_); white_ = 0; }
+        targetBound_ = 0;
         // 池里的块（空闲 + 借出未还）先销毁：句柄是我们的，设备销毁虽然兜底，
         // 但"谁借出谁回收"这条一旦破例，将来换成真正的池化后端就会漏。
         for (const PoolEntry& e : free_)
@@ -715,6 +721,160 @@ bool GpuCompositor::waitIdle() {
     return true;
 }
 
+// ============================================================
+// 直接往渲染目标发 2D 图元（0.16.0）
+//
+// 分工：形状语义（半径怎么夹、覆盖率怎么算）在 bin2d 这边；"拆成几个四边形、怎么合批、
+// 走哪个后端"交给 binGPU（bingpu_cmd_draw_rounded_rect）。所以同一条代码路径在
+// CPU / VK / GL / D3D11 上都能画，而像素由**同一张覆盖率模板**保证 —— 不是两份数学。
+// ============================================================
+
+BgpuTexture GpuCompositor::roundedTile(int radius, bool stroke) {
+    if (!device_) return 0;
+    const int r = radius > 0 ? radius : 1;
+    for (const TileEntry& t : tiles_)
+        if (t.radius == r && t.stroke == stroke) return t.texture;
+
+    const int t = RoundedTileSize(r);
+    if (t <= 0) return 0;
+    CoverageRect cov;
+    if (!RasterizeRoundedTileCoverage(r, stroke, cov)) return 0;
+    if (cov.w != t || cov.h != t) return 0;
+
+    // 覆盖率 → RGBA8（四通道都填同一个值）。为什么四个通道都填：模板是"glyph 式的
+    // 遮罩"，后端只会做 texel × vertexColor，四通道同值等价于 alpha 遮罩，而这是
+    // binUI 三端一直用的口径 —— 换成别的填法像素就变了。
+    std::vector<uint8_t> rgba(static_cast<size_t>(t) * static_cast<size_t>(t) * 4u);
+    for (int i = 0; i < t * t; ++i) {
+        const uint8_t v = cov.v[static_cast<size_t>(i)];
+        rgba[static_cast<size_t>(i) * 4u + 0] = v;
+        rgba[static_cast<size_t>(i) * 4u + 1] = v;
+        rgba[static_cast<size_t>(i) * 4u + 2] = v;
+        rgba[static_cast<size_t>(i) * 4u + 3] = v;
+    }
+    BgpuTextureDesc td{};
+    td.struct_size = sizeof(td);
+    td.width = static_cast<uint32_t>(t);
+    td.height = static_cast<uint32_t>(t);
+    td.format = BGPU_FORMAT_RGBA8;
+    BgpuTexture tex = 0;
+    if (bingpu_texture_create(device_, &td, &tex) != BGPU_OK) {
+        fail("bingpu_texture_create(tile)", BGPU_ERR_BACKEND_FAILED);
+        return 0;
+    }
+    if (bingpu_texture_upload(tex, nullptr, rgba.data(), 0) != BGPU_OK) {
+        bingpu_texture_destroy(device_, tex);
+        fail("bingpu_texture_upload(tile)", BGPU_ERR_BACKEND_FAILED);
+        return 0;
+    }
+    tiles_.push_back(TileEntry{r, stroke, tex});
+    return tex;
+}
+
+bool GpuCompositor::beginTarget(BgpuTexture target, uint32_t clearArgb) {
+    if (!ready() || !target) {
+        error_ = "beginTarget: 设备/目标为空";
+        return false;
+    }
+    BgpuRenderBeginDesc rb{};
+    rb.struct_size = sizeof(rb);
+    rb.target = target;
+    rb.flags = BGPU_RENDER_CLEAR_COLOR;
+    rb.clear_color = clearArgb;
+    BgpuResult r = bingpu_cmd_begin_render(cmd_, &rb);
+    if (r != BGPU_OK) { fail("bingpu_cmd_begin_render(target)", r); return false; }
+    BgpuTextureInfo info{};
+    info.struct_size = sizeof(info);
+    int tw = width_, th = height_;
+    if (bingpu_texture_info(target, &info) == BGPU_OK) {
+        tw = static_cast<int>(info.width);
+        th = static_cast<int>(info.height);
+    }
+    (void)bingpu_cmd_set_viewport(cmd_, 0.0f, 0.0f, static_cast<float>(tw),
+                                  static_cast<float>(th));
+    (void)bingpu_cmd_set_scissor(cmd_, 0, 0, tw, th);
+    (void)bingpu_cmd_set_affine(cmd_, nullptr);   // 顶点就是目标像素
+    (void)bingpu_cmd_set_pipeline(cmd_, pipelineFor(BlendMode::SrcOver));
+    targetBound_ = target;
+    return true;
+}
+
+bool GpuCompositor::endTarget() {
+    if (!targetBound_) {
+        error_ = "endTarget: 没有 beginTarget";
+        return false;
+    }
+    targetBound_ = 0;
+    const BgpuResult r = bingpu_cmd_end_render(cmd_);
+    if (r != BGPU_OK) { fail("bingpu_cmd_end_render(target)", r); return false; }
+    return true;
+}
+
+bool GpuCompositor::drawRect(const Rect& r, Color color) {
+    if (!ready() || !targetBound_ || r.w <= 0.0f || r.h <= 0.0f) return false;
+    if (!white_) {
+        const uint8_t px[4] = {255, 255, 255, 255};
+        BgpuTextureDesc td{};
+        td.struct_size = sizeof(td);
+        td.width = 1;
+        td.height = 1;
+        td.format = BGPU_FORMAT_RGBA8;
+        if (bingpu_texture_create(device_, &td, &white_) != BGPU_OK) return false;
+        if (bingpu_texture_upload(white_, nullptr, px, 0) != BGPU_OK) {
+            bingpu_texture_destroy(device_, white_);
+            white_ = 0;
+            return false;
+        }
+    }
+    (void)bingpu_cmd_set_texture(cmd_, white_, samplerNearest_);
+    const uint32_t argb = color.toArgbStraight();
+    const float x0 = r.x, y0 = r.y, x1 = r.right(), y1 = r.bottom();
+    const BgpuVertex v[4] = {
+        {x0, y0, 0.0f, 0.5f, 0.5f, argb},
+        {x1, y0, 0.0f, 0.5f, 0.5f, argb},
+        {x0, y1, 0.0f, 0.5f, 0.5f, argb},
+        {x1, y1, 0.0f, 0.5f, 0.5f, argb},
+    };
+    const BgpuResult r2 = bingpu_cmd_draw_quads(cmd_, v, 1);
+    if (r2 != BGPU_OK) { fail("bingpu_cmd_draw_quads(rect)", r2); return false; }
+    return true;
+}
+
+bool GpuCompositor::drawRoundedRects(float radius, const Rect* rects, size_t count,
+                                     Color color) {
+    if (!ready() || !targetBound_ || !rects || count == 0) return false;
+    const int tileRadius = std::max(1, static_cast<int>(std::lround(radius)));
+    BgpuTexture tile = roundedTile(tileRadius, false);
+    if (!tile) return false;
+    std::vector<BgpuRoundedRect> batch;
+    batch.reserve(count);
+    const uint32_t argb = color.toArgbStraight();
+    for (size_t i = 0; i < count; ++i) {
+        const Rect& r = rects[i];
+        if (r.w <= 0.0f || r.h <= 0.0f) continue;
+        const float rf = std::min(radius, std::min(r.w, r.h) * 0.5f);
+        if (rf < 0.5f) continue;   // 半径退化：调用方该用 drawRect
+        batch.push_back(BgpuRoundedRect{r.x, r.y, r.w, r.h, rf, argb});
+    }
+    if (batch.empty()) return true;
+    const BgpuResult rc = bingpu_cmd_draw_rounded_rects(
+        cmd_, tile, RoundedTileSize(tileRadius), batch.data(),
+        static_cast<uint32_t>(batch.size()));
+    if (rc != BGPU_OK) { fail("bingpu_cmd_draw_rounded_rects", rc); return false; }
+    return true;
+}
+bool GpuCompositor::drawRoundedRect(const Rect& r, float radius, Color color) {
+    if (!ready() || !targetBound_ || r.w <= 0.0f || r.h <= 0.0f) return false;
+    const float rf = std::min(radius, std::min(r.w, r.h) * 0.5f);
+    if (rf < 0.5f) return drawRect(r, color);   // 半径小于半像素：视觉上就是直角
+    const int tileRadius = std::max(1, static_cast<int>(std::lround(rf)));
+    BgpuTexture tile = roundedTile(tileRadius, false);
+    if (!tile) return drawRect(r, color);       // 模板起不来：别让形状凭空消失
+    const BgpuResult rc = bingpu_cmd_draw_rounded_rect(
+        cmd_, tile, r.x, r.y, r.w, r.h, rf, RoundedTileSize(tileRadius), color.toArgbStraight());
+    if (rc != BGPU_OK) { fail("bingpu_cmd_draw_rounded_rect", rc); return false; }
+    return true;
+}
 bool GpuCompositor::readTarget(BgpuTexture target, Surface& out) {
     if (!device_ || !target) return false;
     BgpuTextureInfo info{};

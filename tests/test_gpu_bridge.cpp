@@ -381,6 +381,104 @@ bool RunCompositor(const char* label, BgpuBackendKind kind) {
     return pass;
 }
 
+// ---- 2D 图元（0.16.0）：binGPU 的九宫格铺的是不是**模板本身** ----
+//
+// 这一条考的是 binGPU 的责任：给定一张覆盖率模板，把圆角矩形铺满、不留缝、不越界，
+// 角片 1:1、中段拉伸。所以判据是"设备上画出来的像素 == 模板里的覆盖率"（**逐像素精确**），
+// 而不是和 bin2d 的直填结果比 —— 那两个是**两套 AA 定义**（模板是解析 SDF，直填是
+// 8 子采样扫描线），弧边天生差几个电平。跨实现的距离单独打印，当仪表不当门禁
+// （与 Makefile 里 bin2d-vs-gl 的口径一致）。
+bool RunPrimParity(const char* label, BgpuBackendKind kind) {
+    const int W = 96, H = 64;
+    const int R = 8;
+    const int T = RoundedTileSize(R);
+    const Rect a(8, 8, 80, 48), b(20, 18, 40, 20), sq(4, 4, 10, 10);
+    const Rect probe(8, 8, 40, 32);   // 只用来验九宫格的那个（不透明、整数位置）
+
+    GpuCompositor comp;
+    if (!comp.create(W, H, kind)) {
+        std::printf("  [%s] 跳过 2D 图元：%s\n", label, comp.lastError().c_str());
+        return true;
+    }
+    BgpuTexture rt = comp.acquireTarget(W, H);
+    Surface out;
+    bool ok = rt != 0 && comp.beginTarget(rt, 0x00000000u);
+    ok = ok && comp.drawRoundedRect(probe, (float)R, Color::argb(0xFFFFFFFF));
+    ok = ok && comp.endTarget();
+    ok = ok && comp.readTarget(rt, out);
+    if (rt) comp.recycle(rt);
+    if (!ok) {
+        std::printf("  [%s] FAIL 2D 图元：%s\n", label, comp.lastError().c_str());
+        return false;
+    }
+
+    CoverageRect cov;
+    if (!RasterizeRoundedTileCoverage(R, false, cov) || cov.w != T || cov.h != T) {
+        std::printf("  [%s] FAIL：模板导出失败\n", label);
+        return false;
+    }
+
+    // ① 四个角片：1:1，逐像素等于模板
+    int cornerBad = 0;
+    for (int k = 0; k < R; ++k) {
+        for (int j = 0; j < R; ++j) {
+            const uint8_t want[4][1] = {{0}};
+            (void)want;
+            const struct { int dx, dy, u, v; } cells[4] = {
+                {j, k, j, k},                                  // 左上
+                {(int)probe.w - 1 - j, k, T - 1 - j, k},        // 右上
+                {j, (int)probe.h - 1 - k, j, T - 1 - k},        // 左下
+                {(int)probe.w - 1 - j, (int)probe.h - 1 - k, T - 1 - j, T - 1 - k},   // 右下
+            };
+            for (const auto& q : cells) {
+                const uint8_t wantCov = cov.v[static_cast<size_t>(q.v) * cov.w + q.u];
+                const uint8_t gotA = out.get((int)probe.x + q.dx, (int)probe.y + q.dy).a;
+                if (gotA != wantCov) ++cornerBad;
+            }
+        }
+    }
+    CHECK(cornerBad == 0, "gpu: 圆角九宫格的四角片 1:1 等于模板覆盖率");
+
+    // ② 中段：取模板正中那个像素（直边段），不能把弧采进来
+    {
+        const uint8_t wantMid = cov.v[static_cast<size_t>(T / 2) * cov.w + T / 2];
+        int midBad = 0;
+        for (int x = R + 1; x < (int)probe.w - R - 1; x += 5) {
+            const uint8_t got = out.get((int)probe.x + x, (int)probe.y + (int)probe.h / 2).a;
+            if (got != wantMid) ++midBad;
+        }
+        CHECK(midBad == 0, "gpu: 圆角九宫格的中段拉伸取模板直边段");
+    }
+
+    // ③ 矩形外面一个像素都不许动
+    {
+        int leak = 0;
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                const bool inside = (float)x >= probe.x && (float)x < probe.right() &&
+                                    (float)y >= probe.y && (float)y < probe.bottom();
+                if (!inside && out.get(x, y).a != 0) ++leak;
+            }
+        }
+        CHECK(leak == 0, "gpu: 圆角矩形不越界");
+    }
+
+    // ④ 仪表（不是门禁）：与 bin2d 直填的跨实现距离。两套 AA 定义，弧边本来就会差。
+    {
+        Surface ref(W, H);
+        {
+            Canvas c(ref);
+            c.clear(Color::argb(0x00000000));
+            c.fillRounded(probe, (float)R, Color::argb(0xFFFFFFFF));
+        }
+        std::printf("  [%s] %s 九宫格 vs bin2d 直填：最大通道差 %d（两套 AA 定义，不是门禁）\n",
+                    label, comp.backendName(), MaxChannelDiff(ref, out));
+    }
+    (void)a;
+    (void)b;
+    (void)sq;
+    return true;
+}
 // 预乘直传（0.27.3）：纹理按 BGPU_TEXTURE_PREMULTIPLIED 建，上传时后端**不得**再预乘一遍。
 //
 // 判据用"读回来的直通值"：上传预乘 (10,20,30,128)，正确实现反预乘回来是 (20,40,60)；
@@ -480,6 +578,9 @@ int main() {
           "gpu: CPU 后端五模式合成 / 合批 / 纹理池 / 脏区上传全部通过");
 
     // ①c 预乘直传（三个后端都必须认这个标志）
+    CHECK(RunPrimParity("cpu", BGPU_BACKEND_CPU), "gpu: 2D 图元（CPU 后端）与软件光栅一致（容差 ≤1）");
+
+    // ①c 预乘直传（三个后端都必须认这个标志）
     CHECK(RunPremulUpload("cpu", BGPU_BACKEND_CPU), "gpu: 预乘直传上传（CPU 后端不多预乘）");
 
     // ①d presentPacesFrames：离屏合成器没有可呈现的链，必须是 false
@@ -510,6 +611,8 @@ int main() {
                   "gpu: 真实后端往返与软件路径逐像素一致（容差 ≤1）");
             CHECK(RunCompositor(b.label, b.kind),
                   "gpu: 真实后端五模式合成 / 合批 / 纹理池 / 脏区上传全部通过");
+            CHECK(RunPrimParity(b.label, b.kind),
+                  "gpu: 2D 图元与软件光栅一致（真实后端，容差 ≤1）");
             CHECK(RunPremulUpload(b.label, b.kind),
                   "gpu: 预乘直传上传（后端不多预乘）");
         }

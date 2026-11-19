@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(bin2D VERSION 0.15.0 LANGUAGES CXX)
+project(bin2D VERSION 0.16.0 LANGUAGES CXX)
 
 # bin2d 是纯 C++17 的 2D 绘制核：无第三方依赖。
 # GPU 桥（src/gpu.cpp）可选 —— 只有定义了 BIN2D_BINGPU_DIR 且能找到 bingpu.h 时才编。

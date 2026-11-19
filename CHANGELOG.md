@@ -3,6 +3,66 @@
 本文件记录 bin2d 的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.16.0] - 2026-11-20
+
+**`GpuCompositor` 能直接画 2D 图元了**：形状语义留在 bin2d，几何展开交给 binGPU。
+（接 binGPU 0.10.0 的 `bingpu_cmd_draw_rounded_rect`）
+
+```cpp
+BgpuTexture rt = comp.acquireTarget(w, h);
+comp.beginTarget(rt, 0xFF101418u);                       // 清色 + 视口 + 管线
+comp.drawRect(Rect(4, 4, 10, 10), Color::argb(0xFFFFFFFF));
+comp.drawRoundedRect(Rect(8, 8, 80, 48), 12.0f, Color::argb(0xFFFF6B6B));
+comp.endTarget();
+```
+
+这是"bin2d 的 Canvas 将来跑在 binGPU 上"的第一块地基。分工与帧节拍器同一个道理：
+- **形状语义在 bin2d**：半径怎么夹、覆盖率怎么算 —— `RasterizeRoundedTileCoverage`
+  是唯一一份解析式，`roundedTile(radius)` 按整数半径缓存成纹理；
+- **怎么画在 binGPU**：拆成几个四边形、怎么合批、走哪个后端；
+- 所以同一份代码在 CPU / VK / GL / D3D11 上都能画，像素由**同一张模板**保证。
+
+粗描边不在 binGPU 里循环：**每层的半径不同、要一张不同的模板**，模板缓存归这边，
+所以多层由这边连着调 `drawRoundedRect`。
+
+### 批量版
+
+```cpp
+comp.drawRoundedRects(12.0f, rects, count, color);   // 同一半径 → 一次绑定 + 一次 draw_quads
+```
+
+### 实测（1020×684 离屏、234 个约 100×32 的圆角矩形，5 次中位）
+
+| 路径 | 时间 |
+|---|---|
+| `Canvas::fillRounded`（本库 CPU 直填） | 1.43 ms |
+| 九宫格 · 逐个 · D3D11 | 1.37 ms |
+| 九宫格 · **批量** · D3D11 | **0.38 ms** |
+| 九宫格 · 逐个/批量 · binGPU 的 CPU 后端 | 19.9 / 20.2 ms |
+
+即：**真 GPU 上批量比本库的 CPU 直填快 3.8×**，而 binGPU 的 CPU 后端慢 14×
+（它是参考实现）。这正是 layering 文档里那条"CPU 执行模式该由 bin2d 的光栅来当"的
+证据 —— 别指望 binGPU 的 CPU 后端当性能路径。
+
+### 测试（`tests/test_gpu_bridge.cpp`，四个后端各跑一遍）
+
+判据是"设备上画出来的像素 == 模板里的覆盖率"，**逐像素精确**：
+四角片 1:1、中段取模板直边段、矩形外一个像素都不动。四个后端全过。
+
+### 顺带量出来的一件事：bin2d 内部有**两套**圆角 AA 定义
+
+| 路径 | AA 做法 | 谁在用 |
+|---|---|---|
+| `Canvas::fillRounded` | 8 子采样扫描线（`RasterEdges` + 差分前缀和） | binUI 的 bin2d 后端、离屏出图 |
+| `RasterizeRoundedTileCoverage` | 解析 SDF（`0.5 - dist`） | binUI 的 GL / VK / D3D11 三端 |
+
+同一个圆角矩形，两条路的弧边像素**差到 48 个电平**（不是 bug，是两套定义）。
+而且这件事一直没被发现，因为两个 golden 是**分开**的：`docs/pixels`（GL）与
+`tests/pixels-bin2d`（bin2d 后端）各自对各自的基线，"逐像素相同"从来没跨过实现比。
+
+统一到哪一套要改像素（弧边会变软/变硬），需要单独批准，所以这一版只把数字量出来，
+并把新路径钉在"模板"上（它是解析式，AA 更准）。
+
 ## [0.15.0] - 2026-11-20
 
 **`GpuCompositor` 有了帧节拍：策略在这一层给，闸门在 binGPU 算。**（接 binGPU 0.9.0）
