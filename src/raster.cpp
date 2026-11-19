@@ -14,6 +14,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <type_traits>
 #include <vector>
@@ -1170,6 +1172,81 @@ void StrokePath(const RasterTarget& t, const Path& path, const Paint& paint,
 void FillRoundedRect(const RasterTarget& t, const Rect& r, float radius,
                      const Paint& paint, const Transform& xf) {
     if (r.empty()) return;
+    // ---- 圆角矩形拆成"两条圆角带 + 一条整宽中段"（0.13.0）----
+    // 中段是真正的矩形：交给 FillRect 的整像素快速路径（32 位直写），不必陪圆角
+    // 一起去跑 8 子采样扫描线。实测 fillRounded 是 binUI 一帧里最大的一笔
+    // （features 页 53 次/帧占 62.6%），而它的面积几乎全在中段。
+    //
+    // 什么时候能拆（不满足就整条走原路径，像素不动）：
+    //   · 半径 > 0 且上下带之间还剩正高度；
+    //   · 变换只有平移，且设备空间盒子的四条边落在整像素上 —— 只有这样
+    //     "解析覆盖率"与"8 子采样"在左右两条竖边上的结果才都是精确的 0/1；
+    //   · 没有 mask（mask 逐像素不同，中段不能按常数写）。
+    // 像素不变的理由：三条带的行区间互斥且完备，圆角带用整条路径的原样覆盖率，
+    // 中段只在"形状完全展宽"的行上取值。
+    {
+        static const bool rrTrace = std::getenv("BIN2D_TRACE_RR") != nullptr;
+        if (rrTrace) {
+            const float tdx = r.x + xf.e, tdy = r.y + xf.f;
+            const bool tAligned = tdx == std::floor(tdx) && tdy == std::floor(tdy) &&
+                                  r.w == std::floor(r.w) && r.h == std::floor(r.h);
+            const int tBand = static_cast<int>(std::ceil(radius));
+            const bool tOk = radius > 0.0f && t.mask == nullptr &&
+                             xf.isTranslationOnly() && tAligned && tBand > 0 &&
+                             static_cast<int>(r.h) > 2 * tBand &&
+                             static_cast<int>(r.w) > 2 * tBand;
+            std::fprintf(stderr,
+                         "[rr] %.0fx%.0f r=%.1f trans=%d mask=%d align=%d band=%d -> %s\n",
+                         r.w, r.h, radius, xf.isTranslationOnly() ? 1 : 0,
+                         t.mask ? 1 : 0, tAligned ? 1 : 0, tBand,
+                         tOk ? "decompose" : "full-path");
+        }
+    }
+    static const bool noSplit = std::getenv("BIN2D_NO_RR_SPLIT") != nullptr;
+    if (!noSplit && radius > 0.0f && t.mask == nullptr && xf.isTranslationOnly()) {
+        const float dx = r.x + xf.e, dy = r.y + xf.f;
+        const bool aligned = dx == std::floor(dx) && dy == std::floor(dy) &&
+                             r.w == std::floor(r.w) && r.h == std::floor(r.h);
+        const int w = static_cast<int>(r.w), h = static_cast<int>(r.h);
+        const int band = static_cast<int>(std::ceil(radius));
+        // 圆角带只可能占用四个角：把它夹到半边以内，好让"药丸"（半径 = 半高）
+        // 也能拆 —— 190x40 r=20 这种按钮在 UI 里满地都是，以前因为
+        // `h > 2*band` 不成立整条掉回全路径（4 ns/px 对 0.5 ns/px）。
+        const int bw = std::min(band, w / 2);
+        const int bh = std::min(band, h / 2);
+        if (aligned && bw > 0 && bh > 0) {
+            const float x0 = static_cast<float>(static_cast<int>(dx));
+            const float y0 = static_cast<float>(static_cast<int>(dy));
+            const float fw = static_cast<float>(w), fh = static_cast<float>(h);
+            const float fbw = static_cast<float>(bw), fbh = static_cast<float>(bh);
+            Path p;
+            p.addRoundedRect(r, radius);
+            // 九宫格铺满：4 个角块（唯一含曲线的部分）走覆盖率光栅，其余 5 块都是
+            // 真正的轴对齐矩形，交给 FillRect 的整像素直写。
+            //   角块  bw x bh ×4；上/下条 (w-2bw) x bh；中段 w x (h-2bh)
+            // 药丸（h == 2bh）时中段为空，四个角块 + 上/下两条正好铺满整条。
+            auto rect = [&](float lx, float ly, float cw, float ch) {
+                // ⚠ 这里传的是**局部坐标**：FillRect 会自己再叠一次 xf。
+                // 曾经写成设备坐标（x0 + fbw, y0），于是平移被加了两次 ——
+                // 微基准里 translate=0 完全看不出来，真页面上整块元素偏一个原点。
+                if (cw > 0.0f && ch > 0.0f) FillRect(t, Rect(lx, ly, cw, ch), paint, xf);
+            };
+            auto corner = [&](float cx, float cy) {
+                // 裁剪框是**设备坐标**（与 t.clip 同一空间）
+                RasterTarget sub = t;
+                sub.clip = Rect::intersect(t.clip, Rect(cx, cy, fbw, fbh));
+                if (!sub.clip.empty()) FillPath(sub, p, FillRule::NonZero, paint, xf);
+            };
+            corner(x0, y0);                          // 左上
+            corner(x0 + fw - fbw, y0);               // 右上
+            corner(x0, y0 + fh - fbh);               // 左下
+            corner(x0 + fw - fbw, y0 + fh - fbh);    // 右下
+            rect(r.x + fbw, r.y, r.w - 2.0f * fbw, fbh);                    // 上条
+            rect(r.x + fbw, r.y + r.h - fbh, r.w - 2.0f * fbw, fbh);        // 下条
+            rect(r.x, r.y + fbh, r.w, r.h - 2.0f * fbh);                    // 中段
+            return;
+        }
+    }
     Path p;
     p.addRoundedRect(r, radius);
     FillPath(t, p, FillRule::NonZero, paint, xf);
@@ -1192,7 +1269,96 @@ void FillRect(const RasterTarget& t, const Rect& r, const Paint& paint,
         const int x1 = static_cast<int>(std::ceil(area.right()));
         const int y1 = static_cast<int>(std::ceil(area.bottom()));
         const int dw = dst.width();
+
+        // ---- 整像素内部（0.13.0）----
+        // 以前这里对**每一个**像素都算一次 RectCoverage（4 次 min/max + 1 次乘），
+        // 再乘颜色、再 BlendPixel —— 实测 4.47 ns/px，而画布地板（memset）是 0.07。
+        // 大块实心矩形（卡片底、面板、代码块）的 99% 面积覆盖率恒等于 1，
+        // 那部分根本不需要算：直接按 32 位读写。
+        // 像素不变的理由：内部区间的定义就是"覆盖率精确为 1 的整像素"，边界带
+        // 仍旧走原来的 RectCoverage 分支 —— 两条分支覆盖的像素集合互斥且完备。
+        int bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
+        const bool hasInterior = t.mask == nullptr && [&] {
+            const float fx0 = std::max(area.x, std::ceil(dev.x));
+            const float fy0 = std::max(area.y, std::ceil(dev.y));
+            const float fx1 = std::min(area.right(), std::floor(dev.right()));
+            const float fy1 = std::min(area.bottom(), std::floor(dev.bottom()));
+            if (!(fx1 > fx0 && fy1 > fy0)) return false;
+            bx0 = static_cast<int>(fx0);
+            by0 = static_cast<int>(fy0);
+            bx1 = static_cast<int>(fx1);
+            by1 = static_cast<int>(fy1);
+            return true;
+        }();
+        if (hasInterior) {
+            const Color src = paint.color;   // 覆盖率 1，颜色不缩放
+            const bool store = t.blend == BlendMode::Replace ||
+                               (t.blend == BlendMode::SrcOver && src.a == 255);
+            if (store) {
+                const uint32_t v = static_cast<uint32_t>(src.r) |
+                                   (static_cast<uint32_t>(src.g) << 8) |
+                                   (static_cast<uint32_t>(src.b) << 16) |
+                                   (static_cast<uint32_t>(src.a) << 24);
+                const int n = bx1 - bx0;
+                // 四个字节相同时退化成 memset（全透明清、纯白、纯黑都走这条）
+                const bool flat = (v & 0xFFu) == ((v >> 8) & 0xFFu) &&
+                                  (v & 0xFFu) == ((v >> 16) & 0xFFu) &&
+                                  (v & 0xFFu) == ((v >> 24) & 0xFFu);
+                for (int py = by0; py < by1; ++py) {
+                    uint8_t* row = dst.row(py) + static_cast<size_t>(bx0) * 4u;
+                    if (flat) {
+                        std::memset(row, static_cast<int>(v & 0xFFu),
+                                    static_cast<size_t>(n) * 4u);
+                    } else {
+                        uint32_t* p = reinterpret_cast<uint32_t*>(row);
+                        for (int i = 0; i < n; ++i) p[i] = v;
+                    }
+                }
+            } else {
+                // 半透明恒定源色 + SrcOver（UI 里大量面板都是这种）：
+                // 逐像素分支那一版实测 2.82 ns/px，其中主要是 BlendPixel 里那个
+                // switch 与四次运行期除法。这里把 dst*(1-a)/255 打成 256 项表
+                // ——**表达式与 blendOver 逐字相同**（同样的 +127 /255 取整），
+                // 所以像素逐字节不变，只是把除法挪出内循环。
+                if (t.blend == BlendMode::SrcOver && src.a != 0) {
+                    uint8_t tab[256];
+                    const unsigned ia = 255u - src.a;
+                    for (int v = 0; v < 256; ++v)
+                        tab[v] = static_cast<uint8_t>((static_cast<unsigned>(v) * ia + 127u) / 255u);
+                    for (int py = by0; py < by1; ++py) {
+                        uint8_t* p = dst.row(py) + static_cast<size_t>(bx0) * 4u;
+                        for (int px = bx0; px < bx1; ++px, p += 4) {
+                            p[0] = static_cast<uint8_t>(src.r + tab[p[0]]);
+                            p[1] = static_cast<uint8_t>(src.g + tab[p[1]]);
+                            p[2] = static_cast<uint8_t>(src.b + tab[p[2]]);
+                            p[3] = static_cast<uint8_t>(src.a + tab[p[3]]);
+                        }
+                    }
+                } else {
+                    for (int py = by0; py < by1; ++py) {
+                        uint8_t* p = dst.row(py) + static_cast<size_t>(bx0) * 4u;
+                        for (int px = bx0; px < bx1; ++px, p += 4) {
+                            const Color d(p[0], p[1], p[2], p[3]);
+                            const Color o = BlendPixel(d, src, t.blend);
+                            p[0] = o.r; p[1] = o.g; p[2] = o.b; p[3] = o.a;
+                        }
+                    }
+                }
+            }
+        }
+
         for (int py = y0; py < y1; ++py) {
+            // 整像素内部已经在上面写完了：这里只处理边界带
+            if (hasInterior && py >= by0 && py < by1) {
+                for (int px = x0; px < x1; ++px) {
+                    if (px >= bx0 && px < bx1) continue;
+                    float c = RectCoverage(dev, px, py);
+                    if (c <= 0.0f) continue;
+                    Color src = paint.color * (c > 1.0f ? 1.0f : c);
+                    dst.set(px, py, BlendPixel(dst.get(px, py), src, t.blend));
+                }
+                continue;
+            }
             for (int px = x0; px < x1; ++px) {
                 float c = RectCoverage(dev, px, py);
                 if (c <= 0.0f) continue;
