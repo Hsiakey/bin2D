@@ -463,7 +463,10 @@ bool RunPrimParity(const char* label, BgpuBackendKind kind) {
         CHECK(leak == 0, "gpu: 圆角矩形不越界");
     }
 
-    // ④ 仪表（不是门禁）：与 bin2d 直填的跨实现距离。两套 AA 定义，弧边本来就会差。
+    // ④ **门禁**（0.20.0 起）：与 bin2d 直填逐像素相同。
+    // 0.19.0 及以前这里是"仪表"——因为模板走解析 SDF、直填走扫描线，两套 AA 定义，
+    // 弧边本来就差。0.20.0 模板改成由 CPU 光栅自己生成，于是这一条变成可以钉死的
+    // 判据：**同一条页面在两个执行体上必须是同一批像素**（容差 1 = 覆盖率的 8 位量化）。
     {
         Surface ref(W, H);
         {
@@ -471,8 +474,9 @@ bool RunPrimParity(const char* label, BgpuBackendKind kind) {
             c.clear(Color::argb(0x00000000));
             c.fillRounded(probe, (float)R, Color::argb(0xFFFFFFFF));
         }
-        std::printf("  [%s] %s 九宫格 vs bin2d 直填：最大通道差 %d（两套 AA 定义，不是门禁）\n",
-                    label, comp.backendName(), MaxChannelDiff(ref, out));
+        const int d = MaxChannelDiff(ref, out);
+        std::printf("  [%s] %s 九宫格 vs bin2d 直填：最大通道差 %d\n", label, comp.backendName(), d);
+        CHECK(d <= 1, "gpu: 圆角矩形与 bin2d 直填逐像素相同（≤1）");
     }
     (void)a;
     (void)b;

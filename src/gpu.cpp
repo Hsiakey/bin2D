@@ -729,21 +729,31 @@ bool GpuCompositor::waitIdle() {
 // CPU / VK / GL / D3D11 上都能画，而像素由**同一张覆盖率模板**保证 —— 不是两份数学。
 // ============================================================
 
-BgpuTexture GpuCompositor::roundedTile(int radius, bool stroke) {
+// 模板缓存与上传：thickness == 0 = 填充模板，> 0 = 该厚度的整圈环带模板。
+// 键里必须带厚度：同一个半径下 1px / 2px / 3px 是三张不同的覆盖率位图。
+BgpuTexture GpuCompositor::uploadTile(int r, int thickness) {
     if (!device_) return 0;
-    const int r = radius > 0 ? radius : 1;
     for (const TileEntry& t : tiles_)
-        if (t.radius == r && t.stroke == stroke) return t.texture;
+        if (t.radius == r && t.thickness == thickness) return t.texture;
 
     const int t = RoundedTileSize(r);
     if (t <= 0) return 0;
     CoverageRect cov;
-    if (!RasterizeRoundedTileCoverage(r, stroke, cov)) return 0;
+    const bool ok = thickness > 0 ? RasterizeRoundedRingCoverage(r, static_cast<float>(thickness),
+                                                                cov)
+                                  : RasterizeRoundedTileCoverage(r, false, cov);
+    if (!ok) return 0;
     if (cov.w != t || cov.h != t) return 0;
 
     // 覆盖率 → RGBA8（四通道都填同一个值）。为什么四个通道都填：模板是"glyph 式的
     // 遮罩"，后端只会做 texel × vertexColor，四通道同值等价于 alpha 遮罩，而这是
     // binUI 三端一直用的口径 —— 换成别的填法像素就变了。
+    //
+    // **必须带 BGPU_TEXTURE_PREMULTIPLIED**（0.20.0 修）：这四通道装的是**覆盖率**，
+    // 不是"直通颜色 + alpha"。按直通上传的话 binGPU 会把它预乘一遍（rgb = cov²），
+    // 于是角片的 RGB 比 alpha 暗一截 —— 在不透明底上画不透明的颜色看不出来（rgb 只
+    // 取决于 alpha），但半透明或带 alpha 的变化就会露馅：实测差 64 个电平（cov=0.5 时
+    // 0.5 对 0.25），92 个像素。
     std::vector<uint8_t> rgba(static_cast<size_t>(t) * static_cast<size_t>(t) * 4u);
     for (int i = 0; i < t * t; ++i) {
         const uint8_t v = cov.v[static_cast<size_t>(i)];
@@ -757,6 +767,7 @@ BgpuTexture GpuCompositor::roundedTile(int radius, bool stroke) {
     td.width = static_cast<uint32_t>(t);
     td.height = static_cast<uint32_t>(t);
     td.format = BGPU_FORMAT_RGBA8;
+    td.flags = BGPU_TEXTURE_PREMULTIPLIED;
     BgpuTexture tex = 0;
     if (bingpu_texture_create(device_, &td, &tex) != BGPU_OK) {
         fail("bingpu_texture_create(tile)", BGPU_ERR_BACKEND_FAILED);
@@ -767,8 +778,21 @@ BgpuTexture GpuCompositor::roundedTile(int radius, bool stroke) {
         fail("bingpu_texture_upload(tile)", BGPU_ERR_BACKEND_FAILED);
         return 0;
     }
-    tiles_.push_back(TileEntry{r, stroke, tex});
+    tiles_.push_back(TileEntry{r, thickness, tex});
     return tex;
+}
+
+BgpuTexture GpuCompositor::roundedTile(int radius, bool stroke) {
+    const int r = radius > 0 ? radius : 1;
+    // 1px 环是"厚度 1 的环带"的一个特例（0.20.0 起走同一份生成器）
+    return uploadTile(r, stroke ? 1 : 0);
+}
+
+BgpuTexture GpuCompositor::roundedRingTile(int radius, int thickness) {
+    const int r = radius > 0 ? radius : 1;
+    int th = thickness < 1 ? 1 : thickness;
+    if (th > r) th = r;
+    return uploadTile(r, th);
 }
 
 bool GpuCompositor::beginTarget(BgpuTexture target, uint32_t clearArgb) {
@@ -904,20 +928,23 @@ bool GpuCompositor::drawRoundedRect(const Rect& r, float radius, Color color) {
     return true;
 }
 
-// 圆角描边（0.19.0）：同心 1px 环叠层。层数/每层几何来自 raster.h 的
-// RoundedStrokeLayerCount / BuildRoundedStrokeLayer —— 与宿主 binUI 的 BuildRoundedLayer
-// 是**同一套口径**（那边 0.25.0 已经收成一份），所以"bin2d 执行体"和"binUI 的 GL/VK/D3D11"
-// 画出来的描边是同一批像素。
+// 圆角描边（0.19.0；0.20.0 换成"一整圈环带模板 + 一次九宫格"）
 //
-// 为什么逐层调 bingpu_cmd_draw_rounded_rect 而不是批量：每层半径不同 → 每层一张模板，
-// 绑纹理就变了，合批没有意义（层数一般也就 1~2 层）。
+// 0.19.0 是同心 1px 环叠层（每层一张不同半径的模板）。它在直边上是精确的，但**弧上不是**：
+// 相邻两层的抗锯齿边各贡献约一半覆盖率，叠加两次得到 0.5 + 0.5×0.5 = 0.75，
+// 于是弧上的带子只有直边的约 60% 亮度（实测覆盖总量 2.56 vs 4.53），肉眼是"发灰发断"。
+//
+// 0.20.0 直接生成**整圈环带**的覆盖率模板（RasterizeRoundedRingCoverage，几何与
+// `Canvas::strokePath` 同一条），一次九宫格画完。九宫格对这种模板为什么成立：
+// 角片 1:1 不拉伸；左边中段取模板的正中一行 —— 那一行上带子就是 [0,T] 的一段直线，
+// 与真实直边完全一样；中心格取的是洞里的那个纹素（0）。
 bool GpuCompositor::drawRoundedStroke(const Rect& r, float radius, float thickness,
                                       Color color) {
     if (!ready() || !targetBound_ || r.w <= 0.0f || r.h <= 0.0f) return false;
     if (thickness <= 0.0f) return true;
     const float rf = std::min(radius, std::min(r.w, r.h) * 0.5f);
     if (rf <= 0.0f) {
-        // 半径退化：直角描边 = 四条矩形（与宿主 strokeRounded 的直角分支同一条）
+        // 半径退化：直角描边 = 四条矩形（与 Canvas 那条 strokePath 路径的直角分支同一条）
         const float t = thickness;
         return drawRect(Rect(r.x, r.y, r.w, std::min(t, r.h)), color) &&
                drawRect(Rect(r.x, r.y + r.h - std::min(t, r.h), r.w, std::min(t, r.h)), color) &&
@@ -927,20 +954,17 @@ bool GpuCompositor::drawRoundedStroke(const Rect& r, float radius, float thickne
                              std::max(0.0f, r.h - 2.0f * t)),
                         color);
     }
-    const int layers = RoundedStrokeLayerCount(r.w, r.h, radius, thickness);
-    const uint32_t argb = color.toArgbStraight();
-    bool ok = true;
-    for (int k = 0; k < layers && ok; ++k) {
-        RoundedStrokeLayer L;
-        if (!BuildRoundedStrokeLayer(r.x, r.y, r.w, r.h, radius, thickness, k, L)) break;
-        BgpuTexture tile = roundedTile(L.tile_radius, true);
-        if (!tile) { fail("roundedTile(stroke)", BGPU_ERR_BACKEND_FAILED); return false; }
-        const BgpuResult rc = bingpu_cmd_draw_rounded_rect(
-            cmd_, tile, L.rect.x, L.rect.y, L.rect.w, L.rect.h, L.radius,
-            RoundedTileSize(L.tile_radius), argb);
-        if (rc != BGPU_OK) { fail("bingpu_cmd_draw_rounded_rect(stroke)", rc); ok = false; }
-    }
-    return ok;
+    const int tileRadius = std::max(1, static_cast<int>(std::lround(rf)));
+    int th = static_cast<int>(std::lround(thickness));
+    if (th < 1) th = 1;
+    if (th > tileRadius) th = tileRadius;
+    BgpuTexture tile = roundedRingTile(tileRadius, th);
+    if (!tile) { fail("roundedRingTile", BGPU_ERR_BACKEND_FAILED); return false; }
+    const BgpuResult rc = bingpu_cmd_draw_rounded_rect(
+        cmd_, tile, r.x, r.y, r.w, r.h, rf, RoundedTileSize(tileRadius),
+        color.toArgbStraight());
+    if (rc != BGPU_OK) { fail("bingpu_cmd_draw_rounded_rect(ring)", rc); return false; }
+    return true;
 }
 
 // 圆角渐变（0.19.0）：九宫格 + 四角直通色。色由 LinearGradientCorners 从**直通**两端

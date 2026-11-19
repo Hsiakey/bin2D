@@ -279,10 +279,13 @@ public:
     bool drawRoundedGradient(const Rect& r, float radius, float angleDeg, const Color& from,
                              const Color& to);
 
-    // 圆角覆盖率模板（按整数半径缓存，描边是另一套 1px 环模板）。
+    // 圆角覆盖率模板（按整数半径缓存；描边是另一套 1px 环模板）。
     // 内容 = bin2d 的解析式覆盖率，四通道都填成同一个值（与 binUI 三端的老模板同一口径）。
     // 显存由合成器持有，destroy() 时统一释放。
     BgpuTexture roundedTile(int radius, bool stroke = false);
+    // **整圈环带**模板（0.20.0）：厚度 thickness 的抗锯齿圆角环，一次九宫格画完。
+    // 粗描边不再用"同心 1px 环叠层"——叠层在弧上会丢掉约 40% 的覆盖率（发的白边发灰）。
+    BgpuTexture roundedRingTile(int radius, int thickness);
     // 1×1 全白（直角矩形、合批的四边形都用它当纹理，配合顶点色）
     BgpuTexture whiteTexture();
     // 贴一张预乘 Surface 到 dst（uv 是归一化子矩形）。内部走纹理池 + 预乘零拷贝上传。
@@ -339,13 +342,16 @@ private:
     // 是因为它要喂"本拍 present 真实耗时"，而那只有 presentSurface 自己量得到。
     BgpuPacer pace_{};
     double refreshMs_ = 0.0;   // 建链时探到的刷新周期；0 = 探测不到（按 60 算）
-    // 覆盖率模板缓存：(radius, stroke) → 纹理。键用整数半径 —— 模板是位图，只能整数。
+    // 覆盖率模板缓存：(radius, thickness) → 纹理。键用整数半径/厚度 —— 模板是位图，
+    // 只能整数；thickness == 0 表示填充模板。
     struct TileEntry {
         int radius = 0;
-        bool stroke = false;
+        int thickness = 0;
         BgpuTexture texture = 0;
     };
     std::vector<TileEntry> tiles_;
+    // 模板取不到就现做一张（按 (radius, thickness) 缓存）
+    BgpuTexture uploadTile(int radius, int thickness);
     BgpuTexture white_ = 0;    // 1×1 全白（直角矩形用）
     BgpuTexture targetBound_ = 0;   // beginTarget 里正在画的目标（诊断/断言用）
 };

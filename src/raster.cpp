@@ -1203,41 +1203,91 @@ bool RasterizeStrokeCoverage(const StrokeCoverageRequest& req, CoverageRect& out
 }
 
 // ------------------------------------------------------------
-// 圆角模板覆盖率（0.7.0）
+// 圆角模板覆盖率（0.7.0；0.20.0 换成"CPU 光栅自己的算法"）
 //
-// 有符号距离的解析式，不经过扫描线：这张模板是"圆角方块"的覆盖率位图，宿主要把它当
-// 灰度纹理去 9 宫格拉伸（角片只采样 [0,r] 那一块）。所以这里刻意**不**走 RasterizeCoverage
-// —— 那会给出一张"折线圆弧 + 8 条子采样"的覆盖率，和三端现在的模板不是同一张图。
+// 这张模板要做的事：给九宫格提供**角片**那一块的覆盖率，宿主把它当灰度纹理去拉伸
+// （角片只采样 [0,r] 那一块，中段取正中 1 个纹素）。所以它必须是"圆角方块 [0,t]²、
+// 半径 r"这个形状的覆盖率，且**与 Canvas::fillRounded 逐位相同**。
 //
-// 边界口径：填充 `0.5 - dist`（dist 是到边界的距离，正 = 在外面），于是边界上正好 0.5、
-// 往内 0.5px 满覆盖 —— 这就是 1px 宽的抗锯齿过渡。描边把带子整体挪到内侧
-// （`min(0.5 - dist, dist + 1.5)`，即 dist ∈ (-1.5, 0.5)），否则环线骑在边界上、靠内的
-// 半个像素只有 50%，白色焦点环会画成灰线（binUI 0.16 实测 #858990）。
+// 0.7.0 ~ 0.19.0 用的是**有符号距离的解析式**（圆的 SDF）。它自己是对的，但它和
+// `Canvas::fillRounded` 不是一个算法，于是同一个圆角在两个执行体上差一截 —— 弧顶那一行
+// 差 **1.00 px**（实测，14px 半径），因为 CPU 那条路是"kappa 三次贝塞尔展平成折线 +
+// 8 条子扫描线"，弧的位置、抗锯齿的分布都来自那套几何，而不是解析圆。
+//
+// 0.20.0 起这里直接**调 CPU 光栅本身**（FlattenToDevice + RasterizeCoverage），
+// 于是两边是同一份数学而不是"看起来一样的两份数学"。为什么模板这条路仍然成立：
+//   · 角片 1:1 不拉伸 —— 模板的 [0,r]² 与设备上的角块逐像素对应；
+//   · 行相位一致 —— 角块从设备行 y0（整像素）起算，模板从行 0 起算，8 条子扫描线的
+//     偏移集合 {0.5,1.5,...,7.5}/8 在"按行取"的口径下与设备一致；
+//   · 四个角**互为镜像**：镜像把偏移集合 {δ} 映射成 {1-δ} = 同一集合，所以一张角片
+//     旋转 90°、水平/垂直翻转之后仍然精确（宿主就是这么复用的）；
+//   · 中段与中心是常数 —— 填充时那里覆盖率恒为 1，环带时按宽度 T 铺开。
+//
+// 描边（stroke=true）是 0.19.0 以前的 1px 环；0.20.0 起另有 RasterizeRoundedRingCoverage
+// 直接生成**整圈环带**（粗描边不再靠同心叠加，那会在弧上丢掉约 40% 覆盖率）。
 // ------------------------------------------------------------
 bool RasterizeRoundedTileCoverage(int radius, bool stroke, CoverageRect& out) {
+    if (stroke) return RasterizeRoundedRingCoverage(radius, 1.0f, out);
+    const int r = radius > 0 ? radius : 1;
+    const int t = RoundedTileSize(r);
+    out.x0 = out.y0 = 0;
+    out.w = t;
+    out.h = t;
+    out.v.assign(static_cast<size_t>(t) * static_cast<size_t>(t), 0);
+
+    // 形状：铺满 [0,t]² 的圆角方块。直边段的起点 = t/2 - r，与宿主九宫格的
+    // "角片边长 = r" 是同一套口径（t = 2r+4 时直边段恰好 4px）。
+    Path p;
+    p.addRoundedRect(Rect(0.0f, 0.0f, static_cast<float>(t), static_cast<float>(t)),
+                     static_cast<float>(r));
+    if (p.empty()) return false;
+    const std::vector<Polyline> polys = FlattenToDevice(p, Transform{}, 0.25f);
+    if (polys.empty()) return false;
+    CoverageRect cov;
+    const Rect clip(0.0f, 0.0f, static_cast<float>(t), static_cast<float>(t));
+    if (!RasterizeCoverage(polys, FillRule::NonZero, clip, kSubSamples, cov,
+                           CoverageStyle::Fractional))
+        return false;
+    // 覆盖率导出矩形必须正好铺满模板（不行就让调用方退回直角，而不是悄悄错位）
+    if (cov.x0 != 0 || cov.y0 != 0 || cov.w != t || cov.h != t) return false;
+    out.v = std::move(cov.v);
+    return true;
+}
+
+// 整圈环带：与 `BinUI2D::strokeRounded` / `Canvas::strokePath` 的"内缩 t/2 + 居中描边 t"
+// 完全同一条几何，只是把结果取成一张模板。粗描边因此变成**一次九宫格**，
+// 而不是"同心 1px 环叠层"——后者在弧上会让两层各自半覆盖的像素叠加两次
+// （0.5 + 0.5×0.5 = 0.75），实测弧上的覆盖率只剩直边的 **约 60%**。
+bool RasterizeRoundedRingCoverage(int radius, float thickness, CoverageRect& out) {
     out.x0 = out.y0 = 0;
     out.w = out.h = 0;
     out.v.clear();
     const int r = radius > 0 ? radius : 1;
     const int t = RoundedTileSize(r);
+    float th = thickness;
+    if (!(th > 0.0f)) th = 1.0f;
+    if (th > static_cast<float>(r)) th = static_cast<float>(r);   // 带宽不能超过角片，否则中段会被裁错
     out.w = t;
     out.h = t;
     out.v.assign(static_cast<size_t>(t) * static_cast<size_t>(t), 0);
-    const float half = static_cast<float>(t) / 2.0f;      // 形状半边长
-    const float inset = half - static_cast<float>(r);     // 直边段起点距中心
-    for (int i = 0; i < t; ++i) {
-        for (int j = 0; j < t; ++j) {
-            const float fx = std::fabs(static_cast<float>(j) + 0.5f - half) - inset;
-            const float fy = std::fabs(static_cast<float>(i) + 0.5f - half) - inset;
-            const float dx = fx > 0.0f ? fx : 0.0f;
-            const float dy = fy > 0.0f ? fy : 0.0f;
-            const float dist = std::sqrt(dx * dx + dy * dy) - static_cast<float>(r);
-            float cov = stroke ? std::min(0.5f - dist, dist + 1.5f) : 0.5f - dist;
-            cov = cov < 0.0f ? 0.0f : (cov > 1.0f ? 1.0f : cov);
-            out.v[static_cast<size_t>(i) * static_cast<size_t>(t) + static_cast<size_t>(j)] =
-                static_cast<uint8_t>(cov * 255.0f + 0.5f);
-        }
-    }
+
+    const float in = th * 0.5f;
+    Path p;
+    p.addRoundedRect(Rect(in, in, static_cast<float>(t) - th, static_cast<float>(t) - th),
+                     static_cast<float>(r) - in);
+    if (p.empty()) return false;
+    const std::vector<Polyline> polys = FlattenToDevice(p, Transform{}, 0.25f);
+    if (polys.empty()) return false;
+    StrokeStyle style;
+    style.width = th;
+    style.roundCap = false;
+    style.squareCap = false;
+    style.roundJoin = true;
+    CoverageRect cov;
+    const Rect clip(0.0f, 0.0f, static_cast<float>(t), static_cast<float>(t));
+    if (!RasterizeStrokeCoverage(polys, style, clip, kSubSamples, cov)) return false;
+    if (cov.x0 != 0 || cov.y0 != 0 || cov.w != t || cov.h != t) return false;
+    out.v = std::move(cov.v);
     return true;
 }
 

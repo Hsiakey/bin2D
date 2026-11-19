@@ -638,44 +638,66 @@ static void TestRoundedTile() {
         CHECK(straightFull, "rounded tile: 直边段整条都是满覆盖的带子（两端只剩圆角）");
     }
 
-    // ④ 与三端旧实现逐字节相同（参考实现 = binUI 0.16~0.22 里那三段一模一样的循环）
+    // ④ 模板的角片 == `Canvas::fillRounded` 在**整像素盒子**上的角块。
+    //
+    // 这是 0.20.0 换掉解析 SDF 之后成立的那条不变量，也是"两个执行体同一份 AA"的
+    // 唯一判据：模板的 [0,r]² 就是设备上那个角块的覆盖率，一个像素都不许差。
+    // （0.19.0 及以前这里比的是"与解析 SDF 逐字节相同"——那条已经作废，
+    //  正因为 SDF 与扫描线不是同一份数学，圆角在两个执行体上差了整段。）
     {
-        auto reference = [](int radius, bool stroke, std::vector<uint8_t>& out) {
-            const int r = std::max(1, radius);
-            const int t = std::max(8, r * 2 + 4);
-            out.assign(static_cast<size_t>(t) * static_cast<size_t>(t), 0);
-            const float half = static_cast<float>(t) / 2.0f;
-            const float inset = half - static_cast<float>(r);
-            for (int i = 0; i < t; i++) {
-                for (int j = 0; j < t; j++) {
-                    const float fx = std::fabs(static_cast<float>(j) + 0.5f - half) - inset;
-                    const float fy = std::fabs(static_cast<float>(i) + 0.5f - half) - inset;
-                    const float dx = fx > 0 ? fx : 0.0f;
-                    const float dy = fy > 0 ? fy : 0.0f;
-                    const float dist = std::sqrt(dx * dx + dy * dy) - static_cast<float>(r);
-                    float cov = stroke ? std::min(0.5f - dist, dist + 1.5f) : 0.5f - dist;
-                    cov = cov < 0.0f ? 0.0f : (cov > 1.0f ? 1.0f : cov);
-                    out[static_cast<size_t>(i) * t + j] =
-                        static_cast<uint8_t>(cov * 255.0f + 0.5f);
+        int worstFill = 0, worstRing = 0, ringAt = 0;
+        for (int r = 1; r <= 40; ++r) {
+            const int t = RoundedTileSize(r);
+            // —— 填充 ——
+            Surface s(t, t);
+            {
+                Canvas c(s);
+                c.clear(Color::trans());
+                c.fillRounded(Rect(0.0f, 0.0f, float(t), float(t)), float(r), Color::white());
+            }
+            CoverageRect cov;
+            if (!RasterizeRoundedTileCoverage(r, false, cov) || cov.w != t) {
+                worstFill = 999;
+                break;
+            }
+            for (int y = 0; y < r; ++y)
+                for (int x = 0; x < r; ++x)
+                    worstFill = std::max(worstFill,
+                                         std::abs(int(s.get(x, y).a) - int(cov.v[y * t + x])));
+
+            // —— 环带（厚度 1、2、3；厚度不超过半径 —— 生成器内部就这么夹）——
+            for (int th = 1; th <= 3 && th <= r; ++th) {
+                Surface s2(t, t);
+                {
+                    Canvas c(s2);
+                    c.clear(Color::trans());
+                    Path p;
+                    const float in = float(th) * 0.5f;
+                    p.addRoundedRect(Rect(in, in, float(t) - float(th), float(t) - float(th)),
+                                     float(r) - in);
+                    StrokeStyle st;
+                    st.width = float(th);
+                    st.roundCap = false;
+                    st.squareCap = false;
+                    st.roundJoin = true;
+                    c.strokePath(p, Paint::solid(Color::white()), st);
                 }
+                CoverageRect rc;
+                if (!RasterizeRoundedRingCoverage(r, float(th), rc) || rc.w != t) {
+                    worstRing = 999;
+                    break;
+                }
+                for (int y = 0; y < r; ++y)
+                    for (int x = 0; x < r; ++x) {
+                        const int d = std::abs(int(s2.get(x, y).a) - int(rc.v[y * t + x]));
+                        if (d > worstRing) { worstRing = d; ringAt = r * 100 + th; }
+                    }
             }
-            return t;
-        };
-        int worst = 0;
-        for (int r = 1; r <= 40; r++) {
-            for (int s = 0; s < 2; s++) {
-                std::vector<uint8_t> ref;
-                const int t = reference(r, s != 0, ref);
-                CoverageRect cov;
-                RasterizeRoundedTileCoverage(r, s != 0, cov);
-                if (cov.w != t) { worst = 999; break; }
-                for (size_t k = 0; k < ref.size(); k++)
-                    worst = std::max(worst, std::abs(int(ref[k]) - int(cov.v[k])));
-            }
-            if (worst == 999) break;
         }
-        CHECK(worst == 0, "rounded tile: 与三端旧实现逐字节相同（r=1..40，填充+描边）");
-        std::printf("  （r=1..40 × {填充,描边} 与旧实现最大差 %d 级）\n", worst);
+        CHECK(worstFill <= 1, "rounded tile: 角片与 Canvas::fillRounded 逐像素相同（r=1..40）");
+        CHECK(worstRing <= 1, "rounded ring: 环带与 Canvas::strokePath 逐像素相同（r=1..40，t=1..3）");
+        std::printf("  （填充 max=%d；环带 max=%d @r=%d/th=%d）\n", worstFill, worstRing, ringAt / 100,
+                    ringAt % 100);
     }
 }
 

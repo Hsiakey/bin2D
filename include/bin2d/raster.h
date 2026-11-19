@@ -323,57 +323,15 @@ inline int RoundedTileSize(int radius) {
 }
 
 // 导出一张 t×t 的覆盖率（t = RoundedTileSize(radius)；out.x0/y0 = 0，out.v 行优先）。
+// 0.20.0 起内容来自 **CPU 光栅自己**（FlattenToDevice + RasterizeCoverage），
+// 不再是解析 SDF —— 于是"九宫格模板"与 `Canvas::fillRounded` 是同一个算法。
 bool RasterizeRoundedTileCoverage(int radius, bool stroke, CoverageRect& out);
 
-// ------------------------------------------------------------
-// 圆角描边的分层（0.19.0）：粗描边 = 同心 1px 环叠层
-//
-// 为什么是"层"而不是"一个环的四个角片"：模板只有 **1px 环**这一种（见上面 stroke=true
-// 的口径）。厚描边没法靠拉伸模板得到 —— 沿 UV 拉伸会把 1px 的环拉成 N px 的带，但
-// 圆弧那一段会被拉成椭圆弧、而且内圈的圆角半径不会跟着缩（画出来是"外圆内方"）。
-// 唯一正确的做法是叠层：第 k 层的外框往里缩 k、半径减 k，每层用**不同半径**的 1px 环模板。
-//
-// 这段几何以前在宿主的三个 GPU 后端里各写一份（`binui_paint.h` 的 RoundedLayerCount /
-// BuildRoundedLayer，0.25.0 才收成一份）。现在 bin2d 要自己画描边，所以它是**第二份**
-// 实现 —— 必须与宿主那份逐条一致，否则"同一张页面在两种执行体上画"会差一圈像素。
-// 单测里钉的就是这条等价关系（tests/test_display_list.cpp 的 ring 页）。
-//
-// 口径（与宿主逐条相同）：
-//   · 层数 = round(max(1, thickness))，再被 floor(radius) 限制（半径耗尽就停）
-//   · 第 k 层：外框 (x+k, y+k, w-2k, h-2k)，半径 = min(rf-k, min(w',h')/2)
-//   · 模板半径取最近整数（模板是位图，只能整数）
-// ------------------------------------------------------------
-struct RoundedStrokeLayer {
-    Rect rect;
-    float radius = 0.0f;      // 几何半径（浮点：缩放动画里半径是连续的）
-    int tile_radius = 1;      // 1px 环模板的整数半径
-};
-
-// 0 = 半径无效（调用方应退回 fillRect / 直角四边）
-inline int RoundedStrokeLayerCount(float w, float h, float radius, float thickness) {
-    if (w <= 0.0f || h <= 0.0f) return 0;
-    const float rf = std::min(radius, std::min(w, h) * 0.5f);
-    if (rf <= 0.0f) return 0;
-    int layers = static_cast<int>(std::lround(std::max(1.0f, thickness)));
-    const int cap = static_cast<int>(std::floor(rf));
-    if (layers > cap) layers = cap;
-    return layers < 1 ? 0 : layers;
-}
-
-// 第 layer 层；false = 这一层已退化（半径耗尽 / 外框不足 1px），调用方应当停。
-inline bool BuildRoundedStrokeLayer(float x, float y, float w, float h, float radius,
-                                    float thickness, int layer, RoundedStrokeLayer& out) {
-    (void)thickness;   // 每一层的形状只取决于序号；厚度体现在"一共几层"
-    if (w <= 0.0f || h <= 0.0f || layer < 0) return false;
-    const float rf = std::min(radius, std::min(w, h) * 0.5f);
-    if (rf <= 0.0f) return false;
-    const float k = static_cast<float>(layer);
-    out.rect = Rect(x + k, y + k, w - 2.0f * k, h - 2.0f * k);
-    if (out.rect.w <= 1.0f || out.rect.h <= 1.0f) return false;
-    out.radius = std::min(rf - k, std::min(out.rect.w, out.rect.h) * 0.5f);
-    if (out.radius <= 0.0f) return false;
-    out.tile_radius = std::max(1, static_cast<int>(std::lround(out.radius)));
-    return true;
-}
+// 整圈环带（0.20.0）：一条 width = thickness 的居中描边，形状与
+// `Canvas::strokePath(addRoundedRect(inset(t/2), radius - t/2))` 相同。
+// 这张模板让"粗圆角描边"变成**一次九宫格**，而不是同心环叠层 —— 叠层会在弧上
+// 让两层各自半覆盖的像素混两次（0.5 + 0.5×0.5 = 0.75），实测弧上只剩直边的约 60%。
+// 前提：thickness <= radius（带宽超过角片时中段的拉伸会错，内部会夹住）。
+bool RasterizeRoundedRingCoverage(int radius, float thickness, CoverageRect& out);
 
 } // namespace bin2d
