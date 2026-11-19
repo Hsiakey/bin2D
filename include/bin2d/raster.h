@@ -165,9 +165,18 @@ void DrawSurface(const RasterTarget& t, const Surface& src, const Rect& dstLocal
                  const Rect& srcUv, const Color& tint, bool nearest,
                  const Transform& xf);
 
-// 盒式模糊（两次可分离，近似高斯）。radius 是像素半径；0 或负数不动。
+// 盒式模糊（两次可分离，近似高斯）。radius 是**盒式核的半宽**（不是 σ）；0 或负数不动。
 // 只模糊当前像素矩形内、且按 srcAlpha 归一化（预乘空间直接模糊即可）。
+// 单趟盒式糊出来边缘是"斜坡 + 折点"，要"像高斯"请用下面的 BlurSigma。
 void Blur(Surface& s, float radius);
+
+// 高斯模糊，**sigma 语义**（0.12.0）：σ 就是 CSS `blur(Npx)` / SVG `stdDeviation` 的
+// 那个 σ，单位像素。为什么必须按 σ 给而不是按盒式半径给：上层（binUI 的 CSS filter、
+// SVG filter、drop-shadow）拿到的数字全是 σ，直接喂给单趟盒式会**系统性糊得不够**
+// ——σ=3 的盒式期望半径是 3，而 width=7 的盒式其实只有 σ≈2.0，观感差一倍。
+// 实现是三趟盒式（每趟 Rows+Cols）：方差可叠加，3 趟之后与理想高斯的最大偏差 <2%，
+// 而代价仍是每像素 O(1)（前缀和），比逐抽头卷积便宜一个数量级。
+void BlurSigma(Surface& s, float sigmaPx);
 
 // ------------------------------------------------------------
 // 覆盖率遮罩的模糊与合成（0.8.0：投影走这条，不再"画彩色图层再模糊"）

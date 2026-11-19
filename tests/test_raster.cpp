@@ -676,6 +676,104 @@ static void TestRoundedTile() {
     }
 }
 
+// ------------------------------------------------------------
+// 模糊（0.12.0）：σ 语义
+//
+// 上半图不透明黑、下半图透明 → 中间那条水平边界是理想阶跃。模糊之后沿纵向取
+// 覆盖率的 10%/90% 两个交点，两者间距对理想高斯是 2.563σ —— 这就是"σ 是不是
+// 真的按像素给的"最直接的判据。单趟盒式（旧的 Blur(radius)）给不出这个数，
+// 所以上层的 CSS blur(Npx) 喂进来会系统性糊得不够。
+// ------------------------------------------------------------
+static int StepWidth(const Surface& s, int col) {
+    // 返回 col 这一列 alpha 从 90% 掉到 10% 的像素距离（线性插值）
+    auto at = [&](int y) { return static_cast<double>(s.row(y)[static_cast<size_t>(col) * 4 + 3]); };
+    const int h = s.height();
+    double y90 = -1.0, y10 = -1.0;
+    for (int y = 0; y + 1 < h; ++y) {
+        const double a = at(y), b = at(y + 1);
+        if (y90 < 0.0 && a >= 229.5 && b < 229.5) y90 = y + (a - 229.5) / std::max(1e-9, a - b);
+        if (y10 < 0.0 && a >= 25.5 && b < 25.5) y10 = y + (a - 25.5) / std::max(1e-9, a - b);
+    }
+    if (y90 < 0.0 || y10 < 0.0) return -1;
+    return static_cast<int>(std::lround(y10 - y90));
+}
+
+static void TestBlurSigma() {
+    const int kSteps[] = {2, 3, 5, 8};
+    for (int sigma : kSteps) {
+        Surface s(96, 96);
+        {
+            Canvas c(s);
+            c.fillRect(Rect(0.0f, 0.0f, 96.0f, 48.0f), Paint::solid(Color::black()));
+        }
+        const double massBefore = AlphaSum(s);
+        BlurSigma(s, static_cast<float>(sigma));
+        const double massAfter = AlphaSum(s);
+        // ① 质量守恒：模糊是线性滤波、核归一化，总覆盖率不该漂
+        CHECK_NEAR(massAfter, massBefore, 96.0 * 0.02, "BlurSigma 保持总覆盖率（模糊不改变面积）");
+        // ② σ 语义：10-90% 过渡宽度 ≈ 2.563σ（3 趟盒式近似，给 20% 容差）
+        const int w = StepWidth(s, 48);
+        const double want = 2.563 * sigma;
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+                      "BlurSigma(σ=%d)：10-90%% 过渡宽度 = %.2fσ 的像素宽度（实测 %d，期望≈%.1f）",
+                      sigma, w > 0 ? w / static_cast<double>(sigma) : 0.0, w, want);
+        CHECK(w > 0 && std::fabs(w - want) <= want * 0.2 + 1.0, msg);
+        // ③ 对称：边界两侧等距的两行覆盖率之和应当恒等于满覆盖率（a + b = 255）
+        const int above = s.row(47 - sigma)[48 * 4 + 3];
+        const int below = s.row(48 + sigma)[48 * 4 + 3];
+        std::snprintf(msg, sizeof(msg),
+                      "BlurSigma(σ=%d)：阶跃两侧 ±σ 覆盖率互补（%d + %d = 255）",
+                      sigma, above, below);
+        CHECK(std::abs(above + below - 255) <= 12, msg);
+    }
+
+    // ④ 单调：σ 越大过渡越宽
+    {
+        int prev = -1;
+        bool mono = true;
+        for (int sigma : kSteps) {
+            Surface s(96, 96);
+            {
+                Canvas c(s);
+                c.fillRect(Rect(0.0f, 0.0f, 96.0f, 48.0f), Paint::solid(Color::black()));
+            }
+            BlurSigma(s, static_cast<float>(sigma));
+            const int w = StepWidth(s, 48);
+            if (prev >= 0 && w <= prev) mono = false;
+            prev = w;
+        }
+        CHECK(mono, "BlurSigma：过渡宽度随 σ 单调增加");
+    }
+
+    // ⑤ 退化输入不动像素（σ=0 / 空图）
+    {
+        Surface s(16, 16);
+        {
+            Canvas c(s);
+            c.fillRect(Rect(0.0f, 0.0f, 16.0f, 8.0f), Paint::solid(Color::black()));
+        }
+        const double before = AlphaSum(s);
+        BlurSigma(s, 0.0f);
+        CHECK_NEAR(AlphaSum(s), before, 1e-9, "BlurSigma(0) 不动像素");
+        Surface empty;
+        BlurSigma(empty, 4.0f);   // 不该崩
+        CHECK(empty.empty(), "BlurSigma 对空图是空操作");
+    }
+
+    // ⑥ 旧的 Blur(radius) 行为不变：半径 1 的盒式只有 3 像素窗口
+    {
+        Surface s(32, 32);
+        {
+            Canvas c(s);
+            c.fillRect(Rect(0.0f, 0.0f, 32.0f, 16.0f), Paint::solid(Color::black()));
+        }
+        Blur(s, 1.0f);
+        const int w = StepWidth(s, 16);
+        CHECK(w > 0 && w <= 3, "Blur(radius=1) 仍是 3 像素窗口的盒式（半径语义没变）");
+    }
+}
+
 int main() {
     TestRoundedTile();
     TestStrokeCoverage();
@@ -686,5 +784,6 @@ int main() {
     TestStrokeWidth();
     TestMinifyPrefilter();
     TestGradientDither();
+    TestBlurSigma();
     return Bin2dTestSummary("test_raster");
 }

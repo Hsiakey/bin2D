@@ -1663,6 +1663,37 @@ void Blur(Surface& s, float radius) {
     BoxBlurCols(s, rad);
 }
 
+// 三趟盒式的高斯近似（σ 语义）。
+//
+// 半径怎么定：一趟半宽 r 的盒式（窗口 2r+1）方差是 r(r+1)/3，三趟方差相加就是
+// Σ r_i(r_i+1)/3，所以要让总 σ 等于目标，只需让 Σ r_i(r_i+1) ≈ 3σ²。
+// 半径是整数，最优解一定形如"n 趟 r + (3-n) 趟 r-1"，于是直接枚举这两种量。
+// 不做 Kutskir 那边框大小取整的 hack：这里 σ 是小数、半径也是小整数，
+// 枚举出来的实际 σ 与目标相差通常 <5%（σ=3 取 3/3/2 → 实际 3.16）。
+void BlurSigma(Surface& s, float sigmaPx) {
+    if (s.empty() || !(sigmaPx > 0.0f)) return;
+    if (sigmaPx < 0.5f) return;                     // 比半个像素还小的模糊看不出来
+    const float want = 3.0f * sigmaPx * sigmaPx;    // Σ r(r+1)
+    int bestR[3] = {1, 1, 1};
+    float bestErr = 1e30f;
+    for (int r = 1; r <= 96; ++r) {
+        for (int n = 0; n <= 3; ++n) {              // n 趟用 r，其余用 r-1
+            const int a = r, b = (r > 1) ? r - 1 : 1;
+            const float got = static_cast<float>(n * a * (a + 1) + (3 - n) * b * (b + 1));
+            const float err = std::fabs(got - want);
+            if (err < bestErr) {
+                bestErr = err;
+                for (int i = 0; i < 3; ++i) bestR[i] = (i < n) ? a : b;
+            }
+        }
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (bestR[i] < 1) continue;
+        BoxBlurRows(s, bestR[i]);
+        BoxBlurCols(s, bestR[i]);
+    }
+}
+
 // ------------------------------------------------------------
 // 覆盖率遮罩的模糊 / 合成（0.8.0：投影走这条）
 //
