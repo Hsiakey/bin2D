@@ -68,6 +68,18 @@ void GpuClearRect(GpuExec& gpu, const Rect& deviceRect, const Color& c) {
     gpu.fillRect(deviceRect, c);
 }
 
+void GpuStrokeRounded(GpuExec& gpu, const Rect& r, float radius, float thickness,
+                      const Color& c) {
+    // 矩形原样交给执行体：它的 SDF 环带是"从边界向内 thickness"，
+    // 正好等于 Canvas 那条 CPU 路径（外框内缩 t/2 + 居中描边 t）的外沿不变语义。
+    gpu.strokeRounded(r, radius, thickness, c);
+}
+
+bool GpuBackdropBlur(GpuExec& gpu, const Rect& area, float radius, float blurPx,
+                     float grain) {
+    return gpu.backdropBlur(area, radius, blurPx, grain);
+}
+
 void GpuDrawSurface(GpuExec& gpu, const Surface& src, const Rect& dst, const Rect& uv,
                     const Color& tint) {
     gpu.drawSurface(src, dst, uv, tint);
@@ -77,6 +89,8 @@ void GpuDrawNineSlice(GpuExec& gpu, const Surface& src, const Rect& dst, float l
                       float r, float b, const Color& tint) {
     gpu.drawNineSlice(src, dst, l, t, r, b, tint);
 }
+
+void GpuImageChanged(GpuExec& gpu, const Surface& src) { gpu.imageChanged(src); }
 
 bool GpuPushLayer(GpuExec& gpu, const Rect& localBounds, float alpha) {
     return gpu.pushLayer(localBounds, alpha);

@@ -157,6 +157,10 @@ void Canvas::clear(const Color& c) {
     }
 }
 
+void Canvas::imageChanged(const Surface& surface) {
+    if (gpu_) GpuImageChanged(*gpu_, surface);
+}
+
 RasterTarget Canvas::makeTarget() const {
     RasterTarget rt;
     rt.surface = target_;
@@ -212,6 +216,70 @@ void Canvas::strokePath(const Path& path, const Color& c, float width) {
     StrokeStyle st;
     st.width = width;
     strokePath(path, Paint::solid(c), st);
+}
+
+// 圆角矩形描边：两条执行体给的是**同一个视觉环**，但落像素的方式不同。
+//   · CPU：外圆角路径描边（厚度的中心线在内缩 t/2 的矩形上 ⇒ 外沿恰好是 r 的边界，
+//     向内 t）。这就是"外圆角矩形 + 内圆角矩形组成环"的等价写法，AA 与 strokePath
+//     同一套覆盖率；
+//   · GPU：执行体的 SDF 环带（|d + t/2| - t/2），一圈解析解，不做路径差集。
+// 半径退化（<=0）走四条矩形：与"环 = 四个 1px 宽的带"的老实现在像素上一致，
+// 而且避免给 0 半径建路径（addRoundedRect 会把它当折线）。
+void Canvas::strokeRounded(const Rect& r, float radius, float thickness, const Color& c) {
+    if (!target_ || r.empty() || thickness <= 0.0f) return;
+    RasterTarget rt = makeTarget();
+    if (rt.clip.empty()) return;
+    const float t = thickness;
+    const float in = t * 0.5f;
+    // 外框内缩半个线宽：描边的中心线在这里，外沿回到 r 的边界
+    const Rect outer(r.x + in, r.y + in, r.w - t, r.h - t);
+    const float rad = std::min(radius, std::min(r.w, r.h) * 0.5f) - in;
+    if (gpu_) {
+        // 执行体收**原矩形 + 原半径**：它自己把环带向内铺（见 GpuStrokeRounded）
+        syncGpu();
+        GpuStrokeRounded(*gpu_, r, radius, thickness, c);
+        return;
+    }
+    if (radius <= 0.0f) {
+        // 直角环：上 / 下 / 左 / 右四条。缺角由左右两条补齐（重叠区在 SrcOver 下
+        // 会叠两次 —— 这是既有口径，别"优化"成路径，像素会变）
+        const float ht = std::min(t, r.h);
+        FillRect(rt, Rect(r.x, r.y, r.w, ht), Paint::solid(c), deviceTransform());
+        FillRect(rt, Rect(r.x, r.y + r.h - ht, r.w, ht), Paint::solid(c), deviceTransform());
+        const float inner = std::max(0.0f, r.h - 2.0f * t);
+        if (inner > 0.0f) {
+            const float wt = std::min(t, r.w);
+            FillRect(rt, Rect(r.x, r.y + t, wt, inner), Paint::solid(c), deviceTransform());
+            FillRect(rt, Rect(r.x + r.w - wt, r.y + t, wt, inner), Paint::solid(c),
+                     deviceTransform());
+        }
+        return;
+    }
+    if (outer.w <= 0.0f || outer.h <= 0.0f) return;
+    if (rad <= 0.0f) {
+        // 环厚度吃掉了整个圆角：退化成内缩后的实心矩形（与路径描边的极限一致）
+        FillRect(rt, outer, Paint::solid(c), deviceTransform());
+        return;
+    }
+    Path path;
+    path.addRoundedRect(outer, rad);
+    StrokeStyle style;
+    style.width = t;
+    style.roundCap = false;
+    style.squareCap = false;
+    style.roundJoin = true;
+    StrokePath(rt, path, Paint::solid(c), style, deviceTransform());
+}
+
+bool Canvas::backdropBlur(const Rect& area, float radius, float blurPx, float grain) {
+    // CPU 执行体不实现：Surface 上没有"已经画过的中间态"可供回过头去糊。
+    // 上层（binUI）自己有一份 CPU 实现，这条返回 false 就是让位给它。
+    if (!gpu_) return false;
+    if (!target_ || area.empty() || !(blurPx > 0.0f)) return false;
+    RasterTarget rt = makeTarget();
+    if (rt.clip.empty()) return false;
+    syncGpu();
+    return GpuBackdropBlur(*gpu_, area, radius, blurPx, grain);
 }
 
 void Canvas::drawImage(const Image& image, const Rect& dstLocal, const Rect& srcUv,
@@ -334,6 +402,11 @@ void Canvas::compositeSurface(const Surface& surface, int originX, int originY, 
 
 void Canvas::popLayer() {
     if (gpu_) {
+        // 出层前的合成是一次**真实的绘制**：它必须按**当前**（已出层的）裁剪落像素。
+        // 不 syncGpu 的后果实测过：层内最后一笔的 clip 留在执行体里，层合成被裁成
+        // 那一小块 —— 表现是"图层内容只剩最后画的那个子元素，盒子本身没了"
+        // （binUI 的 opacity 页面整片白，就是这么来的）。
+        syncGpu();
         GpuPopLayer(*gpu_);
         return;
     }

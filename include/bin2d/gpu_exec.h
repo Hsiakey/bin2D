@@ -84,6 +84,29 @@ public:
     bool present();               // 窗口：把 canvas 贴到交换链并 frame_end；HEADLESS：同上
     bool readback(Surface& out);  // present 之后拿像素（预乘 Surface）
 
+    // ---- 帧节拍（0.22.2）：**knob 在这里，闸门在 binGPU** ----
+    //
+    // 与 GpuCompositor 的那一组**逐字同构**（见 bin2d/gpu.h 的说明）：这一层只是把
+    // "这个画布最多一秒出多少帧"的策略往下传，"现在离下一拍还差多久"往上要。
+    // 分家会出第二份节拍逻辑，所以这里一条都没自己算。
+    //
+    //   · setPacePolicy 要在 create() **之前**调：交换链的垂直同步位是建链时定的，
+    //     而"要跑得比刷新快"（unlimited / 240）必须关掉 vsync —— 建完链再改就得重建。
+    //   · paceFrameBegin 由外壳在自己的 beginFrame 里调（锚点 = 帧开始，不是 present
+    //     开始，否则外壳量到的帧间隔会跟着绘制耗时抖）。
+    //   · present() 里**自己会收尾**（锚点没开过就补一次 frame_begin），所以外壳在
+    //     present 之后那次 paceFrameEnd 是空操作 —— 见 gpu_exec.cpp 里的守卫。
+    bool setPacePolicy(BgpuPacePolicy policy);
+    BgpuPacePolicy pacePolicy() const;
+    double paceFrameMs() const;          // 0 = 不掐拍
+    int64_t paceWaitUs() const;          // 现在离下一拍还差多少微秒；0 = 立刻能画
+    void paceFrameBegin();
+    void paceFrameEnd(double presentMs);
+    bool paceWantsVsync() const;
+    int displayRefreshHz() const;        // 0 = 探测不到
+    double paceRefreshMs() const;        // 0 = 探测不到
+    bool presentPacesFrames() const;     // present 会不会自己掐拍（问交换链）
+
     // ---- 状态 ----
     void setTransform(const Transform& xf);   // 单位阵时走"轴对齐快路"
     const Transform& transform() const;
@@ -114,6 +137,13 @@ public:
     void texUpload(uint64_t tex, const Rect& box, const uint8_t* pixels, uint32_t stride);
     void texDestroy(uint64_t tex);
     void drawTexture(uint64_t tex, const Rect& dst, const Rect& uv, const Color& tint);
+
+    // 这张 Surface 的像素被**原地改过**了（字形图集 / 阴影图集往里贴新格子）。
+    // drawSurface 的纹理缓存键是"像素指针 + 尺寸"（bin2d 的 Surface 没有代概念），
+    // 原地改像素不会改指针 ⇒ 不通知的话 GPU 一直采样**修改前**的那份纹理，
+    // 表现是"文字画成了上一批字形的样子/位置"（接线时实测到）。
+    // 调用方在写完像素之后调一次；句柄所有权不变（这里只丢缓存条目）。
+    void imageChanged(const Surface& src);
 
     // ---- 图层（组透明度）与毛玻璃 ----
     bool pushLayer(const Rect& localBounds, float alpha);
@@ -183,11 +213,14 @@ private:
 
     // drawSurface 的纹理缓存：bin2d 的 Surface 没有"代"概念，所以键就是
     // 像素指针 + 尺寸（见 gpu_exec.cpp 里 surfaceTexture 的注释）。
+    // dirty = 像素被原地改过：下次用之前**重传进同一张纹理**（不销毁句柄 ——
+    // 帧内销毁会被已经录进命令缓冲的那几笔引用着）。
     struct ImgEntry {
         const uint8_t* key = nullptr;
         int w = 0;
         int h = 0;
         BgpuTexture tex = 0;
+        bool dirty = false;
     };
 
     // ============================================================
@@ -208,6 +241,10 @@ private:
     int height_ = 0;
     BgpuBackendKind backend_ = BGPU_BACKEND_AUTO;
     std::string error_;
+    // 帧节拍：pacer 的状态全在 binGPU（它知道刷新率 / present mode / present 耗时），
+    // 这里只存一份策略与探测到的刷新周期。create() 里 init，destroy() 里复位。
+    BgpuPacer pace_{};
+    double refreshMs_ = 0.0;   // 建链时探到的刷新周期；0 = 探测不到（按 60 算）
 
     // ============================================================
     // 帧 / pass
@@ -267,6 +304,11 @@ private:
     void noteError(const char* text);
 
     BgpuTexture makeTexture(int w, int h, uint32_t flags, const void* data, uint32_t stride);
+    // 图元纹理的建/传要**在 pass 外面**做（binGPU 的 texture_create/upload 会重置
+    // 当前 pass 的 viewport / scissor / affine，插在 begin_render 之间会让之后的图元
+    // 按默认视口落像素）。这两个封装负责 flush + endPass + 传完重新 begin。
+    BgpuTexture makeImageTexture(int w, int h, const uint8_t* pixels, uint32_t stride);
+    bool reuploadImageTexture(BgpuTexture tex, const uint8_t* pixels, uint32_t stride);
     BgpuTexture whiteTexture();
     BgpuTexture ensureNoise();
     BgpuTexture surfaceTexture(const Surface& src);

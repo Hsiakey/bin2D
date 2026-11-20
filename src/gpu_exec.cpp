@@ -24,7 +24,9 @@
 #include "bin2d/gpu_exec.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #include "bin2d/gpu.h"   // ToBgpuBlend：混合模式的**唯一**映射处（别再抄一份）
@@ -122,6 +124,17 @@ bool IdentityXf(const float x[6]) {
            x[5] == 0.0f;
 }
 
+// 节拍用的时钟（与 gpu.cpp 的 PaceNowUs 同一份口径）：单调、与墙钟无关。
+// 只在 present 前后各读一次 —— 不是热循环里的逐调用计时，所以"这台机器一次 now()
+// 要 ~40µs"（见 binUI 的 docs/frame_pacing.md）不影响这里。
+// MinGW / MSVC 的 steady_clock 就是 QPC（perf counter），所以 presentMs 量的是
+// "从 canvas 贴到交换链到 frame_end 返回"那一段真实墙钟。
+int64_t PaceNowUs() {
+    using namespace std::chrono;
+    static const auto epoch = steady_clock::now();
+    return duration_cast<microseconds>(steady_clock::now() - epoch).count();
+}
+
 } // namespace
 
 // ============================================================
@@ -157,6 +170,11 @@ void GpuExec::noteError(const char* text) {
 
 bool GpuExec::create(void* window, int width, int height, BgpuBackendKind backend,
                      bool vsync) {
+    // 节拍策略是调用方在 create **之前**设的（setPacePolicy 会先 init 一份 pacer）；
+    // destroy() 会把它清掉，所以先记住再重建 —— 与 GpuCompositor::createInternal 同一条。
+    const int savedPolicy = pace_.struct_size == sizeof(BgpuPacer)
+                                ? pace_.policy
+                                : static_cast<int>(BGPU_PACE_STANDARD);
     destroy();
     if (width <= 0 || height <= 0) {
         error_ = "create: 尺寸非法";
@@ -166,6 +184,17 @@ bool GpuExec::create(void* window, int width, int height, BgpuBackendKind backen
     height_ = height;
     backend_ = backend;
     const bool headless = (window == nullptr);
+
+    // 节拍器先起来：交换链的垂直同步位要按**策略**决定，建完链再改就得重建。
+    // 策略要跑得比刷新快（unlimited / 240）时 vsync 必须关掉，否则 present 会把
+    // 帧率钉在刷新率上，"240 fps" 就是一句空话。
+    bingpu_pace_init(&pace_, window);
+    bingpu_pace_set_policy(&pace_, static_cast<BgpuPacePolicy>(savedPolicy));
+    {
+        const int hz = pace_.refresh_hz;
+        refreshMs_ = hz > 1 ? 1000.0 / static_cast<double>(hz) : 0.0;
+        if (!headless && vsync && !bingpu_pace_wants_vsync(&pace_)) vsync = false;
+    }
     // headless 后端没有呈现路径，VSYNC 位对它们没有意义（传了也会被忽略）
     const uint32_t vsyncFlag =
         (vsync && !headless) ? static_cast<uint32_t>(BGPU_DEVICE_VSYNC) : 0u;
@@ -349,6 +378,10 @@ void GpuExec::destroy() {
     layerStack_.clear();
     blur_ = BlurChain{};
     error_.clear();
+    // 节拍器：设备没了，"下一拍"也就没有意义。复位成零初始化（struct_size==0），
+    // 下一次 create 会按上面的 savedPolicy 重新 init + 灌策略。
+    pace_ = BgpuPacer{};
+    refreshMs_ = 0.0;
 }
 
 // ============================================================
@@ -413,6 +446,35 @@ bool GpuExec::ensureCanvas() {
     canvas_ = makeTexture(width_, height_, BGPU_TEXTURE_RENDER_TARGET, nullptr, 0);
     canvasUndefined_ = true;
     return canvas_ != 0;
+}
+
+// 图元纹理专用：建 / 传都挪到 pass 外面（理由见头文件里的注释）。
+// 目标与尺寸在挂起前记下来，传完用 clear=false 重新 begin —— 内容原地保留。
+BgpuTexture GpuExec::makeImageTexture(int w, int h, const uint8_t* pixels,
+                                      uint32_t stride) {
+    const BgpuTexture target = passTarget_;
+    const int tw = passW_, th = passH_;
+    const bool resume = inPass_ && target != 0;
+    if (resume) endPass();
+    BgpuTexture tex = makeTexture(w, h, BGPU_TEXTURE_DYNAMIC | BGPU_TEXTURE_PREMULTIPLIED,
+                                  pixels, stride);
+    if (resume) beginPass(target, tw, th, false, 0u);
+    return tex;
+}
+
+bool GpuExec::reuploadImageTexture(BgpuTexture tex, const uint8_t* pixels,
+                                   uint32_t stride) {
+    const BgpuTexture target = passTarget_;
+    const int tw = passW_, th = passH_;
+    const bool resume = inPass_ && target != 0;
+    if (resume) endPass();
+    const BgpuResult r = bingpu_texture_upload(tex, nullptr, pixels, stride);
+    if (resume) beginPass(target, tw, th, false, 0u);
+    if (r != BGPU_OK) {
+        fail("bingpu_texture_upload(image)", r);
+        return false;
+    }
+    return true;
 }
 
 void GpuExec::beginPass(BgpuTexture target, int tw, int th, bool clear,
@@ -539,14 +601,26 @@ bool GpuExec::present() {
     flushAll();
     endPass();
 
+    // 节拍锚点：外壳通常在 beginFrame 里 paceFrameBegin 过；没开过就在这里补一次
+    // （退化成 "present 起点" 的锚点，仍然能用 —— 见 bin2d/gpu.h 里那段说明）。
+    if (pace_.frame_open == 0) bingpu_pace_frame_begin(&pace_, PaceNowUs());
+    // present 耗时要单独量（不含绘制）：它是"present 到底有没有在等垂直同步"的判据，
+    // 也是相位锚点选哪种算法（end 起算 / start 起算）的输入。
+    const int64_t t0 = PaceNowUs();
+
     // 窗口与 HEADLESS 都走这一步：binGPU 的 frame_read 读的是**交换链那一帧**，
     // 所以"想读回像素"和"想上屏"是同一件事 —— 不贴上去，readback 拿到的是空目标。
     const bool blitOk = blitCanvasToTarget();
     if (!blitOk) noteError("present: canvas → 交换链失败");
 
     const BgpuResult r = bingpu_frame_end(swapchain_, cmd_);
+    const int64_t t1 = PaceNowUs();
     inFrame_ = false;
     scTarget_ = 0;
+    // 一帧只收尾一次：present 是这条路的唯一收口（外壳随后的 paceFrameEnd 会是空操作，
+    // 见上面那个函数里的守卫）。两次 frame_end 会把 last_frame_ms 抹成 0、把下一拍
+    // 的相位算错 —— 那正是"节拍看起来在跑，帧率却钉不住"的来源。
+    bingpu_pace_frame_end(&pace_, t1, static_cast<double>(t1 - t0) / 1000.0);
     if (r != BGPU_OK) {
         fail("bingpu_frame_end", r);
         return false;
@@ -580,6 +654,46 @@ bool GpuExec::readback(Surface& out) {
     }
     return true;
 }
+
+// ============================================================
+// 帧节拍（knob 在 bin2d，闸门在 binGPU）
+// 与 GpuCompositor 的那一组逐字同构：这边一条节拍算术都没有，全是转发。
+// ============================================================
+
+bool GpuExec::presentPacesFrames() const {
+    if (!swapchain_) return false;
+    BgpuSwapchainInfo info{};
+    info.struct_size = sizeof(info);
+    if (bingpu_swapchain_info(swapchain_, &info) != BGPU_OK) return false;
+    return info.present_paces_frames != 0;
+}
+
+bool GpuExec::setPacePolicy(BgpuPacePolicy policy) {
+    if (pace_.struct_size != sizeof(BgpuPacer)) bingpu_pace_init(&pace_, nullptr);
+    const BgpuResult r = bingpu_pace_set_policy(&pace_, policy);
+    if (r != BGPU_OK) {
+        fail("bingpu_pace_set_policy", r);
+        return false;
+    }
+    return true;
+}
+
+BgpuPacePolicy GpuExec::pacePolicy() const { return bingpu_pace_policy(&pace_); }
+double GpuExec::paceFrameMs() const { return bingpu_pace_frame_ms(&pace_); }
+int64_t GpuExec::paceWaitUs() const { return bingpu_pace_wait_us(&pace_, PaceNowUs()); }
+void GpuExec::paceFrameBegin() { bingpu_pace_frame_begin(&pace_, PaceNowUs()); }
+
+void GpuExec::paceFrameEnd(double presentMs) {
+    // present() 已经收过尾的那一帧再收一次会把 last_frame_ms 抹成 0、把下一拍的相位
+    // 算到"本拍结束"上（等于指针一帧都没掐）。外壳按 "present() → paceFrameEnd(ms)"
+    // 的顺序调是**预期用法**，所以这里必须认得出"已经收尾了"。
+    if (pace_.struct_size == sizeof(BgpuPacer) && pace_.frame_open == 0) return;
+    bingpu_pace_frame_end(&pace_, PaceNowUs(), presentMs);
+}
+
+bool GpuExec::paceWantsVsync() const { return bingpu_pace_wants_vsync(&pace_) != 0; }
+int GpuExec::displayRefreshHz() const { return pace_.refresh_hz > 1 ? pace_.refresh_hz : 0; }
+double GpuExec::paceRefreshMs() const { return refreshMs_; }
 
 // ============================================================
 // 状态
@@ -1151,6 +1265,17 @@ BgpuSampler GpuExec::samplerFor(BgpuTexture tex) const {
     return sampLinear_;
 }
 
+// 原地改像素之后作的废：**只打脏标记**，不销毁句柄。
+// 帧内销毁会被已经录进命令缓冲的图元引用着（Vulkan 上表现为"上一笔采样到别的内容"）；
+// 而重传进同一张纹理既保住句柄、又让后面的笔看到新内容 —— 见 surfaceTexture。
+void GpuExec::imageChanged(const Surface& src) {
+    if (!device_ || src.empty()) return;
+    const uint8_t* key = src.pixels().data();
+    for (ImgEntry& e : imgCache_) {
+        if (e.key == key && e.w == src.width() && e.h == src.height()) e.dirty = true;
+    }
+}
+
 // ============================================================
 // 纹理缓存（drawSurface）
 // ============================================================
@@ -1159,21 +1284,33 @@ BgpuTexture GpuExec::surfaceTexture(const Surface& src) {
     if (!device_ || src.empty()) return 0;
     // bin2d 的 Surface 没有"代/版本"这个概念，所以缓存键只能是像素指针 + 尺寸。
     // 口径与 DisplayList 一致：**图片被认为不变**（列表里存的是 const Surface*）。
-    // 内容会变的场景（视频帧）请用 texCreate/texUpload 自己管句柄。
+    // 内容会变的场景（字形图集 / 视频帧）有两条路：
+    //   · 每次改完调 imageChanged()（帧内增量更新，见下）；
+    //   · 或者干脆用 texCreate/texUpload 自己管句柄。
     const uint8_t* key = src.pixels().data();
-    for (const ImgEntry& e : imgCache_)
-        if (e.key == key && e.w == src.width() && e.h == src.height()) return e.tex;
+    for (ImgEntry& e : imgCache_) {
+        if (e.key != key || e.w != src.width() || e.h != src.height()) continue;
+        if (e.dirty) {
+            // 原地改过的像素：**重传进同一张纹理**。不销毁重建是刻意的 ——
+            // 帧内销毁的句柄可能还被已经录进命令缓冲的图元引用着（Vulkan 上表现为
+            // "上一笔采样到别的内容"，实测就是字形串格）。上传要挂在 pass 外面做。
+            flushAll();
+            if (!reuploadImageTexture(e.tex, src.pixels().data(),
+                                      static_cast<uint32_t>(src.stride())))
+                return 0;
+            e.dirty = false;
+        }
+        return e.tex;
+    }
     if (imgCache_.size() >= kMaxImgCache) {
         flushAll();   // 批次里可能还引用着被淘汰的那张
         bingpu_texture_destroy(device_, imgCache_.front().tex);
         imgCache_.erase(imgCache_.begin());
     }
-    BgpuTexture tex = makeTexture(src.width(), src.height(),
-                                  BGPU_TEXTURE_DYNAMIC | BGPU_TEXTURE_PREMULTIPLIED,
-                                  src.pixels().data(),
-                                  static_cast<uint32_t>(src.stride()));
+    BgpuTexture tex = makeImageTexture(src.width(), src.height(), src.pixels().data(),
+                                       static_cast<uint32_t>(src.stride()));
     if (!tex) return 0;
-    imgCache_.push_back(ImgEntry{key, src.width(), src.height(), tex});
+    imgCache_.push_back(ImgEntry{key, src.width(), src.height(), tex, false});
     return tex;
 }
 

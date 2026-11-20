@@ -3,6 +3,51 @@
 本文件记录 bin2d 的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.22.2] - 2026-11-20
+
+**把 GPU 执行体补成"UI 框架能直接挂上去"的样子**。0.22.0 的执行体够画一张图，但不够跑
+一个界面：binUI 一 `attachGpu` 就掉三样东西，另加两个只有真跑起来才会暴露的 bug。
+
+补的三条原语（都在 `Canvas` 上，CPU / GPU 两个执行体各自兑现，语义一份）：
+
+- `strokeRounded(r, radius, thickness, c)` —— **圆角矩形环**。界面里几乎每条边框
+  （焦点圈、卡片边、输入框）都是它，以前一律写成 `strokePath(addRoundedRect(…))`，
+  而执行体对任意路径描边只有一句告警后跳过 ⇒ 挂上 GPU 之后**所有圆角边框整片消失**。
+  GPU 侧用执行体的圆角 SDF 直接给一圈解析环带（`bingpu_cmd_draw_shapes` + thickness，
+  厚度向内），CPU 侧仍然走"外圆角 + 内圆角"的路径覆盖 —— 弧上的 AA 差几级是
+  8 子采样扫描线与距离场的**定义差**，不是 bug。
+- `imageChanged(surface)` —— 这张 Surface 的像素被**原地改过**（字形图集 / 阴影图集
+  往同一块里贴新格子）。执行体的贴图缓存键是"像素指针 + 尺寸"，原地改像素不改指针
+  ⇒ 不通知就一直采样**修改前**的内容（实测表现：文字画成上一批字形的样子、串格）。
+  实现是重传进**同一张**纹理而不是销毁重建：帧内销毁会被已经录进命令缓冲的那几笔
+  引用着；而且建/传都挪到 render pass **外面**（binGPU 的 texture 命令会重置当前
+  pass 的 viewport / scissor / affine，插在 begin_render 中间会让之后的图元按默认视口
+  落像素，表现是"内容全跑到左上角"）。CPU 执行体里是空操作，调用方不用分支。
+- `backdropBlur(area, radius, blurPx, grain)` —— 把这块面积里**已经画过的背景**糊掉
+  （Replace，不是叠一层）。CPU 执行体返回 **false**：Surface 上没有"已画过的中间态"
+  这种概念，硬做只会多一份会慢慢漂移的实现；GPU 侧转执行体的
+  抓背景 → 2× 降采样 → 分离高斯 → 圆角遮罩。
+
+**节拍**：`GpuExec` 补上 `setPacePolicy / pacePolicy / paceFrameMs / paceWaitUs /
+paceFrameBegin / paceFrameEnd / paceWantsVsync / refreshHz / paceRefreshMs /
+presentPacesFrames`，与 `GpuCompositor` 那一组**逐字同构**。判据仍然只在 binGPU
+（`bingpu_pace_*` 知道刷新率、present mode、present 耗时），这一层只传策略、问"下一拍
+还差多久"。策略要跑得比刷新快时，`create()` 里必须先把 vsync 位关掉再建链 ——
+建完再改就得重建。
+
+两个 bug（都是接线时实测到的，不修就是整页坏）：
+
+- `Canvas::popLayer` 在 GPU 模式下没有 `syncGpu()`：层合成会被层内最后一笔的裁剪裁掉，
+  表现是"组透明度图层的盒子本身整片消失"（`opacity` 页差异 43% → 0）；
+- 上面那个脏标记。修掉之后 `probe` / `radius-matrix` / `svggrad` / `svgstroke` 的
+  最大通道差从 100+ 压到 ≤5，`svgaa` / `svgjoin` 压到 ≤21。
+
+窄接口（`canvas_gpu.h`）从 7 个函数长到 9 个，仍然只有前置声明 + `gpu_exec.cpp` 里
+的实现 —— `canvas.cpp` 继续**不 include** `bingpu.h`，没构建 binGPU 时 bin2d 照样编过。
+
+binUI 挂在执行体上的实测（60 帧中位数，vsync 关）：`appshow` 1280×800
+8.88 ms → **0.74 ms**，`buttonshow` 1020×684 9.07 ms → **0.68 ms**。
+
 ## [0.22.1] - 2026-11-20
 
 **修 `make all` 的链接**：`libbin2d.a` 里现在有 GPU 执行体（`canvas_gpu.o` → `gpu_exec.o`），

@@ -92,6 +92,18 @@ public:
         st.width = width;
         strokePath(path, paint, st);
     }
+    // 圆角矩形描边（0.22.2）—— **环的解析解只在 GPU 上有**。
+    //
+    // 存在的理由：UI 里几乎每一条边框都是"圆角矩形环"（焦点圈、卡片边、输入框）。
+    // 以前那类调用一律走 `strokePath(addRoundedRect(...))`，而 GPU 执行体对任意路径
+    // 描边只有一句"不支持"的告警 —— 挂上 GPU 之后**所有圆角边框会整片消失**。
+    // 所以这里把"环"提升成一条原语：
+    //   · CPU 执行体：外圆角矩形 + 内圆角矩形组成环（= 外框路径描边），走路径覆盖，
+    //     与 strokePath 逐像素同一套 AA；
+    //   · GPU 执行体：执行体的圆角 SDF 直接给一圈解析环带，**不是**两条路径相减。
+    // 两条路的几何口径相同（外沿 = r 的边界、厚度向内），弧上的 AA 会差几级：
+    // 这是"8 子采样扫描线 vs 距离场"的定义差，不是 bug。
+    void strokeRounded(const Rect& r, float radius, float thickness, const Color& c);
     void drawImage(const Image& image, const Rect& dstLocal,
                    const Rect& srcUv = Rect(0, 0, 1, 1),
                    const Color& tint = Color::white(),
@@ -111,6 +123,12 @@ public:
                            const Color& tint = Color::white(),
                            ImageFilter filter = ImageFilter::Linear);
 
+    // 这张 Surface 的像素被**原地改过**了（字形图集往里贴新格子 / 视频帧换内容）。
+    // drawSurface 在 GPU 执行体里按"像素指针 + 尺寸"缓存纹理，原地改像素不改指针，
+    // 不通知就一直采样旧内容（表现是文字画成了上一批字形）。CPU 执行体没有缓存，
+    // 这里是空操作 —— 所以调用方不用判断执行体是哪个。
+    void imageChanged(const Surface& surface);
+
     // ---- 覆盖率遮罩合成（设备空间，不经过当前变换）----
     // 把一张 0..255 的覆盖率罩按 color 合成到当前目标；受当前裁剪 / 路径遮罩 / 混合模式
     // 约束。投影的第二半（模糊后的 alpha 罩）走这里：1 字节/像素，不进颜色管线。
@@ -125,6 +143,19 @@ public:
                    BlendMode blend = BlendMode::SrcOver);
     void popLayer();
     int layerDepth() const { return static_cast<int>(layers_.size()); }
+
+    // ---- 毛玻璃（backdrop-filter）----
+    // area 是**局部坐标**矩形（与 clipRect 同一条近似：按当前变换映射成屏幕包围盒）。
+    // 语义：把这块面积的**已经画过的背景**糊掉（Replace，不是叠一层），圆角按 radius
+    // 裁成覆盖率，grain 是叠上去的确定性颗粒。
+    //
+    // 为什么要走 Canvas 而不是让上层自己做：
+    //   · GPU 执行体那边的整条链（抓背景 → 2× 降采样 → 分离高斯 → 圆角遮罩）只有它
+    //     手上有"当前目标"，上层拿到的是 Surface，抓不到纹理上的背景；
+    //   · CPU 执行体**不实现**这条（返回 false）：CPU 侧的毛玻璃是上层的活，bin2d 的
+    //     Surface 上没有"已经画过的中间态"这种概念，硬做只会多一份会漂移的实现。
+    // 所以返回值是契约的一部分：false = 这次调用什么都没发生，调用方走自己那条路。
+    bool backdropBlur(const Rect& area, float radius, float blurPx, float grain);
 
     // ---- 离屏内容（0.9.0：Scene 的子树缓存用）----
     // 与 pushLayer/popLayer 同一套坐标与裁剪语义，区别只在出口：
@@ -155,12 +186,13 @@ public:
     // 9.3~9.8 ms/帧（1020×684 / 1280×800），GPU 执行体 2.7 ms/帧 —— 而其中 2.4 ms
     // 还是上层节点树遍历，**光栅那一段是 20 倍以上**。
     //
-    // 边界（0.22.0）：
+    // 边界（0.22.2）：
     //   · target() 只用来回答 bounds()/尺寸 —— 挂上期间它的像素**不会被写**；
     //   · pushOffscreen / popOffscreen 在 GPU 模式下返回 false（那套 API 的出口是
     //     Surface，GPU 侧不该把像素拿回 CPU）；
     //   · 路径（fillPath/clipPath/strokePath 的任意路径）仍然走 CPU 覆盖率——GPU 侧
-    //     没有三角化；但**圆角矩形/直线/图片/渐变**这些 UI 里 95% 的图元都在 GPU 上。
+    //     没有三角化；但**圆角矩形/圆角描边/直线/图片/渐变/毛玻璃**这些 UI 里 99% 的
+    //     图元都在 GPU 上（圆角描边是 0.22.2 补的，见 strokeRounded 的注释）。
     bool attachGpu(GpuExec* exec);
     bool gpuAttached() const { return gpu_ != nullptr; }
     GpuExec* gpu() const { return gpu_; }
