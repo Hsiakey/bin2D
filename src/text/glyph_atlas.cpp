@@ -167,7 +167,7 @@ struct Atlas::Impl {
 
     struct GlyphAtlasPage {
         uint64_t tex = 0;
-        int sizePx = 1024;
+        int sizePx = 512;
         int cellW = 0, cellH = 0;
         int cols = 0;
         int next = 1;             // 格子 0 保留给"纯色"（见 rasterGlyph 的空白字形分支）
@@ -191,7 +191,7 @@ struct Atlas::Impl {
 
     struct ColorAtlasPage {
         uint64_t tex = 0;
-        int sizePx = 1024;
+        int sizePx = 512;
         int cellW = 0, cellH = 0;
         int cols = 0;
         int next = 0;
@@ -209,7 +209,7 @@ struct Atlas::Impl {
     };
     struct ShadowAtlasPage {
         uint64_t tex = 0;
-        int sizePx = 1024;
+        int sizePx = 512;
         int cell = 0;        // 格子边长 = 基础字形格 + 2*pad
         int pad = 0;         // 每边外扩的模糊余量（像素）
         int cols = 0;
