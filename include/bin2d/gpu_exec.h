@@ -232,16 +232,37 @@ private:
         float xf[6] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f};   // set_affine 的参数
     };
 
+    // 层目标**按层框尺寸分配**（0.22.8）。以前是整窗尺寸：一页 10 层 + 14 条阴影
+    // 就是 24 次全窗 clear + 24 次全窗 resolve（1080p 上每次 ≈5 MB 写 + 1.2 MB 读），
+    // 实测把 svg-filter 那页压到 11.4 ms/帧。层框通常只有几百像素见方，
+    // 显存与 clear 带宽都该跟着元素走。
+    //
+    // tex 的尺寸是"层框夹进窗口后按 kLayerAlign 向上对齐"的结果：对齐是为了让池子
+    // 有命中的机会（每帧新建纹理比多清几个像素贵得多）。
     struct LayerTarget {
         BgpuTexture tex = 0;
+        int w = 0;   // 纹理宽（≥ 层框，按 kLayerAlign 对齐）
+        int h = 0;
         bool inUse = false;
     };
 
+    // 一层在屏幕（设备）空间里的几何，三套数是**不同用途**，别合并：
+    //   · x/y/w/h  —— mapBounds(localBounds) 的浮点矩形，**不夹窗口**。
+    //                 出层合成时用它当四边形几何（与旧版整窗层逐像素同一位置：
+    //                 小数边缘靠 4× MSAA 的覆盖率抗锯齿，取整就把那几列像素改了）。
+    //   · ox/oy/lw/lh —— 夹进窗口后的**整数**像素区 = 这张层纹理真正覆盖的屏幕区域。
+    //                 层内绘制的 scissor 就是它（与旧版"层框 floor/ceil 后夹窗口"同界），
+    //                 层目标坐标 = 屏幕坐标 - (ox, oy)。
+    //   · tw/th —— 纹理尺寸（≥ lw/lh，对齐后的）。合成/取样用它算 u/v。
     struct LayerFrame {
         int idx = -1;
-        float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f;   // 屏幕（设备）矩形
+        float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f;   // 屏幕（设备）矩形（不夹）
+        int ox = 0, oy = 0;                             // 层纹理原点（屏幕像素）
+        int lw = 0, lh = 0;                             // 覆盖的屏幕像素区尺寸
+        int tw = 0, th = 0;                             // 纹理尺寸
         float alpha = 1.0f;
         BgpuTexture prevTarget = 0;
+        int prevOx = 0, prevOy = 0, prevTw = 0, prevTh = 0;   // 出层要回到的那个 pass
         bool content = false;   // true = 内容层（popContentLayer 的出口，不合成）
     };
 
@@ -330,6 +351,11 @@ private:
     BgpuTexture scTarget_ = 0;      // 本帧借来的交换链目标（不许 destroy）
     BgpuTexture passTarget_ = 0;
     int passW_ = 0, passH_ = 0;
+    // 当前目标在**屏幕**坐标里的原点（层目标专用，画布/交换链恒 0）。
+    // 层内绘制的坐标换算只有这一处：顶点仍是屏幕坐标，仿射里减掉层原点
+    // （binGPU 的仿射作用在 viewport 映射**之后**，所以减法是"左乘平移"，
+    // 见 activeAffine()）。scissor 同步减掉它。
+    int passOx_ = 0, passOy_ = 0;
     BgpuTexture canvas_ = 0;        // 窗口大小的持久画布
     // 内部 pass（图层合成 / 毛玻璃 / 贴屏）：忽略调用方的变换与裁剪栈，
     // 用整目标裁剪 + 单位阵。它画的四边形不计入 Stats（那是实现成本，不是图元数）。
@@ -362,17 +388,26 @@ private:
     // ============================================================
     // 图层 / 毛玻璃 / 纹理
     // ============================================================
-    static constexpr int kMaxLayers = 4;
+    static constexpr int kMaxLayers = 4;      // 嵌套**深度**上限（层栈）
+    // 层池的复用粒度（纹理尺寸向上对齐的步长）在 src/gpu_exec.cpp 里：
+    // 64 px —— 太小则复用不命中（每帧新建纹理），太大则小层白清一片。
+    // 池子兜底：最多留这么多张、合计不超过这么多字节。超了就把最大的一张
+    // 挂 pendingFree_ 让位（**不在帧中途销毁**，见 pendingFree_ 的说明）。
+    static constexpr size_t kMaxLayerTargets = 16;
+    static constexpr size_t kMaxLayerBytes = 48u * 1024u * 1024u;
     std::vector<LayerTarget> layerPool_;
     std::vector<LayerFrame> layerStack_;
+    size_t layerPoolBytes() const;
     BlurChain blur_;
     // 活着的**内容层**句柄（pop 之后、release 之前）。句柄 id 单调递增，
     // 不与层池下标混用：池子只有一个，而句柄可能有多个同时在外面（阴影要从同一份
     // 内容上贴好几趟）。
     struct ContentEntry {
         uint64_t id = 0;
-        int idx = -1;
-        Rect screen;
+        int idx = -1;      // 层池下标（-1 = 内容整块在窗口外，没分配纹理）
+        Rect screen;       // 内容在设备像素空间的矩形（**没夹窗口**，与旧版同一口径）
+        int ox = 0, oy = 0; // 层目标原点（屏幕像素）
+        int tw = 0, th = 0; // 层纹理尺寸（算 u/v 用）
     };
     std::vector<ContentEntry> contentStack_;
     uint64_t nextContentId_ = 1;
@@ -381,12 +416,18 @@ private:
     // 而"帧中途销毁还会被命令缓冲引用的纹理"是 0.22.3 明令禁止的事 —— 一页几十个
     // 尺寸不同的阴影要是共用一条链，每帧就是几十次销毁重建（踩过三次的坑）。
     // 这里换尺寸时旧纹理挂 pendingFree_（下一帧 frame_begin 之后才真正释放）。
+    //
+    // **上限必须大于"一页里不同尺寸的阴影/模糊"的个数**（0.22.8 实测）：池满会
+    // 每帧顶掉一条链并重建它的纹理，而"帧中途建一张渲染目标"会等一次 GPU 排空 ——
+    // svg-filter 那页 14 条链、上限 12 时每帧 2 次重建 = 11.25 ms；上限调到 32
+    // 之后同一页 **3.59 ms**（同一份代码、同一次测量）。所以这里给 32：
+    // 一页里真正"尺寸各不相同"的模糊通常是个位数到十几个，32 足够不踩线。
     struct ContentBlur {
         int w = 0;
         int h = 0;
         BlurChain chain;
     };
-    static constexpr size_t kMaxContentBlur = 12;
+    static constexpr size_t kMaxContentBlur = 32;
     std::vector<ContentBlur> contentBlur_;
     BlurChain* acquireContentBlur(int w, int h);
     void destroyContentBlur();
@@ -418,7 +459,8 @@ private:
     BgpuSampler samplerFor(BgpuTexture tex) const;
     bool ensureCanvas();
     void resetFrameState();
-    void beginPass(BgpuTexture target, int tw, int th, bool clear, uint32_t clearColor);
+    void beginPass(BgpuTexture target, int tw, int th, bool clear, uint32_t clearColor,
+                   int ox = 0, int oy = 0);
     void endPass();
     bool blitCanvasToTarget();
     void computeScissor(int& sx, int& sy, int& sw, int& sh) const;
@@ -436,7 +478,11 @@ private:
                          const uint32_t colors[4]);
     void flushAll();
 
-    int acquireLayer();
+    // 按层框尺寸取一张层目标：返回池下标，并把**实际纹理尺寸**写进 tw/th
+    // （≥ 请求值，对齐到 kLayerAlign；池里够用的空闲张优先，不新建）。
+    int acquireLayer(int lw, int lh, int& tw, int& th);
+    // pushLayer / pushContentLayer 的公共上半段（两个入口只差 alpha 与出口）。
+    bool openLayer(const Rect& localBounds, float alpha, bool content);
     void destroyLayerPool();
     bool ensureBlurChainFor(BlurChain& c, int w, int h);
     bool ensureBlurLevel(BlurChain& c, int index, int w, int h);
@@ -446,7 +492,10 @@ private:
     void retireBlurChain(BlurChain& c);   // 纹理挂 pendingFree_（帧中途换尺寸用）
     // 内容层的公共两步：① 把 src 上 (rx,ry,rw,rh) 那块抓进 chain.lv[0]（1:1 NEAREST）
     // ② 2× 降采样 + 分离高斯。成功时 out = 结果纹理（与那块矩形一一对应）。
-    bool grabIntoBlurChain(BlurChain& c, BgpuTexture src, int rx, int ry, int rw, int rh);
+    // srcUv 是那块矩形在 **src 纹理**里的归一化范围（层目标不再是整窗尺寸，
+    // 所以不能再用窗口宽高算 u/v —— 调用方按层原点与纹理尺寸算好传进来）。
+    bool grabIntoBlurChain(BlurChain& c, BgpuTexture src, int rw, int rh, float u0, float v0,
+                           float u1, float v1);
     bool blurChainDown(BlurChain& c, float blurPx, BgpuTexture& out);
     // 设备像素矩形 → 整数化并夹进窗口（返回 false = 整块都在窗口外）
     bool clampToWindow(const Rect& deviceRect, int& rx, int& ry, int& rw, int& rh) const;

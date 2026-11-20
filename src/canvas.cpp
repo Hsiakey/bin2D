@@ -389,6 +389,12 @@ bool Canvas::pushLayer(const Rect& localBounds, float opacity, BlendMode blend) 
     if (!layer.surface.resize(lw, lh)) return false;
     layer.originX = static_cast<int>(clipped.x);
     layer.originY = static_cast<int>(clipped.y);
+    // 绝对原点 = 父目标的绝对原点 + 本层在父目标里的位置。
+    // clipped 是**父目标像素**坐标（deviceTransform 已经减过父层的 originX_），
+    // 所以这里必须把父原点加回来 —— 以前直接把 originX_ 赋成 clipped.x，
+    // 嵌套层的层内坐标就少减了父原点，内容整块偏移（0.22.8 修）。
+    layer.absX = originX_ + layer.originX;
+    layer.absY = originY_ + layer.originY;
     layer.opacity = opacity;
     layer.blend = blend;
     layer.stackMark = stack_.size();   // 出层时截断：层内漏 call restore 也不会串状态
@@ -397,8 +403,8 @@ bool Canvas::pushLayer(const Rect& localBounds, float opacity, BlendMode blend) 
     // 目标切到层；层的画布同样从"整块层"开始，裁剪矩形换成层内矩形
     Layer& top = *layers_.back();
     target_ = &top.surface;
-    originX_ = top.originX;
-    originY_ = top.originY;
+    originX_ = top.absX;
+    originY_ = top.absY;
     State s;
     s.xf = state().xf;            // 变换不动：几何代码在层内层外同一套
     s.clipRect = target_->bounds();
@@ -451,8 +457,9 @@ void Canvas::popLayer() {
     Surface* parent = layers_.empty() ? baseTarget_ : &layers_.back()->surface;
     target_ = parent;
     if (!layers_.empty()) {
-        originX_ = layers_.back()->originX;
-        originY_ = layers_.back()->originY;
+        // 回到父层的**绝对**原点（层内坐标要靠它减，见 Layer::absX）
+        originX_ = layers_.back()->absX;
+        originY_ = layers_.back()->absY;
     } else {
         originX_ = 0;
         originY_ = 0;
@@ -483,8 +490,9 @@ bool Canvas::popOffscreen(Surface& out, int& originX, int& originY) {
 
     target_ = layers_.empty() ? baseTarget_ : &layers_.back()->surface;
     if (!layers_.empty()) {
-        originX_ = layers_.back()->originX;
-        originY_ = layers_.back()->originY;
+        // 回到父层的**绝对**原点（层内坐标要靠它减，见 Layer::absX）
+        originX_ = layers_.back()->absX;
+        originY_ = layers_.back()->absY;
     } else {
         originX_ = 0;
         originY_ = 0;

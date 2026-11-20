@@ -269,8 +269,15 @@ private:
     };
     struct Layer {
         Surface surface;
+        // originX/originY = 这一层在**父目标**像素空间里的位置（出层合成时用）。
+        // absX/absY = 这一层在**基准目标**像素空间里的位置（层内绘制用）。
+        // 两者不能合并：嵌套时父层自己也有原点，"入层那一刻的 clipped.x"只是相对
+        // 父层的 —— 层内再减它，内容会整体多偏一个父原点（0.22.8 修的那条：
+        // 以前 originX_ 直接被赋成 clipped.x，嵌套层的几何整块错位）。
         int originX = 0;
         int originY = 0;
+        int absX = 0;
+        int absY = 0;
         float opacity = 1.0f;
         BlendMode blend = BlendMode::SrcOver;
         size_t stackMark = 1;   // 入层时的状态栈深度（出层时截断，防止层内漏 restore）

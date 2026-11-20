@@ -221,11 +221,35 @@ static void TestClipRectInsideLayer() {
     CHECK(s.get(10, 10).r == 0, "composite: 层外坐标仍然没被画到");
 }
 
+// 套层的**原点累积**（0.22.8 修）：外层图层不在 (0,0) 时，里面再套一层，
+// 层内坐标必须减掉"外层的绝对原点 + 内层在外层里的位置"，而不是只减后者。
+// 以前 `originX_ = clipped.x`（clipped 是**父层局部**坐标），嵌套时少减了父原点，
+// 层内内容整块偏移 —— TestNestedLayers 测不出来，因为它的外层原点恰好是 0。
+static void TestNestedLayerOffset() {
+    Surface s(200, 160);
+    Canvas canvas(s);
+    canvas.clear(Color::black());
+
+    // 外层：设备 (40,30) 起，120×100
+    CHECK(canvas.pushLayer(Rect(40, 30, 120, 100), 1.0f), "composite: 带偏移的外层图层");
+    // 内层：设备 (70,60) 起，40×40（相对外层是 (30,30)）
+    CHECK(canvas.pushLayer(Rect(70, 60, 40, 40), 1.0f), "composite: 外层带偏移时再套一层");
+    // 层内坐标是**父级设备坐标**（与 TestClipRectInsideLayer 同一条口径）
+    canvas.fillRect(Rect(70, 60, 40, 40), Color::white());
+    canvas.popLayer();
+    canvas.popLayer();
+
+    CHECK(s.get(80, 70).r == 255, "composite: 嵌套层的内容落在它自己的设备矩形上");
+    CHECK(s.get(50, 40).r == 0, "composite: 嵌套层没有把内容画到外层左上角");
+    CHECK(s.get(140, 120).r == 0, "composite: 嵌套层没有把内容画到外层右下角");
+}
+
 int main() {
     TestBlendModes();
     TestGroupOpacity();
     TestPathClip();
     TestNestedLayers();
+    TestNestedLayerOffset();
     TestLayerBlendModes();
     TestClipRect();
     TestClipRectInsideLayer();
