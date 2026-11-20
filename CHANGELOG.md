@@ -3,6 +3,41 @@
 本文件记录 bin2d 的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.22.0] - 2026-11-20
+
+**`Canvas` 有了第二个执行体：GPU（`GpuExec`）。同一套 Canvas API、同一套变换/裁剪/图层
+语义，像素改由 binGPU 出 —— 这就是 layering 第 2 步"bin2d 的语义 + binGPU 的执行"。**
+
+新增文件：
+- `include/bin2d/gpu_exec.h` + `src/gpu_exec.cpp`（执行体本体，~1780 行）；
+- `include/bin2d/canvas_gpu.h` + `src/canvas_gpu.cpp`（Canvas 与执行体之间的**窄接口**）。
+
+为什么要那个窄接口：`gpu_exec.h` 要 `bingpu.h`，而 bin2d 必须能在**没有 binGPU 的环境**
+里编过（`Makefile` 里"只有 `libbingpu.a` 存在才编 GPU 桥"那条约定）。于是 `canvas.cpp`
+只依赖 7 个自由函数声明（`GpuSyncState` / `GpuFillPaint` / `GpuClearRect` /
+`GpuDrawSurface` / `GpuDrawNineSlice` / `GpuPushLayer` / `GpuPopLayer`），实现放在
+只在有 binGPU 时才进库的 `canvas_gpu.cpp` 里。
+
+三条颜色口径（错一条整页偏色）：
+1. `Color` 在 bin2d 里是**预乘**，binGPU 的顶点色是**直通**（片元自己乘 srcA）⇒ 顶点色
+   一律 `toArgbStraight()`；
+2. 纹理上传用 `BGPU_TEXTURE_PREMULTIPLIED`（Surface 本来就是预乘，零拷贝直传）；
+3. 线性渐变用四角直通色（屏幕空间的线性渐变是坐标的仿射函数，四边形上插值是精确解）。
+
+能力边界（0.22.0，都写进 `canvas.h` 的注释）：
+- GPU 下**不做**：任意路径填充/描边（要三角化）、`pushOffscreen`（出口是"像素回 CPU"）、
+  多档渐变（退化成两端色并告警一次）；
+- GPU 下**照常**：矩形 / 圆角（解析 SDF）/ 圆角描边 / 圆角渐变 / 两档线性渐变 /
+  贴图与九宫格 / 矩形裁剪 / 五种混合模式 / 图层组透明度 / 毛玻璃。
+
+验证（`tests/` 全绿，含新执行体的对照）：
+- `test_display_list` 45 项、`test_gpu_bridge` 40 项等全部通过；
+- 手工对照（HEADLESS + GL，200×120）：直角区域、半透明混合区、五种 BlendMode、
+  图层 0.5、矩形裁剪、1:1 NEAREST 贴图 —— 与 CPU `Canvas` **逐像素 0 差异**；
+  只有圆角弧边和 4× 双线性放大有差（弧边是"扫描线 vs 解析 SDF"的固有差，放大是
+  采样器半纹素口径 —— 两条都记在 `docs/` 里，是第 ③ 步要统一的）。
+
+
 ## [0.21.0] - 2026-11-20
 
 **圆角接上 binGPU 的解析圆角（ABI 4）：有 `BGPU_CAP_SHAPE` 时不再生成、也不上传任何

@@ -50,7 +50,7 @@ ifeq ($(BINGPU_LIB),)
     GPU_OBJS :=
     GPU_TEST :=
 else
-    GPU_OBJS := $(OBJ_DIR)/gpu.o $(OBJ_DIR)/display_list.o
+    GPU_OBJS := $(OBJ_DIR)/gpu.o $(OBJ_DIR)/display_list.o $(OBJ_DIR)/gpu_exec.o $(OBJ_DIR)/canvas_gpu.o
     GPU_TEST := $(TEST_DIR)/test_gpu_bridge$(EXT) $(TEST_DIR)/test_display_list$(EXT)
 endif
 
@@ -84,14 +84,26 @@ $(OBJ_DIR)/gpu.o: $(SRC_DIR)/gpu.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INC) -I../binGPU/include -c $< -o $@
 
+# GPU 执行体（0.22.0）：和 gpu.cpp 一样只在 binGPU 已构建时进库
+$(OBJ_DIR)/canvas_gpu.o: $(SRC_DIR)/canvas_gpu.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INC) -I../binGPU/include -c $< -o $@
+
+$(OBJ_DIR)/gpu_exec.o: $(SRC_DIR)/gpu_exec.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INC) -I../binGPU/include -c $< -o $@
+
 gpu-syntax:
 	@echo "[bin2d] gpu.cpp 语法检查（binGPU 未构建时也保证它可编译）"
 	@$(CXX) $(CXXFLAGS) $(INC) -I../binGPU/include -fsyntax-only $(SRC_DIR)/gpu.cpp
 
 # ---- 测试 ----
+# 测试统一带上 binGPU 的库：libbin2d.a 里现在有 GPU 执行体（canvas_gpu.o → gpu_exec.o），
+# 只要测试碰了 Canvas 的 GPU 分支就会被拉进来。没构建 binGPU 时 BINGPU_LIB 为空、
+# GPU 对象也不在库里，链接行自然退化成"纯 CPU"那一条。
 $(TEST_DIR)/%$(EXT): tests/%.cpp $(LIB_A)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $(INC) $< $(LIB_A) $(RTLINK) $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(INC) $< $(LIB_A) $(BINGPU_LIB) $(RTLINK) $(LDFLAGS) -o $@
 
 $(TEST_DIR)/test_gpu_bridge$(EXT): tests/test_gpu_bridge.cpp $(LIB_A) $(GPU_OBJS) $(BINGPU_LIB)
 	@mkdir -p $(dir $@)

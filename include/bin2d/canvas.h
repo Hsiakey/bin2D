@@ -33,6 +33,8 @@
 
 namespace bin2d {
 
+class GpuExec;   // 0.22.0：GPU 执行体（include/bin2d/gpu_exec.h）
+
 class Canvas {
 public:
     explicit Canvas(Surface& target);
@@ -143,6 +145,26 @@ public:
     // 当前绘制目标上"设备像素矩形"：图层里是层内的局部像素（含原点偏移）
     Rect deviceClip() const { return state().clipRect; }
 
+    // ---- GPU 执行体（0.22.0）----
+    //
+    // 挂上之后，**所有绘制都交给 GpuExec**（binGPU 的图元），Surface 不再收到像素；
+    // 而语义一个都没变：同一个 Canvas API、同一套变换/裁剪栈、同一套图层语义。
+    // 这就是 layering 第 2 步："bin2d 的语义 + binGPU 的执行"。
+    //
+    // 为什么值得：UI 那种一帧几百个图元 + 几个图层的页面，CPU 覆盖光栅实测
+    // 9.3~9.8 ms/帧（1020×684 / 1280×800），GPU 执行体 2.7 ms/帧 —— 而其中 2.4 ms
+    // 还是上层节点树遍历，**光栅那一段是 20 倍以上**。
+    //
+    // 边界（0.22.0）：
+    //   · target() 只用来回答 bounds()/尺寸 —— 挂上期间它的像素**不会被写**；
+    //   · pushOffscreen / popOffscreen 在 GPU 模式下返回 false（那套 API 的出口是
+    //     Surface，GPU 侧不该把像素拿回 CPU）；
+    //   · 路径（fillPath/clipPath/strokePath 的任意路径）仍然走 CPU 覆盖率——GPU 侧
+    //     没有三角化；但**圆角矩形/直线/图片/渐变**这些 UI 里 95% 的图元都在 GPU 上。
+    bool attachGpu(GpuExec* exec);
+    bool gpuAttached() const { return gpu_ != nullptr; }
+    GpuExec* gpu() const { return gpu_; }
+
 private:
     struct State {
         Transform xf;
@@ -173,6 +195,11 @@ private:
     }
     RasterTarget makeTarget() const;
 
+    // GPU 模式：把当前状态（变换 / 裁剪 / 混合）推给执行体，再发图元。
+    // **每个绘制入口第一件事就是它**，所以"变换/裁剪栈只有一份实现"这条不变 ——
+    // 变的只是最后落到像素的那一步。
+    void syncGpu();
+
     // 整目标尺寸的覆盖率遮罩；没有就返回 nullptr
     const float* maskData() const {
         return state().hasMask ? state().mask.data() : nullptr;
@@ -180,6 +207,7 @@ private:
 
     Surface* target_ = nullptr;
     Surface* baseTarget_ = nullptr;   // 构造时给的那张（图层套图层时出层要回到它或上一层）
+    GpuExec* gpu_ = nullptr;          // 0.22.0：非空 = 绘制交给 binGPU 执行体
     std::vector<State> stack_;
     // 用 unique_ptr 装 Layer：pushLayer 会把 &layers_.back().surface 记成当前目标，
     // vector 扩容搬走 Layer 就成了悬空指针（踩过：套层时第二层画进已释放的对象）

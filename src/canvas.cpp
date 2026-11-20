@@ -15,9 +15,41 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <memory>
 
+#include "bin2d/canvas_gpu.h"
+
 namespace bin2d {
+namespace {
+
+// GPU 模式下"做不到"的图元：一次告警，别刷屏。这些都在 CPU 执行体里照常工作。
+void GpuUnsupported(const char* what) {
+    static const char* warned[8] = {nullptr};
+    for (int i = 0; i < 8; ++i) {
+        if (warned[i] == what) return;
+        if (!warned[i]) { warned[i] = what; break; }
+    }
+    std::fprintf(stderr, "[bin2d] GPU 执行体不支持 %s，这一次调用被跳过（CPU 执行体照常）\n",
+                 what);
+}
+
+} // namespace
+
+// GPU 执行体：把"当前状态"推下去。Canvas 的变换栈 / 裁剪栈仍然只有这一份实现，
+// 执行体只吃"结果"（设备变换矩阵 + 交好的裁剪矩形 + 混合模式）。
+// 为什么每次绘制都推一遍而不是监听状态变化：Canvas 的状态是**整份压栈**的
+// （save/restore 复制 State），没有"变化通知"可挂；而这三个 setter 在执行体里
+// 都是几百纳秒级的比较+赋值，一帧几百次可以忽略。
+void Canvas::syncGpu() {
+    if (!gpu_) return;
+    GpuSyncState(*gpu_, deviceTransform(), state().blend, state().clipRect);
+}
+
+bool Canvas::attachGpu(GpuExec* exec) {
+    gpu_ = exec;
+    return gpu_ != nullptr;
+}
 
 Canvas::Canvas(Surface& target) : target_(&target), baseTarget_(&target) {
     State s;
@@ -97,6 +129,11 @@ void Canvas::clear(const Color& c) {
     if (!target_) return;
     const Rect area = Rect::intersect(state().clipRect, target_->bounds());
     if (area.empty()) return;
+    if (gpu_) {
+        // Replace 语义（连 alpha 一起换），矩形已经是设备像素 → 单位阵画
+        GpuClearRect(*gpu_, area, c);
+        return;
+    }
     if (!state().hasMask) {
         // 无遮罩：走 Surface 的整像素快路径（Replace 语义：连 alpha 一起换）
         target_->fillRect(area, c);
@@ -135,6 +172,7 @@ void Canvas::fillRect(const Rect& r, const Paint& paint) {
     if (!target_ || r.empty()) return;
     RasterTarget rt = makeTarget();
     if (rt.clip.empty()) return;
+    if (gpu_) { syncGpu(); GpuFillPaint(*gpu_, r, 0.0f, 0.0f, paint); return; }
     FillRect(rt, r, paint, deviceTransform());
 }
 
@@ -142,6 +180,7 @@ void Canvas::fillRounded(const Rect& r, float radius, const Paint& paint) {
     if (!target_ || r.empty()) return;
     RasterTarget rt = makeTarget();
     if (rt.clip.empty()) return;
+    if (gpu_) { syncGpu(); GpuFillPaint(*gpu_, r, radius, 0.0f, paint); return; }
     FillRoundedRect(rt, r, radius, paint, deviceTransform());
 }
 
@@ -151,6 +190,7 @@ void Canvas::fillRounded(const Rect& r, float radius, const Color& c) {
 
 void Canvas::fillPath(const Path& path, const Paint& paint, FillRule rule) {
     if (!target_ || path.empty()) return;
+    if (gpu_) { GpuUnsupported("fillPath（任意路径要三角化）"); return; }
     RasterTarget rt = makeTarget();
     if (rt.clip.empty()) return;
     FillPath(rt, path, rule, paint, deviceTransform());
@@ -162,6 +202,7 @@ void Canvas::fillPath(const Path& path, const Color& c, FillRule rule) {
 
 void Canvas::strokePath(const Path& path, const Paint& paint, const StrokeStyle& style) {
     if (!target_ || path.empty() || style.width <= 0.0f) return;
+    if (gpu_) { GpuUnsupported("strokePath（任意路径描边要三角化）"); return; }
     RasterTarget rt = makeTarget();
     if (rt.clip.empty()) return;
     StrokePath(rt, path, paint, style, deviceTransform());
@@ -178,6 +219,7 @@ void Canvas::drawImage(const Image& image, const Rect& dstLocal, const Rect& src
     if (!target_ || image.empty()) return;
     RasterTarget rt = makeTarget();
     if (rt.clip.empty()) return;
+    if (gpu_) { syncGpu(); GpuDrawSurface(*gpu_, image.surface(), dstLocal, srcUv, tint); return; }
     DrawImage(rt, image, dstLocal, srcUv, tint, filter == ImageFilter::Nearest,
               deviceTransform());
 }
@@ -187,6 +229,7 @@ void Canvas::drawSurface(const Surface& surface, const Rect& dstLocal, const Rec
     if (!target_ || surface.empty()) return;
     RasterTarget rt = makeTarget();
     if (rt.clip.empty()) return;
+    if (gpu_) { syncGpu(); GpuDrawSurface(*gpu_, surface, dstLocal, srcUv, tint); return; }
     DrawSurface(rt, surface, dstLocal, srcUv, tint, filter == ImageFilter::Nearest,
                 deviceTransform());
 }
@@ -197,6 +240,13 @@ void Canvas::drawNineSlice(const Image& image, const Rect& dstLocal, float inset
     if (!target_ || image.empty()) return;
     RasterTarget rt = makeTarget();
     if (rt.clip.empty()) return;
+    if (gpu_) {
+        // 九宫格的切分数学只有一份（这个函数），GPU 执行体照它切完再逐块贴图 ——
+        // 九块各自是一个带 UV 子矩形的四边形，与 CPU 那条路同一套切分。
+        syncGpu();
+        GpuDrawNineSlice(*gpu_, image.surface(), dstLocal, insetL, insetT, insetR, insetB, tint);
+        return;
+    }
     DrawNineSlice(rt, image, dstLocal, insetL, insetT, insetR, insetB, tint,
                   filter == ImageFilter::Nearest, deviceTransform());
 }
@@ -227,6 +277,14 @@ void Canvas::blendCoverageMask(const uint8_t* mask, int w, int h, int dstX, int 
 // ------------------------------------------------------------
 bool Canvas::pushLayer(const Rect& localBounds, float opacity, BlendMode blend) {
     if (!target_ || opacity <= 0.0f) return false;
+    if (gpu_) {
+        // GPU 模式的图层由执行体持有（窗口大小的离屏纹理）：Canvas 这边**不改**
+        // target_/originX_ —— 设备坐标始终是同一套，层内层外的几何代码完全一样。
+        syncGpu();
+        if (!GpuPushLayer(*gpu_, localBounds, opacity)) return false;
+        state().blend = BlendMode::SrcOver;
+        return true;
+    }
     const Transform dev = deviceTransform();
     const Rect devRect = dev.mapBounds(localBounds).snappedOut();
     const Rect clipped = Rect::intersect(devRect, state().clipRect);
@@ -275,6 +333,10 @@ void Canvas::compositeSurface(const Surface& surface, int originX, int originY, 
 }
 
 void Canvas::popLayer() {
+    if (gpu_) {
+        GpuPopLayer(*gpu_);
+        return;
+    }
     if (layers_.empty()) return;
     std::unique_ptr<Layer> layerPtr = std::move(layers_.back());
     layers_.pop_back();
@@ -300,6 +362,9 @@ void Canvas::popLayer() {
 
 // 离屏内容：入层语义与 pushLayer 相同（opacity=1、SrcOver），只是出层时不合成
 bool Canvas::pushOffscreen(const Rect& localBounds) {
+    // GPU 模式的出口是"像素回 CPU"，那正是这一层不该做的事 —— 明确失败，
+    // 调用方据此走不需要离屏的那条路（binUI 的 mask/clip-path 就是这样退化的）。
+    if (gpu_) { GpuUnsupported("pushOffscreen（离屏出像素）"); return false; }
     return pushLayer(localBounds, 1.0f, BlendMode::SrcOver);
 }
 
