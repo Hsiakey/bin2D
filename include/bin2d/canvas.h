@@ -129,6 +129,34 @@ public:
     // 这里是空操作 —— 所以调用方不用判断执行体是哪个。
     void imageChanged(const Surface& surface);
 
+    // ---- 外部纹理（0.22.3）----
+    // 给"内容会边画边变、而且每次只改一小块"的素材（字形图集 / 阴影图集 / 视频帧）
+    // 一条独立的路：句柄归调用方，上传只传改过的那块矩形。
+    //
+    // 为什么不做成 Surface 那条路（drawImage + imageChanged）：
+    //   · drawSurface 的缓存口径是"图片不变"，改一下就要**整张**重传（字形图集是
+    //     1024×1024 = 4 MB，一页文字一帧要改几十个格子）；
+    //   · 更糟的是顺序：GPU 的绘制命令延迟到帧尾执行，而图集是边画边往里贴新格子，
+    //     "整张重传"与"已经录进命令流的那些笔"之间存在真实的先后关系，缓存里残留
+    //     的旧内容会被后续的笔采样到（实测：整页文字串格、阴影层错位）。
+    // 这条路上上传是**同步**的（binGPU 提交后等 fence），图集又只追加不改写已有
+    // 格子，所以无论先上传还是先录笔，任何一笔的采样结果都一样。
+    //
+    // 契约：
+    //   · 没挂 GPU 执行体时 create 返回 0、其余是空操作 —— CPU 光栅没有"纹理"这个
+    //     概念，调用方自己走 Image（Surface）那条路；
+    //   · 句柄由调用方拥有：destroyTexture 之前不能丢，也不能在帧内重复 create。
+    //     destroy 是**延迟**的（执行体把它们推迟到帧尾之后真正释放），所以同一帧里
+    //     先 destroy 再画不会画到别人的内容上。
+    //   · 上传的字节序与 Surface 一致（RGBA 预乘）；box 是纹理上的像素矩形。
+    uint64_t createTexture(int w, int h, bool nearest = false);
+    void uploadTexture(uint64_t tex, const Rect& box, const uint8_t* pixels, uint32_t stride);
+    void destroyTexture(uint64_t tex);
+    // 画一个纹理四边形：dst 是**局部坐标**（与 drawImage 同一条变换/裁剪语义），
+    // uv 是 0..1 的归一化子矩形，tint 是预乘色。
+    void drawTexture(uint64_t tex, const Rect& dstLocal, const Rect& srcUv,
+                     const Color& tint = Color::white());
+
     // ---- 覆盖率遮罩合成（设备空间，不经过当前变换）----
     // 把一张 0..255 的覆盖率罩按 color 合成到当前目标；受当前裁剪 / 路径遮罩 / 混合模式
     // 约束。投影的第二半（模糊后的 alpha 罩）走这里：1 字节/像素，不进颜色管线。

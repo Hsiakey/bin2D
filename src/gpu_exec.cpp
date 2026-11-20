@@ -341,6 +341,8 @@ void GpuExec::destroy() {
         if (white_) { bingpu_texture_destroy(device_, white_); white_ = 0; }
         if (canvas_) { bingpu_texture_destroy(device_, canvas_); canvas_ = 0; }
         if (cmd_) { bingpu_cmd_destroy(device_, cmd_); cmd_ = 0; }
+        // 命令缓冲已经没了（没提交的那部分随之作废），挂起的纹理销毁现在真正释放
+        drainPendingFree();
         if (sampRepeat_) { bingpu_sampler_destroy(device_, sampRepeat_); sampRepeat_ = 0; }
         if (sampNearest_) { bingpu_sampler_destroy(device_, sampNearest_); sampNearest_ = 0; }
         if (sampLinear_) { bingpu_sampler_destroy(device_, sampLinear_); sampLinear_ = 0; }
@@ -559,6 +561,11 @@ bool GpuExec::beginFrame(uint32_t clearArgb, bool clear) {
         return false;
     }
     inFrame_ = true;
+    // 上一帧挂起的纹理销毁在这里才真正释放。为什么放在 frame_begin 之后：
+    //   · 正常收尾时它已经 fence 等完（frame_end 内 submitNow 会等 fence）；
+    //   · 上一帧被调用方漏掉 frame_end 时，刚才那次 frame_begin 已经重新开始录制，
+    //     上一帧录进去的笔全部作废 —— 两种情况下都没有命令还引用着这些纹理。
+    drainPendingFree();
 
     if (!ensureCanvas()) {
         noteError("beginFrame: 画布建不起来");
@@ -1239,15 +1246,23 @@ void GpuExec::texUpload(uint64_t tex, const Rect& box, const uint8_t* pixels,
 
 void GpuExec::texDestroy(uint64_t tex) {
     if (!tex) return;
-    // 批次里可能还引用着它：先落批再销毁（帧内销毁 + 句柄复用会采到别人的内容）
-    flushAll();
     for (size_t i = 0; i < texMeta_.size(); ++i) {
         if (texMeta_[i].tex == tex) {
             texMeta_.erase(texMeta_.begin() + static_cast<std::ptrdiff_t>(i));
             break;
         }
     }
-    if (device_) bingpu_texture_destroy(device_, static_cast<BgpuTexture>(tex));
+    if (!device_) return;
+    // **不当场销毁**：帧内销毁会让本帧已经录进命令流的笔引用到被回收的句柄槽
+    // （见 pendingFree_ 的说明）。挂进表里，下一帧 frame_begin 之后统一释放。
+    pendingFree_.push_back(static_cast<BgpuTexture>(tex));
+}
+
+void GpuExec::drainPendingFree() {
+    if (!device_ || pendingFree_.empty()) return;
+    for (BgpuTexture t : pendingFree_)
+        if (t) bingpu_texture_destroy(device_, t);
+    pendingFree_.clear();
 }
 
 void GpuExec::drawTexture(uint64_t tex, const Rect& dst, const Rect& uv,
@@ -1270,9 +1285,8 @@ BgpuSampler GpuExec::samplerFor(BgpuTexture tex) const {
 // 而重传进同一张纹理既保住句柄、又让后面的笔看到新内容 —— 见 surfaceTexture。
 void GpuExec::imageChanged(const Surface& src) {
     if (!device_ || src.empty()) return;
-    const uint8_t* key = src.pixels().data();
     for (ImgEntry& e : imgCache_) {
-        if (e.key == key && e.w == src.width() && e.h == src.height()) e.dirty = true;
+        if (e.id == src.id() && e.w == src.width() && e.h == src.height()) e.dirty = true;
     }
 }
 
@@ -1282,14 +1296,16 @@ void GpuExec::imageChanged(const Surface& src) {
 
 BgpuTexture GpuExec::surfaceTexture(const Surface& src) {
     if (!device_ || src.empty()) return 0;
-    // bin2d 的 Surface 没有"代/版本"这个概念，所以缓存键只能是像素指针 + 尺寸。
-    // 口径与 DisplayList 一致：**图片被认为不变**（列表里存的是 const Surface*）。
+    // 缓存键是 Surface 的**实例身份** + 尺寸（0.22.3），不是像素指针：
+    // 指针会被复用 —— 一张图销毁后，下一张同样尺寸的图常拿到同一段内存，撞上就会把
+    // 新图画成上一张的旧内容（字形图集换页时实测：整页文字串格、阴影整块消失）。
+    // 口径与 DisplayList 一致：**图片被认为不变**；
     // 内容会变的场景（字形图集 / 视频帧）有两条路：
     //   · 每次改完调 imageChanged()（帧内增量更新，见下）；
     //   · 或者干脆用 texCreate/texUpload 自己管句柄。
-    const uint8_t* key = src.pixels().data();
+    const uint64_t key = src.id();
     for (ImgEntry& e : imgCache_) {
-        if (e.key != key || e.w != src.width() || e.h != src.height()) continue;
+        if (e.id != key || e.w != src.width() || e.h != src.height()) continue;
         if (e.dirty) {
             // 原地改过的像素：**重传进同一张纹理**。不销毁重建是刻意的 ——
             // 帧内销毁的句柄可能还被已经录进命令缓冲的图元引用着（Vulkan 上表现为
@@ -1303,8 +1319,10 @@ BgpuTexture GpuExec::surfaceTexture(const Surface& src) {
         return e.tex;
     }
     if (imgCache_.size() >= kMaxImgCache) {
-        flushAll();   // 批次里可能还引用着被淘汰的那张
-        bingpu_texture_destroy(device_, imgCache_.front().tex);
+        // **不能当场销毁**：批次里还引用着它（flushAll 只是把笔录进命令流，真正执行在
+        // 帧尾），当场 destroy 会让那些笔采样到下一张落进同一个句柄槽的纹理 ——
+        // 字形图集淘汰时实测"整页文字串格"。挂到 pendingFree_ 里，帧尾之后再释放。
+        pendingFree_.push_back(imgCache_.front().tex);
         imgCache_.erase(imgCache_.begin());
     }
     BgpuTexture tex = makeImageTexture(src.width(), src.height(), src.pixels().data(),

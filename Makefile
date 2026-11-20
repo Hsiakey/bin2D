@@ -202,5 +202,9 @@ layers:
 clean:
 	rm -rf $(BUILD_DIR)
 
--include $(LIB_OBJS:.o=.d) $(OBJ_DIR)/gpu.d
+# 头文件依赖（-MMD 产的 .d）。**必须覆盖每一个 .o**：GPU 桥那四个（gpu / display_list /
+# gpu_exec / canvas_gpu）不在 LIB_OBJS 里，以前只补了 gpu.d，于是 display_list.o /
+# gpu_exec.o / canvas_gpu.o 改了头也不重建 —— 头里一改结构（比如 Surface 多一个字段），
+# 库里的旧目标文件还按老布局读，症状是"测试莫名其妙失败、而且 make 说已经是最新的"。
+-include $(LIB_OBJS:.o=.d) $(GPU_OBJS:.o=.d)
 

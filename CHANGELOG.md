@@ -3,6 +3,48 @@
 本文件记录 bin2d 的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.22.3] - 2026-11-20
+
+**修"纹理在帧尾才用到、却在帧中被销毁"这一类缺陷**，并给执行体补一条外部纹理通道。
+前者是整页文字串格的真凶，不修的话 binUI 那页 `text-shadow-multi` 差 17%、最大通道差 255。
+
+### 根因
+
+`GpuExec` 的贴图缓存是"图片不变"的口径（`drawSurface` 的 Surface 被认为是常量），上限
+`kMaxImgCache = 32`。而 binUI 的字形/阴影图集在一页里要 62 张 1024²，淘汰发生在帧中：
+淘汰时**当场** `bingpu_texture_destroy`，可这张纹理还被**已经录进命令流、要到帧尾才执行**
+的那些笔引用着 —— binGPU 的句柄槽会被复用，于是那些笔采样到了别的纹理。表现：整页文字
+串格、阴影错位成重影（CPU 光栅是立即落像素，看不见这个时序差）。
+
+### 修法
+
+- `GpuExec` 新增 `pendingFree_` + `drainPendingFree()`：纹理销毁**一律延迟**到"上一帧已经
+  submit 且等完 fence"之后（`beginFrame` 的 `frame_begin` 之后、`destroy()` 里命令缓冲
+  销毁之后各排空一次）。这条与 binGPU 0.13.0 修的顶点流扩容是同一类错误 —— 释放"命令流
+  还在引用"的东西，只是这次发生在上层。
+- `Surface` 增加**实例身份**（`id()`）：构造发号、拷贝换号、移动搬号。缓存键从"像素指针
+  + 尺寸"换成"id + 尺寸" —— 像素指针会被复用（一张图销毁后下一张同样尺寸的图常拿到同一段
+  内存），撞上就会把新图画成旧内容。`imageChanged()` 同步改用 id。
+- `Canvas` 新增外部纹理通道（`createTexture` / `uploadTexture` / `destroyTexture` /
+  `drawTexture`，走 `canvas_gpu.h` 的窄接口，`canvas.cpp` 仍然不 include `bingpu.h`）：
+  句柄归调用方所有、上传只传**那一块矩形**。字形图集这种"一次建、每帧只追加几个格子"的
+  宿主用它，不必整张重传（binUI 侧已改过来，见 binUI 0.37.1）。
+- 修 `Makefile` 的一个真 bug：`-include` 只挂了普通对象的 `.d`，漏了 `GPU_OBJS`
+  （`display_list` / `gpu_exec` / `canvas_gpu`）—— 改头文件不重建。现在改成
+  `$(GPU_OBJS:.o=.d)`。
+
+### 数字（binUI 挂在执行体上，CPU 光栅 vs GPU 执行体，640×N）
+
+| 页 | 修前 | 修后 |
+|---|---|---|
+| `text-shadow-multi` | 17.116%（max 255） | **0.043%**（128 px，max 22） |
+| `text-shadow` | 7.65% | **0.025%**（64 px，max 22） |
+| `shadow` | 7.21% | **0.027%**（max 19） |
+
+残留那 128/64 个像素全在卡片圆角边缘（8 子采样扫描线 vs 解析 SDF），属于第 3 步的账。
+"强制走旧 Image 宿主 vs 新设备纹理宿主"在 18 个像素用例上逐页完全相同 —— 两条路像素一致。
+帧时不变（1020×684 0.68 ms、1280×800 0.72 ms）。
+
 ## [0.22.2] - 2026-11-20
 
 **把 GPU 执行体补成"UI 框架能直接挂上去"的样子**。0.22.0 的执行体够画一张图，但不够跑

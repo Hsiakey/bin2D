@@ -302,6 +302,30 @@ void Canvas::drawSurface(const Surface& surface, const Rect& dstLocal, const Rec
                 deviceTransform());
 }
 
+// ---- 外部纹理（见 canvas.h 的说明）----
+uint64_t Canvas::createTexture(int w, int h, bool nearest) {
+    if (!gpu_ || w <= 0 || h <= 0) return 0;
+    return GpuTexCreate(*gpu_, w, h, nearest);
+}
+
+void Canvas::uploadTexture(uint64_t tex, const Rect& box, const uint8_t* pixels,
+                           uint32_t stride) {
+    if (!gpu_ || !tex || !pixels) return;
+    GpuTexUpload(*gpu_, tex, box, pixels, stride);
+}
+
+void Canvas::destroyTexture(uint64_t tex) {
+    if (!gpu_ || !tex) return;
+    GpuTexDestroy(*gpu_, tex);
+}
+
+void Canvas::drawTexture(uint64_t tex, const Rect& dstLocal, const Rect& srcUv,
+                         const Color& tint) {
+    if (!target_ || !gpu_ || !tex || dstLocal.empty()) return;
+    syncGpu();
+    GpuDrawTexture(*gpu_, tex, dstLocal, srcUv, tint);
+}
+
 void Canvas::drawNineSlice(const Image& image, const Rect& dstLocal, float insetL,
                            float insetT, float insetR, float insetB, const Color& tint,
                            ImageFilter filter) {

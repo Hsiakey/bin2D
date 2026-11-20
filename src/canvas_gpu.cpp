@@ -92,6 +92,20 @@ void GpuDrawNineSlice(GpuExec& gpu, const Surface& src, const Rect& dst, float l
 
 void GpuImageChanged(GpuExec& gpu, const Surface& src) { gpu.imageChanged(src); }
 
+// ---- 外部纹理（见 canvas_gpu.h 的说明）----
+uint64_t GpuTexCreate(GpuExec& gpu, int w, int h, bool nearest) {
+    return gpu.texCreate(w, h, /*dynamic=*/true, nearest);
+}
+void GpuTexUpload(GpuExec& gpu, uint64_t tex, const Rect& box, const uint8_t* pixels,
+                  uint32_t stride) {
+    gpu.texUpload(tex, box, pixels, stride);
+}
+void GpuTexDestroy(GpuExec& gpu, uint64_t tex) { gpu.texDestroy(tex); }
+void GpuDrawTexture(GpuExec& gpu, uint64_t tex, const Rect& dst, const Rect& uv,
+                    const Color& tint) {
+    gpu.drawTexture(tex, dst, uv, tint);
+}
+
 bool GpuPushLayer(GpuExec& gpu, const Rect& localBounds, float alpha) {
     return gpu.pushLayer(localBounds, alpha);
 }

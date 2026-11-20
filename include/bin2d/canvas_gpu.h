@@ -49,9 +49,27 @@ void GpuDrawSurface(GpuExec& gpu, const Surface& src, const Rect& dst, const Rec
 void GpuDrawNineSlice(GpuExec& gpu, const Surface& src, const Rect& dst, float l, float t,
                       float r, float b, const Color& tint);
 
-// 这张 Surface 的像素被原地改过了（字形图集 / 阴影图集）：丢掉执行体的纹理缓存。
-// 键是"像素指针 + 尺寸"，原地改不改指针 ⇒ 不通知就会一直采样旧内容。
+// 这张 Surface 的像素被原地改过了（图片素材 / 视频帧）：丢掉执行体的纹理缓存。
+// 缓存键是 Surface 的实例身份，原地改像素不改身份 ⇒ 不通知就会一直采样旧内容。
 void GpuImageChanged(GpuExec& gpu, const Surface& src);
+
+// ---- 外部纹理（0.22.3 字形图集 / 阴影图集 / 视频帧）----
+// 为什么需要另一条路：drawSurface 的纹理缓存建立在"图片不变"这条口径上
+// （变了要 imageChanged 打个脏标记，然后**整张**重传）。字形图集恰好是反面：
+// 一帧里要往同一张 1024×1024 上贴几十个 40×40 的新格子 ——
+//   · 整张重传是 4 MB/次，一页文字几十次就是几百 MB 的 PCIe 流量；
+//   · 而"帧内改内容"本身就与延迟执行的命令流有先后关系，缓存里的旧内容会被后续
+//     已经录好的笔采样到（实测：整页文字串格）。
+// 所以这一组接口把句柄交给调用方：create 一次、upload **只传新格子那块矩形**、
+// 用完 destroy。上传在 binGPU 里是同步的（提交后等 fence），所以"先上传再画"
+// 与"先画后上传"在设备上都看到最终内容；而图集只追加、不覆盖已有格子，
+// 于是两种顺序都不改变任何一笔的采样结果 —— 与 CPU 光栅逐像素立即落盘等价。
+uint64_t GpuTexCreate(GpuExec& gpu, int w, int h, bool nearest);
+void GpuTexUpload(GpuExec& gpu, uint64_t tex, const Rect& box, const uint8_t* pixels,
+                  uint32_t stride);
+void GpuTexDestroy(GpuExec& gpu, uint64_t tex);
+void GpuDrawTexture(GpuExec& gpu, uint64_t tex, const Rect& dst, const Rect& uv,
+                    const Color& tint);
 
 // 图层（组透明度）
 bool GpuPushLayer(GpuExec& gpu, const Rect& localBounds, float alpha);

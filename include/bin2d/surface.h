@@ -22,10 +22,61 @@
 
 namespace bin2d {
 
+namespace surface_detail {
+// 实例身份的发号器（0.22.3）。不要求线程安全：Surface 本身就不是线程安全的类型，
+// 加锁只会让人以为它能跨线程用。
+inline uint64_t NextSurfaceId() {
+    static uint64_t next = 0;
+    return ++next;
+}
+} // namespace surface_detail
+
 class Surface {
 public:
-    Surface() = default;
-    Surface(int w, int h) { resize(w, h); }
+    // ---- 实例身份（0.22.3）----
+    //
+    // 为什么需要：GPU 执行体的贴图缓存原来用"像素指针 + 尺寸"当键，而**像素指针会被复用**
+    // —— 一张图被销毁后，下一张同样尺寸的图经常拿到同一段内存，于是新图直接命中上一张
+    // 已销毁的图的纹理，显示成**旧内容**。字形图集换页时实测就是这个症状（整页文字串格）。
+    //
+    // 语义：构造时发一个号；**拷贝得到新号**（拷贝是新的像素缓冲，不是同一张图）；
+    // 移动把号一起搬走、被移走的那个重新发号（它已不再持有那块像素）。
+    // 号只在"是不是同一块内容"这个意义上有用，不暗示任何绘制语义。
+    Surface() : id_(surface_detail::NextSurfaceId()) {}
+    Surface(int w, int h) : id_(surface_detail::NextSurfaceId()) { resize(w, h); }
+    Surface(const Surface& o)
+        : id_(surface_detail::NextSurfaceId()), width_(o.width_), height_(o.height_),
+          stride_(o.stride_), pixels_(o.pixels_) {}
+    Surface& operator=(const Surface& o) {
+        if (this == &o) return *this;
+        width_ = o.width_;
+        height_ = o.height_;
+        stride_ = o.stride_;
+        pixels_ = o.pixels_;
+        id_ = surface_detail::NextSurfaceId();   // 内容换了一份 → 身份也换
+        return *this;
+    }
+    Surface(Surface&& o) noexcept
+        : id_(o.id_), width_(o.width_), height_(o.height_), stride_(o.stride_),
+          pixels_(std::move(o.pixels_)) {
+        o.id_ = surface_detail::NextSurfaceId();
+        o.width_ = o.height_ = o.stride_ = 0;
+        o.pixels_.clear();
+    }
+    Surface& operator=(Surface&& o) noexcept {
+        if (this == &o) return *this;
+        id_ = o.id_;
+        width_ = o.width_;
+        height_ = o.height_;
+        stride_ = o.stride_;
+        pixels_ = std::move(o.pixels_);
+        o.id_ = surface_detail::NextSurfaceId();
+        o.width_ = o.height_ = o.stride_ = 0;
+        o.pixels_.clear();
+        return *this;
+    }
+
+    uint64_t id() const { return id_; }
 
     int width() const { return width_; }
     int height() const { return height_; }
@@ -171,6 +222,7 @@ public:
     }
 
 private:
+    uint64_t id_ = 0;   // 实例身份（见上面的说明）：贴图缓存的键，避免像素指针复用撞车
     int width_ = 0;
     int height_ = 0;
     int stride_ = 0;

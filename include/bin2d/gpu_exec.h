@@ -133,16 +133,20 @@ public:
     void drawQuadUV(const float pos[8], const float uv[8], const Color col[4]);  // 任意四边形
 
     // ---- 外部纹理（字形图集 / 视频帧；句柄对调用方不透明）----
+    // "谁改像素、谁管句柄"：内容边画边变的素材（字形图集每帧往里贴新格子）走这一组，
+    // 上传只传改过的那块矩形。为什么不能靠 drawSurface + imageChanged：那条路的缓存
+    // 口径是"图片不变"，改一下就要整张重传（1024² = 4 MB），而且整张重传与延迟执行的
+    // 命令流有先后关系，缓存里的旧内容会被后续的笔采样到。详见 canvas_gpu.h。
     uint64_t texCreate(int w, int h, bool dynamic, bool nearest);
     void texUpload(uint64_t tex, const Rect& box, const uint8_t* pixels, uint32_t stride);
-    void texDestroy(uint64_t tex);
+    void texDestroy(uint64_t tex);   // 延迟到帧尾之后真正释放（见 pendingFree_）
     void drawTexture(uint64_t tex, const Rect& dst, const Rect& uv, const Color& tint);
 
-    // 这张 Surface 的像素被**原地改过**了（字形图集 / 阴影图集往里贴新格子）。
-    // drawSurface 的纹理缓存键是"像素指针 + 尺寸"（bin2d 的 Surface 没有代概念），
-    // 原地改像素不会改指针 ⇒ 不通知的话 GPU 一直采样**修改前**的那份纹理，
-    // 表现是"文字画成了上一批字形的样子/位置"（接线时实测到）。
-    // 调用方在写完像素之后调一次；句柄所有权不变（这里只丢缓存条目）。
+    // 这张 Surface 的像素被**原地改过**了（图片素材 / 视频帧）。
+    // drawSurface 的纹理缓存键是 Surface 的实例身份 + 尺寸，原地改像素不改身份 ⇒
+    // 不通知的话 GPU 一直采样**修改前**的那份纹理，表现是"文字画成了上一批字形
+    // 的样子/位置"（接线时实测到）。
+    // 调用方在写完像素之后调一次；句柄所有权不变（这里只打脏标记）。
     void imageChanged(const Surface& src);
 
     // ---- 图层（组透明度）与毛玻璃 ----
@@ -211,17 +215,28 @@ private:
         bool nearest = false;
     };
 
-    // drawSurface 的纹理缓存：bin2d 的 Surface 没有"代"概念，所以键就是
-    // 像素指针 + 尺寸（见 gpu_exec.cpp 里 surfaceTexture 的注释）。
+    // drawSurface 的纹理缓存：键是 Surface 的**实例身份**（`Surface::id()`，0.22.3）
+    // + 尺寸，不是像素指针 —— 指针会被复用（一张图销毁后下一张常拿到同一段内存），
+    // 撞上就会把新图画成旧内容（字形图集换页时实测到）。详见 surface.h 的 id() 说明。
     // dirty = 像素被原地改过：下次用之前**重传进同一张纹理**（不销毁句柄 ——
     // 帧内销毁会被已经录进命令缓冲的那几笔引用着）。
     struct ImgEntry {
-        const uint8_t* key = nullptr;
+        uint64_t id = 0;
         int w = 0;
         int h = 0;
         BgpuTexture tex = 0;
         bool dirty = false;
     };
+
+    // 帧内**不许当场销毁**纹理（0.22.3）：命令流是延迟执行的（帧尾才提交），
+    // 本帧已经录进去的那几笔还引用着句柄，而 binGPU 的句柄槽会被复用 ——
+    // 当场 destroy 之后，先前那批笔会采样到"下一张落进同一个槽的纹理"的内容
+    // （实测：字形图集淘汰时整页文字串格、阴影层错位）。
+    // 所以销毁统一进这张表，等"上一帧已经 fence 等完"再真正释放：入口是 beginFrame
+    // （frame_begin 之后：上一帧要么已经 submit+等 fence，要么那次重新录制已经把它
+    // 作废）与 destroy。
+    std::vector<BgpuTexture> pendingFree_;
+    void drainPendingFree();
 
     // ============================================================
     // 设备层
