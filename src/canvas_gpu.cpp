@@ -112,4 +112,29 @@ bool GpuPushLayer(GpuExec& gpu, const Rect& localBounds, float alpha) {
 
 void GpuPopLayer(GpuExec& gpu) { gpu.popLayer(); }
 
+// ---- 设备侧内容层（0.22.5）----
+bool GpuPushContentLayer(GpuExec& gpu, const Rect& localBounds) {
+    return gpu.pushContentLayer(localBounds);
+}
+
+bool GpuPopContentLayer(GpuExec& gpu, uint64_t& outId, Rect& outScreen) {
+    GpuExec::ContentLayerHandle h;
+    if (!gpu.popContentLayer(h)) return false;
+    outId = h.id;
+    outScreen = h.screen;
+    return true;
+}
+
+bool GpuDrawContentLayer(GpuExec& gpu, uint64_t id, const Rect& dstDevice, const Rect& uv,
+                         const Color& tint, float blurPx, bool nearest) {
+    return gpu.drawContentLayer(id, dstDevice, uv, tint, blurPx, nearest);
+}
+
+bool GpuFillContentLayer(GpuExec& gpu, uint64_t id, const Rect& dstDevice,
+                         const Color& color, float blurPx) {
+    return gpu.fillContentLayer(id, dstDevice, color, blurPx);
+}
+
+void GpuReleaseContentLayer(GpuExec& gpu, uint64_t id) { gpu.releaseContentLayer(id); }
+
 } // namespace bin2d

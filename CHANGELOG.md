@@ -3,6 +3,54 @@
 本文件记录 bin2d 的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.22.5] - 2026-11-20
+
+**GPU 执行体长出"设备上的离屏层"**（`pushContentLayer` / `popContentLayer` /
+`drawContentLayer` / `fillContentLayer` / `releaseContentLayer`）。这是 binUI 的图层模糊
+与外阴影最后缺的那块：以前 `pushOffscreen` 的出口是 `Surface`（像素回 CPU），GPU 模式下
+直接返回 false，于是图层特效只能退化成"纯组 alpha"——`svg-filter` 页对 `docs/pixels`
+是 **12.921% / max 204**。现在内容渲进离屏纹理、句柄交出去、按需加模糊或只借轮廓画回来：
+同一页 **0.000% / max 6**，另外 17 页一个数字都没变。
+
+设计上两个决定值得记：
+
+- **贴回有两种，不是一个 tint 能覆盖的**。binGPU 的 tint 是**预乘空间逐通道相乘**，
+  乘出来是"内容颜色 × 阴影色"；而外阴影要的是**只借轮廓**（`预乘(阴影色) × 内容alpha`）。
+  所以拆成 `drawContentLayer`（内容 × tint）与 `fillContentLayer`（纯色轮廓填）——
+  与 CPU 那条实现、与三份老 GPU 后端逐条同构，不是新发明。
+- **纹理按整窗复用**：内容层复用 `layerPool_` 那批整窗尺寸的层纹理（`inUse` 标记），
+  模糊链按尺寸留一份（上限 12，LRU），换尺寸时旧纹理进 `pendingFree_` —— 0.22.3 立的
+  规矩（帧中途销毁还会被命令缓冲引用的东西 = `VK_ERROR_DEVICE_LOST`）。
+
+`pushOffscreen/popOffscreen` 的语义**一个字没动**（GPU 仍返回 false）：它和这一对是
+"两条出口"的分工 —— 一个要像素，一个要纹理。
+
+新测试 `tests/test_content_layer.cpp`（17 项）：出口语义、复用、模糊、轮廓填、
+`canvas.cpp` 的不变式（不 include `bingpu.h`）。
+
+### 顺手修的一个自身 bug
+
+模糊贴回时若**层框越出窗口**（`filter:blur(20px)` 这种大 pad 最容易），uv/dst 必须按
+`S ∩ 抓取区` 取交集。第一版按整块映射，大模糊页整块位移 31%。
+
+### 发现的既有缺陷（不是这一版引入，未动）
+
+CPU 的 `Canvas::pushLayer` 在**嵌套**时原点不累积（`originX_ = clipped.x` 是父层的局部
+坐标，而 `deviceTransform()` 只减这一层）—— 实测外层 (200,100) 里套内层 (212,112)，
+内层内容 **0 个非透明像素**（应为 64）；外层原点小时只是整体偏几像素，所以一直没被门禁
+抓到。设备路径没有这个问题（执行体永远按屏幕坐标画进已清空的整窗纹理），于是
+`filter-blur.html` 那种"滤镜套滤镜"页会出现 GPU 与 CPU 差 2.6%。修它会动 CPU 像素权威
+（`pixels-bin2d` 基线），单独一版做。
+
+### 帧时欠账（filter 重的页）
+
+`svg-filter` 660×470 在窗口路径上现在 **~11.4 ms/帧**（老 `binui_gpu` ~2.9 ms，同页 CPU
+路径 13.9 ms）。两个结构原因都在这一层的权限之内、但需要额外坐标模型或 ABI：内容层纹理是
+**整窗**尺寸且带设备级 4× MSAA（每层一次 clear ≈ 5 MB 写 + 1.2 MB resolve，一页 10 层 +
+14 条阴影 ≈ 60 次全尺寸清屏），以及分离高斯是"2r+1 个整矩形累加"（4× MSAA 再乘 4）。
+解法方向：层纹理按层框尺寸分配（等于把 CPU 的 `originX_` 搬到 GPU，顺手修上面那个 bug），
+或 binGPU 开放**逐目标采样数**。两条都留作下一版。
+
 ## [0.22.4] - 2026-11-20
 
 **GPU 执行体吃上设备层的质量档**：`create()` 不再硬写 `msaa_samples = 1`，而是先问

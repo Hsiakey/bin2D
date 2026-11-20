@@ -75,4 +75,17 @@ void GpuDrawTexture(GpuExec& gpu, uint64_t tex, const Rect& dst, const Rect& uv,
 bool GpuPushLayer(GpuExec& gpu, const Rect& localBounds, float alpha);
 void GpuPopLayer(GpuExec& gpu);
 
+// ---- 设备侧内容层（0.22.5）----
+// 与 GpuPushLayer/GpuPopLayer 同一套入层语义，出口是**句柄**而不是合成：
+// 内容留在设备上，由调用方决定怎么贴回去（模糊 / 偏移 / 上色）。
+// 为什么不让 canvas.cpp 自己调 gpu_exec.h：老规矩 —— canvas.cpp 不许 include
+// bingpu.h（见文件顶上的说明），所以这一组仍然是"几个自由函数"。
+bool GpuPushContentLayer(GpuExec& gpu, const Rect& localBounds);
+bool GpuPopContentLayer(GpuExec& gpu, uint64_t& outId, Rect& outScreen);
+bool GpuDrawContentLayer(GpuExec& gpu, uint64_t id, const Rect& dstDevice, const Rect& uv,
+                         const Color& tint, float blurPx, bool nearest);
+bool GpuFillContentLayer(GpuExec& gpu, uint64_t id, const Rect& dstDevice,
+                         const Color& color, float blurPx);
+void GpuReleaseContentLayer(GpuExec& gpu, uint64_t id);
+
 } // namespace bin2d

@@ -190,8 +190,41 @@ public:
     //   pushOffscreen 吃掉接下来的绘制，popOffscreen 把内容**交出来**（不合成）。
     // 调用方拿到 (surface, originX, originY) 之后可以自己决定什么时候、按什么
     // 不透明度/混合模式贴回去（缓存就是"上一帧已经贴过一次了"）。
+    //
+    // **出口是 Surface** —— 这条只为"真的要拿像素"的调用方存在（子树缓存、导出）。
+    // GPU 模式下它恒返回 false（见下面的 pushContentLayer）。
     bool pushOffscreen(const Rect& localBounds);
     bool popOffscreen(Surface& out, int& originX, int& originY);
+
+    // ---- 设备侧离屏内容（0.22.5）----
+    // 与 pushOffscreen/popOffscreen **同一套入层语义**（同一个局部→设备映射、同一套
+    // 层内裁剪、同一个 4 层上限），但出口是**设备上的句柄**：内容不回到 CPU，
+    // 调用方拿着 handle 自己决定怎么贴回去。
+    //
+    // 为什么需要它："图层模糊 / 外阴影"要的正是"把整层内容当一张图、先在它上面做一次
+    // 模糊/上色，再按偏移画回去"。CPU 执行体走 pushOffscreen + Surface；GPU 执行体以前
+    // 没有对应物，于是上层只能降级成纯组 alpha（模糊和阴影整片消失）。
+    //
+    // 契约（三端都按这个写）：
+    //   · 只有挂了 GPU 执行体才可能成功；CPU 执行体一律返回 false，调用方据此走
+    //     自己的 Surface 那条路 —— 这就是"两个出口"的分工，不是谁替代谁；
+    //   · handle 由调用方拥有，**必须** releaseContentLayer 还回来（池子复用，
+    //     一帧里几十个图层也不新建纹理）；
+    //   · popContentLayer 同时给出内容在**设备像素**空间里的矩形（screen）。
+    //     层内层外的坐标口径与 pushLayer 完全一样（层内不改 target_ / 原点）。
+    bool pushContentLayer(const Rect& localBounds);
+    bool popContentLayer(uint64_t& outHandle, Rect& outScreen);
+    // 贴回（内容 × tint，可带模糊）。dst 是**局部坐标**（与 drawTexture 同一条变换
+    // 语义，内部映射成设备矩形后按屏幕空间合成），uv 是内容矩形上的归一化子矩形，
+    // tint 是预乘色。blurPx > 0 = 先分离高斯（σ = blurPx）再贴回。
+    // 合成恒按 SrcOver（与 compositeSurface(…, SrcOver) 同一个出口语义）。
+    bool drawContentLayer(uint64_t handle, const Rect& dstLocal, const Rect& uv,
+                          const Color& tint, float blurPx, bool nearest = false);
+    // 贴回（纯色轮廓）：内容的 alpha 当遮罩填 color，再按 blurPx 模糊。
+    // 外阴影要的就是这一条 —— 只借轮廓、不借内容自己的颜色。
+    bool fillContentLayer(uint64_t handle, const Rect& dstLocal, const Color& color,
+                          float blurPx);
+    void releaseContentLayer(uint64_t handle);
 
     // 把一张已经算好的内容图按"图层合成"语义贴回当前目标：
     // opacity 乘在内容上、blend 是这次合成的模式 —— 与 popLayer 的出口逐位相同
@@ -217,7 +250,8 @@ public:
     // 边界（0.22.2）：
     //   · target() 只用来回答 bounds()/尺寸 —— 挂上期间它的像素**不会被写**；
     //   · pushOffscreen / popOffscreen 在 GPU 模式下返回 false（那套 API 的出口是
-    //     Surface，GPU 侧不该把像素拿回 CPU）；
+    //     Surface，GPU 侧不该把像素拿回 CPU）；要设备侧的离屏层请用上面那对
+    //     pushContentLayer / popContentLayer（0.22.5）；
     //   · 路径（fillPath/clipPath/strokePath 的任意路径）仍然走 CPU 覆盖率——GPU 侧
     //     没有三角化；但**圆角矩形/圆角描边/直线/图片/渐变/毛玻璃**这些 UI 里 99% 的
     //     图元都在 GPU 上（圆角描边是 0.22.2 补的，见 strokeRounded 的注释）。

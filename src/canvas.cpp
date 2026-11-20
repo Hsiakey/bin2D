@@ -461,6 +461,8 @@ void Canvas::popLayer() {
 bool Canvas::pushOffscreen(const Rect& localBounds) {
     // GPU 模式的出口是"像素回 CPU"，那正是这一层不该做的事 —— 明确失败，
     // 调用方据此走不需要离屏的那条路（binUI 的 mask/clip-path 就是这样退化的）。
+    // **要设备上的离屏层**请用 pushContentLayer：那一对的目的地是设备纹理，
+    // 出口是句柄而不是 Surface（0.22.5）。
     if (gpu_) { GpuUnsupported("pushOffscreen（离屏出像素）"); return false; }
     return pushLayer(localBounds, 1.0f, BlendMode::SrcOver);
 }
@@ -485,6 +487,53 @@ bool Canvas::popOffscreen(Surface& out, int& originX, int& originY) {
     originY = layer.originY;
     out = std::move(layer.surface);
     return !out.empty();
+}
+
+// ------------------------------------------------------------
+// 设备侧离屏内容（0.22.5）
+//
+// 两条出口的分工写在这里一次：GPU 模式下一律走执行体（内容留在设备上，出口是
+// 句柄），CPU 模式一律返回 false 让调用方走自己的 Surface 那条路。没有"偷偷降级到
+// 另一条"的分支 —— 调用方（binUI 的 pushLayerEx）比这一层更清楚降级该怎么降。
+// ------------------------------------------------------------
+bool Canvas::pushContentLayer(const Rect& localBounds) {
+    if (!gpu_ || !target_ || localBounds.empty()) return false;
+    syncGpu();
+    if (!GpuPushContentLayer(*gpu_, localBounds)) return false;
+    // 与 pushLayer 的 GPU 分支逐条相同：层内默认正常混合（层的语义在贴回时表达）
+    state().blend = BlendMode::SrcOver;
+    return true;
+}
+
+bool Canvas::popContentLayer(uint64_t& outHandle, Rect& outScreen) {
+    outHandle = 0;
+    if (!gpu_) return false;
+    return GpuPopContentLayer(*gpu_, outHandle, outScreen);
+}
+
+bool Canvas::drawContentLayer(uint64_t handle, const Rect& dstLocal, const Rect& uv,
+                              const Color& tint, float blurPx, bool nearest) {
+    if (!gpu_ || !target_ || !handle) return false;
+    // dst 走 deviceTransform()（与 clipRect/drawTexture 同一条口径：层内要减掉原点），
+    // 执行体那边按屏幕空间贴回 —— 顶点已经是目标像素，不需要再过一遍变换。
+    const Rect dst = deviceTransform().mapBounds(dstLocal);
+    if (dst.empty()) return false;
+    syncGpu();
+    return GpuDrawContentLayer(*gpu_, handle, dst, uv, tint, blurPx, nearest);
+}
+
+bool Canvas::fillContentLayer(uint64_t handle, const Rect& dstLocal, const Color& color,
+                              float blurPx) {
+    if (!gpu_ || !target_ || !handle) return false;
+    const Rect dst = deviceTransform().mapBounds(dstLocal);
+    if (dst.empty()) return false;
+    syncGpu();
+    return GpuFillContentLayer(*gpu_, handle, dst, color, blurPx);
+}
+
+void Canvas::releaseContentLayer(uint64_t handle) {
+    if (!gpu_ || !handle) return;
+    GpuReleaseContentLayer(*gpu_, handle);
 }
 
 } // namespace bin2d

@@ -25,7 +25,11 @@
 //     create(…)
 //     beginFrame(clearArgb, clear)   → frame_begin + 开 canvas 的 render pass
 //       … 图元 …
-//     pushLayer/popLayer             → 在 canvas 与层纹理之间切 pass
+//     pushLayer/popLayer             → 在 canvas 与层纹理之间切 pass（出口 = 合成）
+//     pushContentLayer/…             → 同上，但出口是**句柄**：内容留在设备上，
+//       popContentLayer                由调用方决定怎么贴回去（0.22.5，见下面的注释）
+//     drawContentLayer/fillContentLayer → 内容 × tint（可带模糊）/ 纯色轮廓（可带模糊）
+//     releaseContentLayer            → 句柄还回池子（纹理不销毁，复用）
 //     backdropBlur(…)                → 抓背景 → 降采样 → 分离高斯 → 圆角合成
 //     present()                      → canvas 贴到交换链目标（REPLACE/NEAREST/1:1）
 //                                      + frame_end
@@ -159,6 +163,47 @@ public:
     void popLayer();
     bool backdropBlur(const Rect& area, float radius, float blurPx, float grain);
 
+    // ---- 内容层（0.22.5）：离屏层在设备上的一等操作 ----
+    //
+    // 为什么需要另一对 push/pop：pushLayer 的出口是**合成**（整层乘 alpha 再 over），
+    // 而"图层模糊 / 外阴影"要的是"把整层内容当一张图，先在它上面做一次模糊/上色，
+    // 再按偏移画回去"。后者在 CPU 上就是 pushOffscreen → Surface → 处理 → 贴回，
+    // 设备上以前没有对应物，于是 binUI 的 pushLayerEx 在 GPU 路径下只能退化成纯组
+    // alpha（模糊和阴影整片消失，svg-filter 一页 12.9% 像素不一样就是这么来的）。
+    //
+    // 语义与 pushLayer **逐条相同**（同一个局部→屏幕映射、同一个层内裁剪、层内默认
+    // SrcOver、同一套 4 层上限、同一个句柄池），只换出口：
+    //
+    //   pushContentLayer(bounds)   → 清空一张离屏纹理，之后的绘制落进去
+    //   popContentLayer(handle)    → **不合成**，把 (句柄, 内容矩形) 交出来
+    //   drawContentLayer(...)      → 内容 × tint（预乘相乘），可带模糊半径
+    //   fillContentLayer(...)      → 内容的 alpha 当遮罩填纯色，可带模糊半径（外阴影）
+    //   releaseContentLayer(id)    → 句柄还回池子；纹理留着给下一次 push 复用
+    //
+    // 句柄对调用方不透明（内部就是一层纹理 + 它在设备像素空间里的矩形）。
+    // **必须 release**：池子是有限且复用的（同一页几十个图层要能不新建纹理）。
+    struct ContentLayerHandle {
+        uint64_t id = 0;   // 0 = 无效
+        Rect screen;       // 内容在设备像素空间里的矩形（= localBounds 经变换的包围盒）
+        bool valid() const { return id != 0; }
+    };
+    bool pushContentLayer(const Rect& localBounds);
+    bool popContentLayer(ContentLayerHandle& out);
+    // dstDevice 是**设备像素**矩形（调用方已经映射过变换），uv 是内容矩形上的
+    // 归一化子矩形，tint 是预乘色（内容 × tint，与 drawSurface 的 tint 同口径）。
+    // blurPx > 0 时先在链上跑分离高斯再贴回（= CSS blur(Npx) 的 σ=N）；
+    // nearest 只在**没有**模糊时有意义（模糊结果本来就该双线性放大）。
+    bool drawContentLayer(uint64_t id, const Rect& dstDevice, const Rect& uv,
+                          const Color& tint, float blurPx, bool nearest);
+    // 外阴影的语义：out = 预乘(color) × 内容alpha，再按 blurPx 模糊。
+    // 为什么不是 drawContentLayer + tint：tint 在预乘空间是"逐通道相乘"，乘在
+    // **颜色**上就变成"内容自己的颜色 × 阴影色"，而外阴影要的是**只取轮廓**。
+    // 这与 CPU 那条实现逐条同构（① 铺纯色 ② dst *= 层 alpha ③ 模糊），
+    // 也是三份老 GPU 后端的做法。
+    bool fillContentLayer(uint64_t id, const Rect& dstDevice, const Color& color,
+                          float blurPx);
+    void releaseContentLayer(uint64_t id);
+
     struct Stats {
         int quads = 0;    // 提交的普通四边形数（每 quad 4 顶点）
         int shapes = 0;   // 提交的解析圆角四边形数
@@ -197,6 +242,7 @@ private:
         float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f;   // 屏幕（设备）矩形
         float alpha = 1.0f;
         BgpuTexture prevTarget = 0;
+        bool content = false;   // true = 内容层（popContentLayer 的出口，不合成）
     };
 
     struct BlurTex {
@@ -320,6 +366,30 @@ private:
     std::vector<LayerTarget> layerPool_;
     std::vector<LayerFrame> layerStack_;
     BlurChain blur_;
+    // 活着的**内容层**句柄（pop 之后、release 之前）。句柄 id 单调递增，
+    // 不与层池下标混用：池子只有一个，而句柄可能有多个同时在外面（阴影要从同一份
+    // 内容上贴好几趟）。
+    struct ContentEntry {
+        uint64_t id = 0;
+        int idx = -1;
+        Rect screen;
+    };
+    std::vector<ContentEntry> contentStack_;
+    uint64_t nextContentId_ = 1;
+    // 内容层的模糊链：**按尺寸各留一份**，跨帧复用。
+    // 为什么不共用 blur_：backdropBlur 的链每换一次尺寸就重建（destroyBlurChain），
+    // 而"帧中途销毁还会被命令缓冲引用的纹理"是 0.22.3 明令禁止的事 —— 一页几十个
+    // 尺寸不同的阴影要是共用一条链，每帧就是几十次销毁重建（踩过三次的坑）。
+    // 这里换尺寸时旧纹理挂 pendingFree_（下一帧 frame_begin 之后才真正释放）。
+    struct ContentBlur {
+        int w = 0;
+        int h = 0;
+        BlurChain chain;
+    };
+    static constexpr size_t kMaxContentBlur = 12;
+    std::vector<ContentBlur> contentBlur_;
+    BlurChain* acquireContentBlur(int w, int h);
+    void destroyContentBlur();
     std::vector<TexMeta> texMeta_;       // texCreate 出来的纹理（含 nearest 采样口径）
     std::vector<ImgEntry> imgCache_;     // drawSurface 的纹理缓存
     static constexpr size_t kMaxImgCache = 32;
@@ -368,11 +438,18 @@ private:
 
     int acquireLayer();
     void destroyLayerPool();
-    bool ensureBlurChain(int w, int h);
-    bool ensureBlurLevel(int index, int w, int h);
+    bool ensureBlurChainFor(BlurChain& c, int w, int h);
+    bool ensureBlurLevel(BlurChain& c, int index, int w, int h);
     bool ensureBlurSlot(BlurTex& slot, int w, int h);
-    bool gaussLevel(int level, float blurPx);
-    void destroyBlurChain();
+    bool gaussLevel(BlurChain& c, int level, float blurPx);
+    void destroyBlurChain(BlurChain& c);
+    void retireBlurChain(BlurChain& c);   // 纹理挂 pendingFree_（帧中途换尺寸用）
+    // 内容层的公共两步：① 把 src 上 (rx,ry,rw,rh) 那块抓进 chain.lv[0]（1:1 NEAREST）
+    // ② 2× 降采样 + 分离高斯。成功时 out = 结果纹理（与那块矩形一一对应）。
+    bool grabIntoBlurChain(BlurChain& c, BgpuTexture src, int rx, int ry, int rw, int rh);
+    bool blurChainDown(BlurChain& c, float blurPx, BgpuTexture& out);
+    // 设备像素矩形 → 整数化并夹进窗口（返回 false = 整块都在窗口外）
+    bool clampToWindow(const Rect& deviceRect, int& rx, int& ry, int& rw, int& rh) const;
 };
 
 } // namespace bin2d

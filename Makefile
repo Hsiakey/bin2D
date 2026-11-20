@@ -51,7 +51,8 @@ ifeq ($(BINGPU_LIB),)
     GPU_TEST :=
 else
     GPU_OBJS := $(OBJ_DIR)/gpu.o $(OBJ_DIR)/display_list.o $(OBJ_DIR)/gpu_exec.o $(OBJ_DIR)/canvas_gpu.o
-    GPU_TEST := $(TEST_DIR)/test_gpu_bridge$(EXT) $(TEST_DIR)/test_display_list$(EXT)
+    GPU_TEST := $(TEST_DIR)/test_gpu_bridge$(EXT) $(TEST_DIR)/test_display_list$(EXT) \
+                $(TEST_DIR)/test_content_layer$(EXT)
 endif
 
 TESTS := $(TEST_DIR)/test_geometry$(EXT) $(TEST_DIR)/test_raster$(EXT) \
@@ -111,6 +112,12 @@ $(TEST_DIR)/test_gpu_bridge$(EXT): tests/test_gpu_bridge.cpp $(LIB_A) $(GPU_OBJS
 	    $(RTLINK) $(LDFLAGS) -o $@
 
 $(TEST_DIR)/test_display_list$(EXT): tests/test_display_list.cpp $(LIB_A) $(GPU_OBJS) $(BINGPU_LIB)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INC) -I../binGPU/include $< $(LIB_A) $(BINGPU_LIB) \
+	    $(RTLINK) $(LDFLAGS) -o $@
+
+# 设备侧离屏层（0.22.5）：要 GpuExec 的具体类型（不是窄接口），所以也带 binGPU 的 include
+$(TEST_DIR)/test_content_layer$(EXT): tests/test_content_layer.cpp $(LIB_A) $(GPU_OBJS) $(BINGPU_LIB)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INC) -I../binGPU/include $< $(LIB_A) $(BINGPU_LIB) \
 	    $(RTLINK) $(LDFLAGS) -o $@

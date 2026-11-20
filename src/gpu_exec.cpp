@@ -365,7 +365,8 @@ void GpuExec::destroy() {
             inFrame_ = false;
         }
         destroyLayerPool();
-        destroyBlurChain();
+        destroyBlurChain(blur_);
+        destroyContentBlur();
         for (const TexMeta& m : texMeta_)
             if (m.tex) bingpu_texture_destroy(device_, m.tex);
         texMeta_.clear();
@@ -416,6 +417,7 @@ void GpuExec::destroy() {
     overflowWarned_ = false;
     layerStack_.clear();
     blur_ = BlurChain{};
+    contentStack_.clear();
     error_.clear();
     // 节拍器：设备没了，"下一拍"也就没有意义。复位成零初始化（struct_size==0），
     // 下一次 create 会按上面的 savedPolicy 重新 init + 灌策略。
@@ -572,6 +574,9 @@ void GpuExec::resetFrameState() {
     layerStack_.clear();
     // 上一帧没收的层（调用方漏了 popLayer）：内容作废，句柄归还池子
     for (LayerTarget& t : layerPool_) t.inUse = false;
+    // 内容层句柄同理：漏了 releaseContentLayer 就在这里作废（纹理还在池子里，
+    // 不销毁 —— 销毁只发生在 destroy()/换尺寸时）。
+    contentStack_.clear();
     curTex_ = whiteTexture();
     curSamp_ = sampLinear_;
 }
@@ -1511,6 +1516,374 @@ void GpuExec::popLayer() {
 }
 
 // ============================================================
+// 内容层（0.22.5）：离屏层在设备上的一等操作
+//
+// 入层那一半与 pushLayer 逐条同构（同一个层池、同一个层内裁剪、同一条"内容按屏幕
+// 坐标落进整窗纹理"的口径），差别只在出口：
+//   · popLayer      → 整层乘 alpha 合成回上一层（组透明度）；
+//   · popContentLayer → **什么都不合成**，只把 (纹理, 屏幕矩形) 变成一个句柄交出去。
+// 于是"图层模糊 / 外阴影"终于能在设备上做完：调用方拿着句柄，先按自己的需要把它
+// 模糊、按内容 alpha 上色、按偏移贴回来 —— 不需要像素回 CPU。
+//
+// 句柄池：纹理就是 layerPool_ 里的那一批（整窗尺寸、按 inUse 复用），**一帧里几十个
+// 图层不会新建纹理**；releaseContentLayer 只是把它标回空闲，销毁只发生在 destroy()。
+// ============================================================
+
+bool GpuExec::pushContentLayer(const Rect& localBounds) {
+    if (!drawing() || localBounds.empty()) return false;
+    if (static_cast<int>(layerStack_.size()) >= kMaxLayers) {
+        noteError("图层超过 4 层，多出来的内容层被丢弃");
+        return false;
+    }
+    flushAll();   // 层之前画的图元必须落在**上一层**，不能跟着进层
+    const int idx = acquireLayer();
+    if (idx < 0) {
+        noteError("内容层纹理分配失败");
+        return false;
+    }
+    LayerFrame f;
+    f.idx = idx;
+    const Rect scr = xf_.mapBounds(localBounds);
+    f.x = scr.x;
+    f.y = scr.y;
+    f.w = scr.w;
+    f.h = scr.h;
+    f.alpha = 1.0f;
+    f.prevTarget = passTarget_;
+    f.content = true;
+    layerPool_[static_cast<size_t>(idx)].inUse = true;
+    beginPass(layerPool_[static_cast<size_t>(idx)].tex, width_, height_, true, 0x00000000u);
+    if (!inPass_) {
+        layerPool_[static_cast<size_t>(idx)].inUse = false;
+        return false;
+    }
+    layerStack_.push_back(f);
+    ++stats_.layers;
+    curTex_ = whiteTexture();
+    curSamp_ = sampLinear_;
+    return true;
+}
+
+bool GpuExec::popContentLayer(ContentLayerHandle& out) {
+    if (!drawing() || layerStack_.empty()) return false;
+    if (!layerStack_.back().content) {
+        // 配对错了（拿 popContentLayer 去收一个 pushLayer）：**不弹**，让调用方的
+        // 降级路自己收自己的，别把两个栈搞乱。
+        noteError("popContentLayer: 栈顶不是内容层");
+        return false;
+    }
+    flushAll();   // 层内容先落进层纹理
+    const LayerFrame f = layerStack_.back();
+    layerStack_.pop_back();
+
+    // 回到入层前的目标（可能是 canvas，也可能是外层的层纹理）
+    beginPass(f.prevTarget ? f.prevTarget : canvas_, width_, height_, false, 0u);
+    if (!inPass_) {
+        layerPool_[static_cast<size_t>(f.idx)].inUse = false;
+        return false;
+    }
+    ContentEntry e;
+    e.id = nextContentId_++;
+    e.idx = f.idx;
+    e.screen = Rect(f.x, f.y, f.w, f.h);
+    contentStack_.push_back(e);
+    out.id = e.id;
+    out.screen = e.screen;
+    return true;
+}
+
+void GpuExec::releaseContentLayer(uint64_t id) {
+    if (!id) return;
+    for (size_t i = 0; i < contentStack_.size(); ++i) {
+        if (contentStack_[i].id != id) continue;
+        const int idx = contentStack_[i].idx;
+        if (idx >= 0 && idx < static_cast<int>(layerPool_.size()))
+            layerPool_[static_cast<size_t>(idx)].inUse = false;
+        contentStack_.erase(contentStack_.begin() + static_cast<std::ptrdiff_t>(i));
+        return;
+    }
+}
+
+bool GpuExec::clampToWindow(const Rect& r, int& rx, int& ry, int& rw, int& rh) const {
+    if (r.empty()) return false;
+    int x0 = static_cast<int>(std::floor(r.x));
+    int y0 = static_cast<int>(std::floor(r.y));
+    int x1 = static_cast<int>(std::ceil(r.right()));
+    int y1 = static_cast<int>(std::ceil(r.bottom()));
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > width_) x1 = width_;
+    if (y1 > height_) y1 = height_;
+    if (x1 - x0 < 1 || y1 - y0 < 1) return false;
+    rx = x0;
+    ry = y0;
+    rw = x1 - x0;
+    rh = y1 - y0;
+    return true;
+}
+
+GpuExec::BlurChain* GpuExec::acquireContentBlur(int w, int h) {
+    if (!device_ || w <= 0 || h <= 0) return nullptr;
+    for (size_t i = 0; i < contentBlur_.size(); ++i) {
+        if (contentBlur_[i].w != w || contentBlur_[i].h != h) continue;
+        if (i + 1 != contentBlur_.size()) {
+            // 挪到末尾 = 最近使用（池满时从头部顶掉）
+            const ContentBlur hit = contentBlur_[i];
+            contentBlur_.erase(contentBlur_.begin() + static_cast<std::ptrdiff_t>(i));
+            contentBlur_.push_back(hit);
+        }
+        return &contentBlur_.back().chain;
+    }
+    if (contentBlur_.size() >= kMaxContentBlur) {
+        // 池满：顶掉最久没用的那一条。旧纹理**挂 pendingFree_**，不在帧中途销毁
+        // （本帧已经录进命令流的笔可能还引用着它们，0.22.3 的坑）。
+        ContentBlur victim = contentBlur_.front();
+        contentBlur_.erase(contentBlur_.begin());
+        retireBlurChain(victim.chain);
+        victim.w = w;
+        victim.h = h;
+        if (!ensureBlurChainFor(victim.chain, w, h)) return nullptr;
+        contentBlur_.push_back(victim);
+        return &contentBlur_.back().chain;
+    }
+    ContentBlur cb;
+    cb.w = w;
+    cb.h = h;
+    if (!ensureBlurChainFor(cb.chain, w, h)) return nullptr;
+    contentBlur_.push_back(cb);
+    return &contentBlur_.back().chain;
+}
+
+void GpuExec::destroyContentBlur() {
+    for (ContentBlur& cb : contentBlur_) destroyBlurChain(cb.chain);
+    contentBlur_.clear();
+}
+
+// 抓取：把 src（整窗尺寸的纹理）上 (rx,ry,rw,rh) 那块 1:1 拷进 chain.lv[0]。
+// 整数对齐 + NEAREST = 逐像素拷贝，不做任何重采样（模糊只发生在后面几级）。
+bool GpuExec::grabIntoBlurChain(BlurChain& c, BgpuTexture src, int rx, int ry, int rw,
+                                int rh) {
+    if (!src || rw < 1 || rh < 1) return false;
+    if (!ensureBlurChainFor(c, rw, rh)) return false;
+    beginPass(c.lv[0].tex, rw, rh, true, 0x00000000u);
+    if (!inPass_) return false;
+    blend_ = BlendMode::Replace;
+    curTex_ = src;
+    curSamp_ = sampNearest_;
+    const float invW = 1.0f / static_cast<float>(width_);
+    const float invH = 1.0f / static_cast<float>(height_);
+    emitQuad(0.0f, 0.0f, static_cast<float>(rw), static_cast<float>(rh),
+             static_cast<float>(rx) * invW, static_cast<float>(ry) * invH,
+             static_cast<float>(rx + rw) * invW, static_cast<float>(ry + rh) * invH,
+             0xFFFFFFFFu);
+    flushAll();
+    return true;
+}
+
+// lv[0] 已经是待模糊的内容：逐级 2× 降采样到"σ 还剩 ≥2 纹素"那一级，再分离高斯。
+bool GpuExec::blurChainDown(BlurChain& c, float blurPx, BgpuTexture& out) {
+    if (!(blurPx > 0.0f) || !c.lv[0].tex) return false;
+    const int levels = BlurLevelsFor(blurPx);
+    for (int i = 1; i <= levels; ++i) {
+        const int dw = std::max(1, c.lv[i - 1].w / 2);
+        const int dh = std::max(1, c.lv[i - 1].h / 2);
+        if (!ensureBlurLevel(c, i, dw, dh)) return false;
+        beginPass(c.lv[i].tex, dw, dh, true, 0x00000000u);
+        if (!inPass_) return false;
+        blend_ = BlendMode::Replace;
+        curTex_ = c.lv[i - 1].tex;
+        curSamp_ = sampLinear_;
+        emitQuad(0.0f, 0.0f, static_cast<float>(dw), static_cast<float>(dh), 0.0f, 0.0f, 1.0f,
+                 1.0f, 0xFFFFFFFFu);
+        flushAll();
+    }
+    if (!gaussLevel(c, levels, blurPx)) return false;
+    out = c.lv[levels].tex;
+    return true;
+}
+
+bool GpuExec::drawContentLayer(uint64_t id, const Rect& dstDevice, const Rect& uv,
+                               const Color& tint, float blurPx, bool nearest) {
+    const ContentEntry* entry = nullptr;
+    for (const ContentEntry& c : contentStack_)
+        if (c.id == id) { entry = &c; break; }
+    if (!entry || !drawing()) return false;
+    if (dstDevice.empty() || tint.a == 0) return true;   // 没什么可画，也算做到了
+
+    const BgpuTexture layerTex = layerPool_[static_cast<size_t>(entry->idx)].tex;
+    if (!layerTex) return false;
+    const Rect content = entry->screen;
+    if (content.empty()) return true;
+
+    const BgpuTexture target = passTarget_ ? passTarget_ : canvas_;
+    const BlendMode savedBlend = blend_;
+    const BgpuTexture savedTex = curTex_;
+    const BgpuSampler savedSamp = curSamp_;
+    const bool savedInternal = internalPass_;
+    const bool savedScreen = screenSpace_;
+    bool done = false;
+
+    if (!(blurPx > 0.0f)) {
+        // 不模糊：直接把层纹理按 uv 贴回去。内容就在整窗纹理的 content 矩形上，
+        // 所以 uv 要先换算到 texture 空间的子矩形。
+        const float invW = 1.0f / static_cast<float>(width_);
+        const float invH = 1.0f / static_cast<float>(height_);
+        const float u0 = (content.x + uv.x * content.w) * invW;
+        const float v0 = (content.y + uv.y * content.h) * invH;
+        const float u1 = (content.x + uv.right() * content.w) * invW;
+        const float v1 = (content.y + uv.bottom() * content.h) * invH;
+        blend_ = BlendMode::SrcOver;
+        curTex_ = layerTex;
+        curSamp_ = nearest ? sampNearest_ : sampLinear_;
+        screenSpace_ = true;   // 顶点已经是目标像素：单位阵，但裁剪栈照常生效
+        emitQuad(dstDevice.x, dstDevice.y, dstDevice.right(), dstDevice.bottom(), u0, v0, u1,
+                 v1, tint.toArgbStraight());
+        flushAll();
+        done = true;
+    } else {
+        int rx = 0, ry = 0, rw = 0, rh = 0;
+        if (!clampToWindow(content, rx, ry, rw, rh)) return true;   // 整块在窗口外
+        BlurChain* chain = acquireContentBlur(rw, rh);
+        if (chain) {
+            internalPass_ = true;   // 抓取/降采样/高斯都是"各自目标的像素"
+            BgpuTexture blurred = 0;
+            if (grabIntoBlurChain(*chain, layerTex, rx, ry, rw, rh) &&
+                blurChainDown(*chain, blurPx, blurred)) {
+                // 抓下来的那块 G = (rx,ry,rw,rh) 是**内容矩形夹进窗口**之后的结果，
+                // 它与 dst 的比例 = dstDevice.w / content.w。调用方给的 uv 又可能只是
+                // 内容里的一段，所以真正要画的是 S ∩ G（S = uv 在内容空间的那块）：
+                // 层越出窗口时（大模糊的 pad 最容易），画出来的正好是"窗口里真的有的
+                // 那一块"，不会把边缘纹素当成整块拉过来。
+                const float sxc = content.w > 0.0f ? dstDevice.w / content.w : 1.0f;
+                const float syc = content.h > 0.0f ? dstDevice.h / content.h : 1.0f;
+                const float sx0 = content.x + uv.x * content.w;
+                const float sx1 = content.x + uv.right() * content.w;
+                const float sy0 = content.y + uv.y * content.h;
+                const float sy1 = content.y + uv.bottom() * content.h;
+                const float ix0 = std::max(sx0, static_cast<float>(rx));
+                const float iy0 = std::max(sy0, static_cast<float>(ry));
+                const float ix1 = std::min(sx1, static_cast<float>(rx + rw));
+                const float iy1 = std::min(sy1, static_cast<float>(ry + rh));
+                if (ix1 > ix0 && iy1 > iy0) {
+                    const float dx = dstDevice.x + (ix0 - content.x) * sxc;
+                    const float dy = dstDevice.y + (iy0 - content.y) * syc;
+                    const float dw = (ix1 - ix0) * sxc;
+                    const float dh = (iy1 - iy0) * syc;
+                    const float u0 = (ix0 - static_cast<float>(rx)) / static_cast<float>(rw);
+                    const float v0 = (iy0 - static_cast<float>(ry)) / static_cast<float>(rh);
+                    const float u1 = (ix1 - static_cast<float>(rx)) / static_cast<float>(rw);
+                    const float v1 = (iy1 - static_cast<float>(ry)) / static_cast<float>(rh);
+                    internalPass_ = savedInternal;
+                    beginPass(target, width_, height_, false, 0u);
+                    if (inPass_) {
+                        blend_ = BlendMode::SrcOver;
+                        curTex_ = blurred;
+                        curSamp_ = sampLinear_;
+                        screenSpace_ = true;
+                        emitQuad(dx, dy, dx + dw, dy + dh, u0, v0, u1, v1,
+                                 tint.toArgbStraight());
+                        flushAll();
+                        done = true;
+                    }
+                } else {
+                    done = true;   // 交集为空：没有可见内容，算做到了
+                }
+            }
+        }
+    }
+
+    internalPass_ = savedInternal;
+    screenSpace_ = savedScreen;
+    blend_ = savedBlend;
+    curTex_ = savedTex;
+    curSamp_ = savedSamp;
+    return done;
+}
+
+// 外阴影：out = 预乘(color) × 内容alpha（再模糊）。两趟，与 CPU 那条逐条同构：
+//   ① 在链的 lv[0] 上铺满预乘色（REPLACE，把内容矩形当画布）；
+//   ② dst *= 内容 alpha（KEEP）—— 于是拿到"轮廓 + 纯色"，与内容自己的颜色无关。
+// 坐标全程是各自目标的像素（internalPass_），最后再按屏幕空间 over 回去。
+bool GpuExec::fillContentLayer(uint64_t id, const Rect& dstDevice, const Color& color,
+                               float blurPx) {
+    const ContentEntry* entry = nullptr;
+    for (const ContentEntry& c : contentStack_)
+        if (c.id == id) { entry = &c; break; }
+    if (!entry || !drawing()) return false;
+    if (dstDevice.empty() || color.a == 0) return true;
+
+    const BgpuTexture layerTex = layerPool_[static_cast<size_t>(entry->idx)].tex;
+    if (!layerTex) return false;
+    int rx = 0, ry = 0, rw = 0, rh = 0;
+    if (!clampToWindow(entry->screen, rx, ry, rw, rh)) return true;
+
+    const BgpuTexture target = passTarget_ ? passTarget_ : canvas_;
+    const BlendMode savedBlend = blend_;
+    const BgpuTexture savedTex = curTex_;
+    const BgpuSampler savedSamp = curSamp_;
+    const bool savedInternal = internalPass_;
+    const bool savedScreen = screenSpace_;
+
+    BlurChain* chain = acquireContentBlur(rw, rh);
+    if (!chain) return false;
+
+    internalPass_ = true;
+    beginPass(chain->lv[0].tex, rw, rh, true, 0x00000000u);
+    if (!inPass_) {
+        internalPass_ = savedInternal;
+        return false;
+    }
+    const float fw = static_cast<float>(rw);
+    const float fh = static_cast<float>(rh);
+    blend_ = BlendMode::Replace;
+    curTex_ = whiteTexture();
+    curSamp_ = sampNearest_;
+    emitQuad(0.0f, 0.0f, fw, fh, 0.5f, 0.5f, 0.5f, 0.5f, color.toArgbStraight());
+    flushAll();
+    blend_ = BlendMode::Keep;   // dst *= srcA：只借内容的**覆盖率**，颜色来自上面那一层
+    curTex_ = layerTex;
+    const float invW = 1.0f / static_cast<float>(width_);
+    const float invH = 1.0f / static_cast<float>(height_);
+    emitQuad(0.0f, 0.0f, fw, fh, static_cast<float>(rx) * invW, static_cast<float>(ry) * invH,
+             static_cast<float>(rx + rw) * invW, static_cast<float>(ry + rh) * invH,
+             0xFFFFFFFFu);
+    flushAll();
+
+    BgpuTexture src = chain->lv[0].tex;
+    bool okAll = true;
+    if (blurPx > 0.0f) {
+        BgpuTexture blurred = 0;
+        if (blurChainDown(*chain, blurPx, blurred)) src = blurred;
+        else okAll = false;
+    }
+
+    if (okAll) {
+        internalPass_ = savedInternal;
+        beginPass(target, width_, height_, false, 0u);
+        if (inPass_) {
+            // 阴影的矩形 = 内容矩形（夹过窗口的那块）平移到 dstDevice 上
+            const float dx = dstDevice.x + (static_cast<float>(rx) - entry->screen.x);
+            const float dy = dstDevice.y + (static_cast<float>(ry) - entry->screen.y);
+            blend_ = BlendMode::SrcOver;
+            curTex_ = src;
+            curSamp_ = sampLinear_;
+            screenSpace_ = true;
+            emitQuad(dx, dy, dx + fw, dy + fh, 0.0f, 0.0f, 1.0f, 1.0f, 0xFFFFFFFFu);
+            flushAll();
+        } else {
+            okAll = false;
+        }
+    }
+
+    internalPass_ = savedInternal;
+    screenSpace_ = savedScreen;
+    blend_ = savedBlend;
+    curTex_ = savedTex;
+    curSamp_ = savedSamp;
+    return okAll;
+}
+
+// ============================================================
 // 毛玻璃（backdrop-filter 的唯一来源）
 //
 // 照 binUI 的 backdropBlur 抄结构：抓背景 → 逐级 2× 降采样 → 分离高斯 → 圆角合成。
@@ -1540,39 +1913,53 @@ bool GpuExec::ensureBlurSlot(BlurTex& slot, int w, int h) {
     return true;
 }
 
-bool GpuExec::ensureBlurLevel(int index, int w, int h) {
+bool GpuExec::ensureBlurLevel(BlurChain& c, int index, int w, int h) {
     if (index < 0 || index >= 6) return false;
-    return ensureBlurSlot(blur_.lv[index], w, h);
+    return ensureBlurSlot(c.lv[index], w, h);
 }
 
-void GpuExec::destroyBlurChain() {
+void GpuExec::destroyBlurChain(BlurChain& c) {
     for (int i = 0; i < 6; ++i) {
-        if (blur_.lv[i].tex && device_) bingpu_texture_destroy(device_, blur_.lv[i].tex);
-        blur_.lv[i] = BlurTex{};
+        if (c.lv[i].tex && device_) bingpu_texture_destroy(device_, c.lv[i].tex);
+        c.lv[i] = BlurTex{};
     }
-    if (blur_.scratch.tex && device_) bingpu_texture_destroy(device_, blur_.scratch.tex);
-    blur_.scratch = BlurTex{};
-    if (blur_.mask.tex && device_) bingpu_texture_destroy(device_, blur_.mask.tex);
-    blur_.mask = BlurTex{};
-    blur_.w = blur_.h = 0;
+    if (c.scratch.tex && device_) bingpu_texture_destroy(device_, c.scratch.tex);
+    c.scratch = BlurTex{};
+    if (c.mask.tex && device_) bingpu_texture_destroy(device_, c.mask.tex);
+    c.mask = BlurTex{};
+    c.w = c.h = 0;
 }
 
-bool GpuExec::ensureBlurChain(int w, int h) {
-    if (blur_.w == w && blur_.h == h && blur_.lv[0].tex) return true;
-    destroyBlurChain();
-    blur_.w = w;
-    blur_.h = h;
-    return ensureBlurLevel(0, w, h);
+// 帧中途换尺寸：**不能**当场销毁（本帧已经录进命令流的那几笔还引用着它们，
+// 0.22.3 的坑）。挂进 pendingFree_，下一帧 frame_begin 之后统一释放。
+void GpuExec::retireBlurChain(BlurChain& c) {
+    for (int i = 0; i < 6; ++i) {
+        if (c.lv[i].tex) pendingFree_.push_back(c.lv[i].tex);
+        c.lv[i] = BlurTex{};
+    }
+    if (c.scratch.tex) pendingFree_.push_back(c.scratch.tex);
+    c.scratch = BlurTex{};
+    if (c.mask.tex) pendingFree_.push_back(c.mask.tex);
+    c.mask = BlurTex{};
+    c.w = c.h = 0;
 }
 
-bool GpuExec::gaussLevel(int level, float blurPx) {
+bool GpuExec::ensureBlurChainFor(BlurChain& c, int w, int h) {
+    if (c.w == w && c.h == h && c.lv[0].tex) return true;
+    retireBlurChain(c);
+    c.w = w;
+    c.h = h;
+    return ensureBlurLevel(c, 0, w, h);
+}
+
+bool GpuExec::gaussLevel(BlurChain& c, int level, float blurPx) {
     if (level < 0 || level >= 6) return false;
-    const int lw = blur_.lv[level].w;
-    const int lh = blur_.lv[level].h;
-    if (!blur_.lv[level].tex || lw < 1 || lh < 1) return false;
+    const int lw = c.lv[level].w;
+    const int lh = c.lv[level].h;
+    if (!c.lv[level].tex || lw < 1 || lh < 1) return false;
     const float sigma = blurPx / static_cast<float>(1 << level);
     if (!(sigma > 0.0f)) return false;
-    if (!ensureBlurSlot(blur_.scratch, lw, lh)) return false;
+    if (!ensureBlurSlot(c.scratch, lw, lh)) return false;
 
     unsigned w[33];
     const int n = GaussTaps(sigma, w, 33);
@@ -1582,28 +1969,28 @@ bool GpuExec::gaussLevel(int level, float blurPx) {
     const float flh = static_cast<float>(lh);
 
     // 横：level → scratch（加法累加，权重和 = 255 ⇒ alpha 不变）
-    beginPass(blur_.scratch.tex, lw, lh, true, 0x00000000u);
+    beginPass(c.scratch.tex, lw, lh, true, 0x00000000u);
     if (!inPass_) return false;
     blend_ = BlendMode::Additive;
-    curTex_ = blur_.lv[level].tex;
+    curTex_ = c.lv[level].tex;
     curSamp_ = sampLinear_;
     for (int k = -r; k <= r; ++k) {
         const float o = static_cast<float>(k);
-        const uint32_t c = (w[k + r] << 24) | 0x00FFFFFFu;
-        emitQuad(0.0f, 0.0f, flw, flh, o / flw, 0.0f, 1.0f + o / flw, 1.0f, c);
+        const uint32_t col = (w[k + r] << 24) | 0x00FFFFFFu;
+        emitQuad(0.0f, 0.0f, flw, flh, o / flw, 0.0f, 1.0f + o / flw, 1.0f, col);
     }
     flushAll();
 
     // 纵：scratch → level（覆盖写，所以目标内容由 clear 重置）
-    beginPass(blur_.lv[level].tex, lw, lh, true, 0x00000000u);
+    beginPass(c.lv[level].tex, lw, lh, true, 0x00000000u);
     if (!inPass_) return false;
     blend_ = BlendMode::Additive;
-    curTex_ = blur_.scratch.tex;
+    curTex_ = c.scratch.tex;
     curSamp_ = sampLinear_;
     for (int k = -r; k <= r; ++k) {
         const float o = static_cast<float>(k);
-        const uint32_t c = (w[k + r] << 24) | 0x00FFFFFFu;
-        emitQuad(0.0f, 0.0f, flw, flh, 0.0f, o / flh, 1.0f, 1.0f + o / flh, c);
+        const uint32_t col = (w[k + r] << 24) | 0x00FFFFFFu;
+        emitQuad(0.0f, 0.0f, flw, flh, 0.0f, o / flh, 1.0f, 1.0f + o / flh, col);
     }
     flushAll();
     blend_ = BlendMode::SrcOver;
@@ -1640,7 +2027,7 @@ bool GpuExec::backdropBlur(const Rect& area, float radius, float blurPx, float g
     internalPass_ = true;   // 内部坐标 = 各自目标的像素：单位阵 + 整目标裁剪
 
     // 1) 抓背景：当前目标 → level0（整数对齐的 1:1 拷贝，NEAREST 采样）
-    if (!ensureBlurChain(rw, rh)) {
+    if (!ensureBlurChainFor(blur_, rw, rh)) {
         okAll = false;
     } else {
         beginPass(blur_.lv[0].tex, rw, rh, true, 0x00000000u);
@@ -1663,7 +2050,7 @@ bool GpuExec::backdropBlur(const Rect& area, float radius, float blurPx, float g
     for (int i = 1; i <= levels && okAll; ++i) {
         const int dw = std::max(1, blur_.lv[i - 1].w / 2);
         const int dh = std::max(1, blur_.lv[i - 1].h / 2);
-        if (!ensureBlurLevel(i, dw, dh)) {
+        if (!ensureBlurLevel(blur_, i, dw, dh)) {
             okAll = false;
             break;
         }
@@ -1681,7 +2068,7 @@ bool GpuExec::backdropBlur(const Rect& area, float radius, float blurPx, float g
     }
 
     // 3) 分离高斯（在"σ 还剩 ≥2 纹素"的那一级上；σ 很小的时候就是 0 级全分辨率）
-    if (okAll && !gaussLevel(levels, blurPx)) okAll = false;
+    if (okAll && !gaussLevel(blur_, levels, blurPx)) okAll = false;
     blend_ = BlendMode::SrcOver;
 
     // 4) 成品：模糊结果 → 颗粒 → 圆角遮罩
