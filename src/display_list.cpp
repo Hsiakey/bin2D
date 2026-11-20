@@ -149,7 +149,9 @@ void DisplayList::drawImage(const Surface& image, const Rect& dst, const Rect& u
 //    （0.18.0 这里写的是另一条理由 —— "CPU 是直通插值"。真相是反的：CPU 走预乘，
 //     真正被这条挡住的其实是"直通域插值"的 GPU，而且那时四角色自己还被多预乘了一次。）
 // ② 缩小的贴图：CPU 的 Surface 采样器放大时双线性、缩小时走盒式预滤波；GPU 执行体现在
-//    只有双线性点采样 + 无 mipmap。缩小越多差得越远（边缘整级差异）。
+//    会按缩小比例请求真 mip 链（`GpuExec::drawSurface` 的 kMipDownscale），也就是
+//    三线性 —— 但 mip 链是"逐级 2× 的盒式平均 + 级间线性"，与 CPU 用一个窗宽等于
+//    缩放比的盒式核**不是同一个滤波器**，缩小越多差得越远（边缘整级差异）。
 //
 // 两条都是"整份退回 CPU"，不是"画得差不多"。
 bool DisplayList::gpuCompatible(std::string* reason) const {

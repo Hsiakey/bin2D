@@ -146,6 +146,7 @@ GpuExec::~GpuExec() { destroy(); }
 bool GpuExec::ready() const { return ok(); }
 int GpuExec::width() const { return width_; }
 int GpuExec::height() const { return height_; }
+int GpuExec::msaaSamples() const { return static_cast<int>(msaaSamples_); }
 BgpuBackendKind GpuExec::backend() const { return backend_; }
 const char* GpuExec::backendName() const { return bingpu_backend_name(backend_); }
 const std::string& GpuExec::lastError() const { return error_; }
@@ -199,15 +200,34 @@ bool GpuExec::create(void* window, int width, int height, BgpuBackendKind backen
     const uint32_t vsyncFlag =
         (vsync && !headless) ? static_cast<uint32_t>(BGPU_DEVICE_VSYNC) : 0u;
 
+    // 后端与质量档**都问 binGPU**（不在这里猜）：bingpu_render_plan 是设备层给的
+    // 唯一入口，0.15.x 起档位按后端定（VK 4 / GL·D3D11·CPU 1；GL 只给 1 是因为
+    // 窗口路径 4× 还有欠账，见 binGPU 的 docs/backends.md 欠账 12）。
+    // 以前是直接 bingpu_device_create 让设备自己解析 AUTO 并且硬写 msaa=1 ——
+    // 结果是这条链（binUI → bin2d → binGPU）的画质永远停在 1×，而 binGPU 其实能开。
+    //
+    // 只把 **AUTO** 换成 plan 解析出来的具体后端：显式指定的后端原样传下去，
+    // 不可用时要让 device_create 报出真实原因，不能被 plan 悄悄换成 CPU。
+    BgpuRenderPlan plan{};
+    plan.struct_size = sizeof(plan);
+    if (bingpu_render_plan(backend, &plan) != BGPU_OK) {
+        plan.backend = backend;   // 计划拿不到就退回"让设备自己解析"
+        plan.msaa_samples = 1;
+    }
+    const BgpuBackendKind planBackend =
+        (backend == BGPU_BACKEND_AUTO) ? plan.backend : backend;
+
     BgpuDeviceDesc dd{};
     dd.struct_size = sizeof(dd);
-    dd.backend = backend;
+    dd.backend = planBackend;
     dd.native_window = window;
     dd.width = static_cast<uint32_t>(width);
     dd.height = static_cast<uint32_t>(height);
     dd.flags = static_cast<uint32_t>(BGPU_DEVICE_VALIDATE) |
                (headless ? static_cast<uint32_t>(BGPU_DEVICE_HEADLESS) : 0u) | vsyncFlag;
-    dd.msaa_samples = 1;
+    // 设备会按自己的上限降级（要 8 而只到 4 时给 4，完全不支持则退回 1）；
+    // 实际生效值在交换链建好之后从 bingpu_swapchain_info 读回来。
+    dd.msaa_samples = plan.msaa_samples ? plan.msaa_samples : 1u;
     BgpuResult r = bingpu_device_create(&dd, &device_);
     if (r != BGPU_OK) {
         fail("bingpu_device_create", r);
@@ -220,8 +240,11 @@ bool GpuExec::create(void* window, int width, int height, BgpuBackendKind backen
     // （bin2d 的这一版不持有覆盖率模板缓存，见头注释）。
     BgpuCaps caps{};
     caps.struct_size = sizeof(caps);
-    shapeOk_ = (bingpu_device_caps(device_, &caps) == BGPU_OK) &&
-               (caps.flags & BGPU_CAP_SHAPE) != 0;
+    const bool capsOk = bingpu_device_caps(device_, &caps) == BGPU_OK;
+    shapeOk_ = capsOk && (caps.flags & BGPU_CAP_SHAPE) != 0;
+    // 真 mip 链也是能力位：CPU / D3D11 接受 BGPU_TEXTURE_MIPMAPS 但降级为 1 级，
+    // 所以没有这一位就**根本不请求**（请求也只是让后端多算一遍降级）。
+    mipOk_ = capsOk && (caps.flags & BGPU_CAP_MIPMAPS) != 0;
 
     BgpuSwapchainDesc sd{};
     sd.struct_size = sizeof(sd);
@@ -235,6 +258,18 @@ bool GpuExec::create(void* window, int width, int height, BgpuBackendKind backen
         fail("bingpu_swapchain_create", r);
         destroy();
         return false;
+    }
+
+    // 实际开到的档位：以**交换链上报**为准（desc 里只是"要多少"）。
+    // 设备连 CAP_MSAA 都不声明时不信那个数字 —— 按 1 记（拿不到能力就当没开）。
+    {
+        BgpuSwapchainInfo sinfo{};
+        sinfo.struct_size = sizeof(sinfo);
+        msaaSamples_ = 1;
+        if (capsOk && (caps.flags & BGPU_CAP_MSAA) &&
+            bingpu_swapchain_info(swapchain_, &sinfo) == BGPU_OK) {
+            msaaSamples_ = sinfo.msaa_samples ? sinfo.msaa_samples : 1u;
+        }
     }
 
     // 5 种混合 × {2D, 形状}。管线表按 **BgpuBlend 的值**建（下标 = 枚举值），
@@ -357,6 +392,8 @@ void GpuExec::destroy() {
     width_ = height_ = 0;
     backend_ = BGPU_BACKEND_AUTO;
     shapeOk_ = false;
+    mipOk_ = false;
+    msaaSamples_ = 1;
     inPass_ = false;
     inFrame_ = false;
     internalPass_ = false;
@@ -453,13 +490,16 @@ bool GpuExec::ensureCanvas() {
 // 图元纹理专用：建 / 传都挪到 pass 外面（理由见头文件里的注释）。
 // 目标与尺寸在挂起前记下来，传完用 clear=false 重新 begin —— 内容原地保留。
 BgpuTexture GpuExec::makeImageTexture(int w, int h, const uint8_t* pixels,
-                                      uint32_t stride) {
+                                      uint32_t stride, bool mips) {
     const BgpuTexture target = passTarget_;
     const int tw = passW_, th = passH_;
     const bool resume = inPass_ && target != 0;
     if (resume) endPass();
-    BgpuTexture tex = makeTexture(w, h, BGPU_TEXTURE_DYNAMIC | BGPU_TEXTURE_PREMULTIPLIED,
-                                  pixels, stride);
+    // 预乘位必带（bin2d 的 Surface 就是预乘）。mips 时后端会把整条链建出来并按 LOD
+    // 采样 —— 被明显缩小的图不再闪（binGPU 0.15.0 起 VK/GL 是真链）。
+    uint32_t flags = BGPU_TEXTURE_DYNAMIC | BGPU_TEXTURE_PREMULTIPLIED;
+    if (mips) flags |= BGPU_TEXTURE_MIPMAPS;
+    BgpuTexture tex = makeTexture(w, h, flags, pixels, stride);
     if (resume) beginPass(target, tw, th, false, 0u);
     return tex;
 }
@@ -1131,10 +1171,38 @@ void GpuExec::fillRoundedGradient(const Rect& r, float radius, float angleDeg,
     emitShapeColors(r.x, r.y, r.w, r.h, rad, 0.0f, colors);
 }
 
+// ------------------------------------------------------------
+// mip 的请求门槛（单位：倍）。
+//
+// 准则：**只有会被缩小采样的图元纹理才请求真 mip 链**（判据在下面 drawSurface：
+// 用 uv 折算出的源像素尺寸与目标矩形比）。数据支撑（`make pixels-bin2d-gpu`，
+// 18 页对 binUI/docs/pixels 基线，VK 4×、0.5% 容差 / 单通道 8）：
+//   · image-mip（512² 源图缩到 64~200 px，2px 棋盘）**不要 mip：37.021% 像素不同、
+//     最大通道差 128**（摩尔纹）；要 mip：**0.000% / max 0**。所以这条不是可选项。
+//   · 其余 17 页的图片要么 1:1、要么放大，mip 开与不开**逐像素相同**。
+// 代价（`probe_cost`，窗口路径、30 帧中位，同一轮里交替跑"无条件请求"与"1.5× 门槛"
+// 两份构建）：两者差 ≤3%（appshow 1.58~1.65 对 1.58~1.61 ms），而**同一份二进制
+// 连跑两次也能差 ±0.05 ms** —— 帧时上量不出差别；代价落在显存（链多 ~1/3）与建链
+// 时那一串逐级 blit 上。
+// 所以门槛的作用不是省帧时，而是**把不缩小的纹理留在默认 1 级路径上**：那条路径与
+// 改动前逐位相同（不给几百张 1:1 图标各建一条 10 级链，也不引入任何像素风险）。
+// 门槛取 1.5 而不是 1.0：1.0~1.5 之间是双线性自己的地盘（一个目标像素最多覆盖 2 个
+// 纹素），mip 救不回信息；而 1:1 贴图（九宫格的角、图标）永远不进 mip 路径。
+// ------------------------------------------------------------
+constexpr float kMipDownscale = 1.5f;
+
 void GpuExec::drawSurface(const Surface& src, const Rect& dst, const Rect& uv,
                           const Color& tint) {
     if (!drawing() || src.empty() || dst.empty() || tint.a == 0) return;
-    BgpuTexture tex = surfaceTexture(src);
+    // 会不会被**缩小**采样？uv 决定用到的是源图的哪一块（九宫格/图集走子矩形），
+    // 所以按 uv 折算成源像素尺寸再比，而不是拿整张图比 —— 否则"40×40 的角贴到
+    // 40×40"会被当成 1:1，"整张 200×200 的图只用中间 10×10 那块"会被误判成放大。
+    // 与 DisplayList::gpuCompatible 判"缩小贴图"的口径逐字相同（同一套折算）。
+    const float srcW = uv.w * static_cast<float>(src.width());
+    const float srcH = uv.h * static_cast<float>(src.height());
+    const bool shrink = (srcW > 0.0f && dst.w * kMipDownscale < srcW) ||
+                        (srcH > 0.0f && dst.h * kMipDownscale < srcH);
+    BgpuTexture tex = surfaceTexture(src, shrink);
     if (!tex) return;
     curTex_ = tex;
     curSamp_ = sampLinear_;
@@ -1294,7 +1362,7 @@ void GpuExec::imageChanged(const Surface& src) {
 // 纹理缓存（drawSurface）
 // ============================================================
 
-BgpuTexture GpuExec::surfaceTexture(const Surface& src) {
+BgpuTexture GpuExec::surfaceTexture(const Surface& src, bool wantMips) {
     if (!device_ || src.empty()) return 0;
     // 缓存键是 Surface 的**实例身份** + 尺寸（0.22.3），不是像素指针：
     // 指针会被复用 —— 一张图销毁后，下一张同样尺寸的图常拿到同一段内存，撞上就会把
@@ -1303,9 +1371,24 @@ BgpuTexture GpuExec::surfaceTexture(const Surface& src) {
     // 内容会变的场景（字形图集 / 视频帧）有两条路：
     //   · 每次改完调 imageChanged()（帧内增量更新，见下）；
     //   · 或者干脆用 texCreate/texUpload 自己管句柄。
+    // 设备没有 CAP_MIPMAPS（CPU / D3D11）时请求也没用，别让后端白走降级。
+    const bool want = wantMips && mipOk_;
     const uint64_t key = src.id();
     for (ImgEntry& e : imgCache_) {
         if (e.id != key || e.w != src.width() || e.h != src.height()) continue;
+        if (want && !e.mips) {
+            // 先按 1:1 建过、后来才被缩着画（九宫格的角先 1:1、中心后拉伸就是这种
+            // 顺序）：**升一次级**。旧句柄不能当场销毁（批次里还引用着），挂进
+            // pendingFree_ 等帧尾；同一个 Surface 只升一次，之后一直带 mip 链。
+            BgpuTexture up = makeImageTexture(src.width(), src.height(), src.pixels().data(),
+                                              static_cast<uint32_t>(src.stride()), true);
+            if (up) {
+                pendingFree_.push_back(e.tex);
+                e.tex = up;
+                e.mips = true;
+                e.dirty = false;   // 升级时已经传了最新像素
+            }
+        }
         if (e.dirty) {
             // 原地改过的像素：**重传进同一张纹理**。不销毁重建是刻意的 ——
             // 帧内销毁的句柄可能还被已经录进命令缓冲的图元引用着（Vulkan 上表现为
@@ -1326,9 +1409,9 @@ BgpuTexture GpuExec::surfaceTexture(const Surface& src) {
         imgCache_.erase(imgCache_.begin());
     }
     BgpuTexture tex = makeImageTexture(src.width(), src.height(), src.pixels().data(),
-                                       static_cast<uint32_t>(src.stride()));
+                                       static_cast<uint32_t>(src.stride()), want);
     if (!tex) return 0;
-    imgCache_.push_back(ImgEntry{key, src.width(), src.height(), tex, false});
+    imgCache_.push_back(ImgEntry{key, src.width(), src.height(), tex, false, want});
     return tex;
 }
 

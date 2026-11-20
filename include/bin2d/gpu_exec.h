@@ -73,6 +73,11 @@ public:
     int height() const;
     BgpuBackendKind backend() const;
     const char* backendName() const;
+    // 实际开到的 MSAA 档（1 = 没开）。**不是**"想要多少"，而是设备上报的生效值
+    // （create 时从 bingpu_swapchain_info().msaa_samples 读回来）。
+    // 想要多少由 binGPU 的 bingpu_render_plan 按后端定（VK 4 / GL·D3D11·CPU 1），
+    // 这里只负责如实转述，供上层诊断与日志用。
+    int msaaSamples() const;
     const std::string& lastError() const;
 
     // ---- 帧 ----
@@ -220,12 +225,16 @@ private:
     // 撞上就会把新图画成旧内容（字形图集换页时实测到）。详见 surface.h 的 id() 说明。
     // dirty = 像素被原地改过：下次用之前**重传进同一张纹理**（不销毁句柄 ——
     // 帧内销毁会被已经录进命令缓冲的那几笔引用着）。
+    // mips = 这张纹理带真 mip 链（请求过 BGPU_TEXTURE_MIPMAPS 且设备有 CAP_MIPMAPS）。
+    // 缩小采样才需要它；建链在上传时多一条 blit 链 + 一次 submit/fence，所以按需请求
+    // （判据见 src/gpu_exec.cpp 的 kMipDownscale）。
     struct ImgEntry {
         uint64_t id = 0;
         int w = 0;
         int h = 0;
         BgpuTexture tex = 0;
         bool dirty = false;
+        bool mips = false;
     };
 
     // 帧内**不许当场销毁**纹理（0.22.3）：命令流是延迟执行的（帧尾才提交），
@@ -247,6 +256,11 @@ private:
     BgpuPipeline pipe2d_[5] = {0, 0, 0, 0, 0};      // 下标 = BgpuBlend 的值
     BgpuPipeline pipeShape_[5] = {0, 0, 0, 0, 0};   // 同上；没有 CAP_SHAPE 时全 0
     bool shapeOk_ = false;
+    // 设备声明的两项能力（**能力位**，不是"已经开了"）：mip 链与 MSAA。
+    // 拿不到 caps 时两个都当"没有" —— 请求 MIPMAPS/4× 也不会发生任何事，
+    // 只是让后端多走一遍降级判断。
+    bool mipOk_ = false;
+    uint32_t msaaSamples_ = 1;   // 交换链上报的**实际生效**档（1 = 没开）
     BgpuSampler sampLinear_ = 0;
     BgpuSampler sampNearest_ = 0;
     BgpuSampler sampRepeat_ = 0;
@@ -322,11 +336,15 @@ private:
     // 图元纹理的建/传要**在 pass 外面**做（binGPU 的 texture_create/upload 会重置
     // 当前 pass 的 viewport / scissor / affine，插在 begin_render 之间会让之后的图元
     // 按默认视口落像素）。这两个封装负责 flush + endPass + 传完重新 begin。
-    BgpuTexture makeImageTexture(int w, int h, const uint8_t* pixels, uint32_t stride);
+    // mips = 建完整 mip 链（只有"会被缩小采样"的图元纹理才要，见 kMipDownscale）。
+    BgpuTexture makeImageTexture(int w, int h, const uint8_t* pixels, uint32_t stride,
+                                 bool mips);
     bool reuploadImageTexture(BgpuTexture tex, const uint8_t* pixels, uint32_t stride);
     BgpuTexture whiteTexture();
     BgpuTexture ensureNoise();
-    BgpuTexture surfaceTexture(const Surface& src);
+    // wantMips = 这一笔会把它缩小采样。缓存里的纹理第一次按 1:1 建、后来才被缩着画时
+    // 会**升一次级**（重建带 mip 链的纹理，旧句柄挂 pendingFree_）。
+    BgpuTexture surfaceTexture(const Surface& src, bool wantMips);
     BgpuSampler samplerFor(BgpuTexture tex) const;
     bool ensureCanvas();
     void resetFrameState();
