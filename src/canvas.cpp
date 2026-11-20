@@ -414,7 +414,13 @@ void Canvas::compositeSurface(const Surface& surface, int originX, int originY, 
     if (!target_ || surface.empty() || opacity <= 0.0f) return;
     RasterTarget rt;
     rt.surface = target_;
-    rt.clip = target_->bounds();
+    // 合成也是一次**真实的绘制**：必须按当前 clipRect 落像素（与 makeTarget 同一口径）。
+    // 只按 target 边界裁是不够的 —— 局部重绘（脏矩形）时，层内容是按"入层那一刻的
+    // clipRect"分配尺寸的，而外阴影会按 (sdx,sdy) 偏移贴回，偏移量就能把阴影推到
+    // 脏矩形外面去（脏矩形边界上留下一圈硬边旧阴影）。GPU 那条出口（GpuPopLayer /
+    // drawContentLayer / fillContentLayer）是按裁剪栈 scissor 的，这里补齐同一条语义。
+    rt.clip = Rect::intersect(state().clipRect, target_->bounds());
+    if (rt.clip.empty()) return;
     rt.mask = nullptr;              // 层外已经有了自己的裁剪：层已按裁剪尺寸分配
     rt.blend = blend;
     const Rect dstRect(static_cast<float>(originX), static_cast<float>(originY),

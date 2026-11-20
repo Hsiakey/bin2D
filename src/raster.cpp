@@ -1407,13 +1407,20 @@ inline void CompositeRowFused(uint8_t* dstRow, float* acc, float* delta, int tLo
         }
         if (c >= 1.0f) {
             // 整像素段：delta/acc 都为 0 的连续像素覆盖率恒等于当前 run（≥1）
+            //
+            // ⚠ 本像素**自己的**覆盖率是 c，不是 run：c 可能完全来自 acc（左右两条
+            // 边被裁剪切齐时，裁剪边界那一列的子扫描线覆盖率全记在 acc 上，run 还是 0）。
+            // 早先这里直接 emitRun(i, j, run)，于是"裁剪边界那一列"被 run=0 判掉 ——
+            // 局部重绘时脏矩形左右边上的那一列像素少画一次（make partial 在
+            // buttonshow 上量到的 39 个 clip 内差异像素就是这个：每个都是脏矩形边上的单列）。
+            BlendOne<M>(dstRow + static_cast<size_t>(x0 + i) * 4u, color);
             int j = i + 1;
             while (j <= tHi && delta[j] == 0.0f && acc[j] == 0.0f) {
                 acc[j] = 0.0f;
                 delta[j] = 0.0f;
                 ++j;
             }
-            emitRun(i, j, run);
+            emitRun(i + 1, j, run);
             i = j;
             continue;
         }
@@ -1533,8 +1540,15 @@ void FillRoundedSolidDirect(const RasterTarget& t, const std::vector<Polyline>& 
     const int candBegin = static_cast<int>(std::ceil(devRect.y + rad));
     const int candEnd = static_cast<int>(std::floor(devRect.bottom() - rad));
     if (candEnd > candBegin) {
-        midBegin = std::max(candBegin, by);
-        midEnd = std::min(candEnd, rowEnd);
+        // ⚠ 两个候选值都必须先夹进**裁剪后**的行区间 [by, rowEnd]，再取序：
+        // 裁剪切掉形状的中段时（脏矩形从形状腰部往下切，floor(bottom-rad) 落在
+        // clip 上边之上）会出现 midBegin > midEnd 的倒挂 —— 下面的下圆角带就会从
+        // midEnd（= 裁剪区**上方**）开始画 rowEnd-midEnd 行，把圆角带的覆盖率写到
+        // 裁剪矩形上面去。表现是"局部重绘时脏矩形边界外多出一条 12px 高的半透明带"，
+        // make partial 在 buttonshow 上量到的 1786 个 clip 外差异像素就是它。
+        midBegin = std::min(std::max(candBegin, by), rowEnd);
+        midEnd = std::min(std::max(candEnd, by), rowEnd);
+        if (midEnd < midBegin) midEnd = midBegin;   // 中段整段在裁剪区外：两支都空
     }
 
     if (midBegin > by)

@@ -3,6 +3,30 @@
 本文件记录 bin2d 的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.22.6] - 2026-11-20
+
+**修 CPU 覆盖光栅的两个真 bug**，都是"局部重绘时像素落到自己裁剪之外"这一类，由 binUI 的
+`make partial`（脏矩形重绘对拍）照出来的 —— 该门禁以前走 GL 后端，删掉三份老后端之后才
+照到 CPU 光栅这一侧。
+
+- **`FillRoundedSolidDirect` 的行区间倒挂**（`src/raster.cpp`）：形状的"腰"被裁剪矩形从
+  腰部往下切时，`candEnd = floor(bottom - radius)` 会小于 `by`，于是
+  `midEnd = min(candEnd, rowEnd) < midBegin`，`if (midEnd < rowEnd)` 仍然成立 ⇒ 下圆角带
+  从 `y0 = midEnd` 开始画了 42 行，跑出裁剪区 12 行。指纹是"x 被裁到裁剪矩形、y 没裁"
+  （`RasterEdges` 的 baseX/bw 来自 `ClipPixels`，而 y0/count 用的是倒挂后的值）。
+  修法：`midBegin/midEnd` 先夹进 `[by, rowEnd]` 再取序，倒挂时取空区间。
+- **`CompositeRowFused` 漏掉每个 run 的首像素**（`src/raster.cpp`）：裁剪左边界那一列的
+  子扫描线覆盖率全记在 `acc` 上（`run` 还是 0），`c >= 1` 分支却直接 `emitRun(i, j, run)`，
+  `run <= 0` 就 return ⇒ 该列整列偏亮（实测 220,223,226 → 235,236,237）。
+  修法：`c >= 1` 时先用本列覆盖率落一次像素，再从 `i+1` 起用前缀和。
+- **`Canvas::compositeSurface` 没有按当前裁剪落像素**（`src/canvas.cpp`）：
+  `rt.clip = target_->bounds()`，而合成也是一次真实绘制 —— 外阴影按偏移贴回时会溢出。
+  改成与 `state().clipRect` 求交（GPU 那条出口本来就是 scissor 裁的，两条语义对齐）。
+
+效果：binUI 的 `make partial` 从"四点全红（1825 / 23 / 905 / 1373 像素，其中绝大多数在
+脏矩形之外）"变成**四点全 0、0 容差**。两个像素门禁不变：`pixels-bin2d` 仍全绿 0 容差
+（基线本来就是这支代码生成的，所以基线值不动），`pixels-bin2d-gpu` 18 页数字逐页相同。
+
 ## [0.22.5] - 2026-11-20
 
 **GPU 执行体长出"设备上的离屏层"**（`pushContentLayer` / `popContentLayer` /
