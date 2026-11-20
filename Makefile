@@ -62,12 +62,55 @@ TESTS := $(TEST_DIR)/test_geometry$(EXT) $(TEST_DIR)/test_raster$(EXT) \
 DEMO  := $(OUT_DIR)/bin2d-demo$(EXT)
 BENCH := $(OUT_DIR)/bin2d-bench$(EXT)
 
-.PHONY: all lib test demo bench bench-gpu quality layers clean gpu-syntax
+# ============================================
+# 文字模块（可选静态库 libbin2d_text.a）
+#
+# 为什么是独立的库：核心库定位"纯 CPU、零第三方依赖"，而字形光栅与整形必须
+# FreeType + HarfBuzz。所以核心库的构建路径**不出现**这两个库；只有这个目标
+# 才用它们。两个静态库不存在时 `make all` 照常成功（核心 + 现有测试），
+# 文字模块整体跳过 —— 这也正是"只想画图形的人不被强制装字体库"的落地方式。
+#
+# bin2d 自己不带第三方源码树（体积大、不入库），默认指向隔壁 binUI 的
+# third_party；换路径用 `make TEXT_DEPS=<dir>`。
+# ============================================
+TEXT_DEPS   ?= ../binUI/third_party
+FT_INC      := $(TEXT_DEPS)/freetype/include
+FT_LIB      := $(TEXT_DEPS)/freetype/build/libfreetype.a
+HB_INC      := $(TEXT_DEPS)/harfbuzz/src
+HB_LIB      := $(TEXT_DEPS)/harfbuzz/build-static/src/libharfbuzz.a
+TEXT_SRC    := $(SRC_DIR)/text/text_unicode.cpp $(SRC_DIR)/text/font_face.cpp \
+               $(SRC_DIR)/text/font_raster.cpp $(SRC_DIR)/text/font_shaping.cpp \
+               $(SRC_DIR)/text/glyph_atlas.cpp
+TEXT_OBJS   := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(TEXT_SRC))
+LIB_TEXT_A  := $(BUILD_DIR)/libbin2d_text.a
+TEXT_CFLAGS := -I$(FT_INC) -I$(HB_INC)
+TEXT_LIBS   := $(FT_LIB) $(HB_LIB)
 
-all: $(LIB_A) $(TESTS) $(DEMO) $(BENCH) $(QUALITY)
+# 头 + 静态库都在才算"有依赖"；缺任何一样就整体跳过（不是失败）
+TEXT_DEPS_OK := $(and $(wildcard $(FT_LIB)),$(wildcard $(HB_LIB)),\
+                     $(wildcard $(FT_INC)/ft2build.h),$(wildcard $(HB_INC)/hb.h))
+
+ifeq ($(TEXT_DEPS_OK),)
+TEXT_EXTRA :=
+TEXT_TEST  :=
+TEXT_NOTE  := "[bin2d] libbin2d_text 跳过：没找到 FreeType/HarfBuzz（$(FT_LIB) / $(HB_LIB)）；核心库与测试照常"
+else
+TEXT_EXTRA := $(LIB_TEXT_A)
+TEXT_TEST  := $(TEST_DIR)/test_text$(EXT)
+TEXT_NOTE  := "[bin2d] libbin2d_text 就绪（FreeType + HarfBuzz 只进这个模块）"
+endif
+
+.PHONY: all lib test demo bench bench-gpu quality layers clean gpu-syntax text-lib
+
+all: $(LIB_A) $(TEXT_EXTRA) $(TESTS) $(TEXT_TEST) $(DEMO) $(BENCH) $(QUALITY)
 	@echo "[bin2d] all: 库 + 测试 + 演示 就绪"
+	@echo $(TEXT_NOTE)
 
 lib: $(LIB_A)
+
+# 只编文字模块（验收与"只装字形的人"的入口）
+text-lib: $(TEXT_EXTRA)
+	@echo $(TEXT_NOTE)
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(dir $@)
@@ -76,6 +119,16 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 $(LIB_A): $(LIB_OBJS) $(GPU_OBJS)
 	@mkdir -p $(dir $@)
 	ar rcs $@ $^
+
+# 文字模块：多两个 include 路径（FreeType / HarfBuzz），**只有这里加**
+$(OBJ_DIR)/text/%.o: $(SRC_DIR)/text/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INC) $(TEXT_CFLAGS) -c $< -o $@
+
+$(LIB_TEXT_A): $(TEXT_OBJS)
+	@mkdir -p $(dir $@)
+	ar rcs $@ $^
+
 
 # GPU 胶水层：绑定 ../binGPU/include/bingpu.h（C 头）
 $(OBJ_DIR)/display_list.o: $(SRC_DIR)/display_list.cpp
@@ -122,14 +175,21 @@ $(TEST_DIR)/test_content_layer$(EXT): tests/test_content_layer.cpp $(LIB_A) $(GP
 	$(CXX) $(CXXFLAGS) $(INC) -I../binGPU/include $< $(LIB_A) $(BINGPU_LIB) \
 	    $(RTLINK) $(LDFLAGS) -o $@
 
-test: $(TESTS)
+test: $(TESTS) $(TEXT_TEST)
 	@fail=0; \
-	for t in $(TESTS); do \
+	for t in $(TESTS) $(TEXT_TEST); do \
 	    echo "== $$t =="; \
 	    ./$$t || fail=1; \
 	done; \
 	if [ $$fail -ne 0 ]; then echo "[bin2d] 测试失败"; exit 1; fi; \
 	echo "[bin2d] 全部测试通过"
+
+# 文字模块的用例（只有依赖在时才存在）：彩色字形 / 豆腐块 / 逐字形回退 /
+# 多层 text-shadow 四条边界，加图集的两条出口（CPU Image、设备纹理句柄不提）。
+$(TEST_DIR)/test_text$(EXT): tests/test_text.cpp $(LIB_TEXT_A) $(LIB_A)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INC) $(TEXT_CFLAGS) $< $(LIB_TEXT_A) $(LIB_A) $(BINGPU_LIB) \
+	    $(TEXT_LIBS) $(RTLINK) $(LDFLAGS) -o $@
 
 # ---- 演示 ----
 $(DEMO): tools/bin2d_demo.cpp $(LIB_A)
@@ -193,6 +253,8 @@ quality: $(QUALITY)
 #   · 不许出现 Node / layout / dom 这些"另一层的事"（-w 只抓独立单词，
 #     所以 vertex_layout 这种对方 C 结构体字段名不会被误伤）；
 #   · gpu.* 是 binGPU 的胶水层，字段名由对方头文件决定，单独豁免。
+#   · **文字模块只能是"被注入"的方向**（2026-11-21 新增）：face 与平台回调由
+#     上层注入，模块里出现 binui 任何拼写就算红 —— 字形不出反方向的依赖。
 layers:
 	@echo "[bin2d] 层边界检查"
 	@bad=0; \
@@ -203,6 +265,8 @@ layers:
 	hits=$$(grep -rnw -e Node -e layout -e dom -e DOM $(INC_DIR)/bin2d $(SRC_DIR) \
 	        --exclude='gpu.*' || true); \
 	if [ -n "$$hits" ]; then echo "!! 出现上层词汇（Node/layout/dom）："; echo "$$hits"; bad=1; fi; \
+	hits=$$(grep -rniE "binui" $(INC_DIR)/bin2d/text.h $(SRC_DIR)/text || true); \
+	if [ -n "$$hits" ]; then echo "!! 文字模块反向依赖上层（binui）："; echo "$$hits"; bad=1; fi; \
 	if [ $$bad -ne 0 ]; then exit 1; fi; \
 	echo "[bin2d] 层边界 OK"
 
@@ -213,5 +277,7 @@ clean:
 # gpu_exec / canvas_gpu）不在 LIB_OBJS 里，以前只补了 gpu.d，于是 display_list.o /
 # gpu_exec.o / canvas_gpu.o 改了头也不重建 —— 头里一改结构（比如 Surface 多一个字段），
 # 库里的旧目标文件还按老布局读，症状是"测试莫名其妙失败、而且 make 说已经是最新的"。
--include $(LIB_OBJS:.o=.d) $(GPU_OBJS:.o=.d)
+# 文字模块同理：它的 .o 也不在 LIB_OBJS 里。
+-include $(LIB_OBJS:.o=.d) $(GPU_OBJS:.o=.d) $(TEXT_OBJS:.o=.d)
+
 

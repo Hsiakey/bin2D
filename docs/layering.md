@@ -93,7 +93,7 @@ binUI 现在自带一份"半成品 bin2d"：路径几何在 `include/binui_path.
 | `include/binui_path.h`（扫描线填充 + AA + 掩码） | 1112 | **删**（填充/描边换成 bin2d `Path + raster`；只留"把节点转成路径"的那层壳） |
 | `binui_paint.h`（变换与绘制工具） | — | 与 `bin2d/transform.h`、`bin2d/path.h` **收敛成一份**；收敛前两边各一份是明确的临时状态 |
 | `binui_draw_nodes.h`（节点 → 原语） | 1788 | **留**（它不是几何，是"节点语义") |
-| `binui_glyph_atlas.h`（字形图集） | 1169 | **待迁**（归 bin2d 文字模块，见 binUI `docs/issues/12` §5 步 3；bin2d 0.22.3 的外部纹理通道已经接上，剩下的只是"从字符串到字形"那一层） |
+| `binui_glyph_atlas.h`（字形图集） | 1169 | **已迁（bin2d 0.22.7）**：实现搬到 `src/text/`，随可选静态库 `libbin2d_text` 发布；binUI 只剩 CSS 语义 + 平台字体发现（见 binUI `docs/issues/12` §5 步 3/4） |
 | `binui_gl.*` / `binui_vk.*` / `binui_d3d11.*` 的离屏图层实现 | 三份 | 图层语义统一到 `Canvas::pushLayer/popLayer` 之后，三份可退休（后端只负责"把 Surface 或四边形刷到屏幕"） |
 
 **每步的删除条件**（沿用 binGPU §5 的"替换不并存"）：

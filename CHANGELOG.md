@@ -3,6 +3,45 @@
 本文件记录 bin2d 的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.22.7] - 2026-11-21
+
+**新增可选模块 `libbin2d_text`：字形光栅化、整形（shaping）、图集缓存搬进 bin2d。**
+这是 binUI `docs/issues/12-font-layer-ownership.md` 的步 3/4 落地，也是"bin2d 能画字"这件事
+第一次成立 —— 以前的 bin2d 只肯画上层递过来的位图。
+
+**边界（判据：这段代码认不认 CSS / 节点 / 布局？）**
+
+| 进 bin2d 文字模块 | 留 binUI |
+|---|---|
+| face 加载与生命周期（含回退链、豆腐块） | CSS 排版语义：`line-height` / 换行与避头点 / `text-align` / `overflow` / 省略号 / bidi |
+| 字形光栅化（light hinting、gamma 1.3、¼ 像素相位、COLR/CPAL） | 居中、阴影层的 CSS 参数翻译 |
+| 图集打包与缓存（含 `text-shadow` 的多层模糊图集） | 平台字体发现（`EnumFontFamiliesEx` 等，以 `FaceResolver` 注入） |
+| shaping（HarfBuzz + 簇切分 + 逐字形 cmap 回退） | 节点树遍历与"文字在哪个盒子里" |
+
+一句话：**「字符串 + face + 字号 → 一批字形位图、advance、图集纹理」归 bin2d；
+「这段字在哪个盒子里、行高多少、怎么折、对齐到哪」归 binUI。**
+
+**形态**：`libbin2d_text` 是**可选静态库** —— `libbin2d` 核心保持"纯 CPU、零第三方依赖"；
+没有 FreeType / HarfBuzz 的机器上 `make all` 照常成功（打印"跳过文字模块"），核心与测试不受影响。
+**没有独立开关宏**：搬完就删旧实现（`binui_glyph_atlas.h` 1172 行、`binui_font_renderer.cpp`
+632 行在 binUI 侧删除）。
+
+**接口（`include/bin2d/text.h`）**：`text::Library`（`init` / `setResolver` / `setFallbackChain` /
+`faceIndexFor` / `metrics` / `renderGlyph` / `renderColorCluster` / `shape`）与 `text::Atlas`
+（`setCanvas` / `textWidth` / `metrics` / `measureCluster` / `drawText` / `setTextShadows` / `clear`）。
+纹理句柄直接用 `Canvas::createTexture` 的 `uint64` —— 0.22.3 开的外部纹理通道，不用新增管道。
+CPU / GPU 两个出口由图集按 `Canvas::gpuAttached()` 自己认。
+
+**像素逐字节不变**（这一版只搬位置，不动 hinting / gamma / 亚像素定位 / 阴影核）：
+binUI 的 `pixels-bin2d`（CPU 权威，容差 0）18/18 逐字节相同；`pixels-bin2d-gpu`（对
+`docs/pixels`）18 页数字逐页相同（`text-shadow` 566 px / 0.221% / max 13、
+`text-shadow-multi` 3841 px / 1.277% / max 19 仍在 known 名单）；`make partial` 四点
+`diff=0 max=0`。新增 `tests/test_text.cpp`（32 项：彩色字形、豆腐块、逐字形回退、
+多层 text-shadow、换 Canvas 后墨量不变、emoji 链）。
+
+环境变量 `BINUI_FONT_HINT` / `BINUI_TEXT_PHASE_OFF` 随之改名为 `BIN2D_TEXT_HINT` /
+`BIN2D_TEXT_PHASE_OFF`（模块里不许出现 `BINUI_`，`make layers` 判红）；默认行为不变。
+
 ## [0.22.6] - 2026-11-20
 
 **修 CPU 覆盖光栅的两个真 bug**，都是"局部重绘时像素落到自己裁剪之外"这一类，由 binUI 的
