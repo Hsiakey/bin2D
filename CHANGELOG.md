@@ -3,6 +3,14 @@
 本文件记录 bin2d 的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.22.1] - 2026-11-20
+
+**修 `make all` 的链接**：`libbin2d.a` 里现在有 GPU 执行体（`canvas_gpu.o` → `gpu_exec.o`），
+所以凡是链这个库的可执行文件都得带上 `$(BINGPU_LIB)` —— 0.22.0 只给测试加了，演示和
+基准（`bin2d-demo` / `bin2d-bench`）漏了，`make all` 会挂在 `undefined reference to
+bingpu_last_error`。现在统一加到那几条通用链接行上；没构建 binGPU 时 `BINGPU_LIB`
+为空、GPU 对象也不进库，链接行自然退化成纯 CPU。
+
 ## [0.22.0] - 2026-11-20
 
 **`Canvas` 有了第二个执行体：GPU（`GpuExec`）。同一套 Canvas API、同一套变换/裁剪/图层

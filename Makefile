@@ -127,7 +127,7 @@ test: $(TESTS)
 # ---- 演示 ----
 $(DEMO): tools/bin2d_demo.cpp $(LIB_A)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $(INC) $< $(LIB_A) $(RTLINK) $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(INC) $< $(LIB_A) $(BINGPU_LIB) $(RTLINK) $(LDFLAGS) -o $@
 
 demo: $(DEMO)
 	@mkdir -p $(OUT_DIR)
@@ -137,7 +137,7 @@ demo: $(DEMO)
 # ---- 吞吐基准 ----
 $(BENCH): tools/bin2d_bench.cpp $(LIB_A)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $(INC) $< $(LIB_A) $(RTLINK) $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) $(INC) $< $(LIB_A) $(BINGPU_LIB) $(RTLINK) $(LDFLAGS) -o $@
 
 bench: $(BENCH)
 	@echo "[bin2d] 512x512 目标，六项单线程吞吐（取最好一次）"
