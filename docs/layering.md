@@ -75,7 +75,7 @@ bin3d 没这个待遇（浮点光栅顺序不同，见它的 `roadmap.md` ②）
 | 故意不收 | 归谁 | 为什么 |
 |---|---|---|
 | 布局 / flex / 节点树遍历 | binUI | 与"画"正交；binUI 的 `binui_draw_nodes.h`（1860 行）就是这条线的实现 |
-| 文本排版 / 字形图集 | binUI | 字形是几千个小位图，走 UI 的图集与 hinting；bin2d 只画它给的位图 |
+| 字形（光栅化 / 整形 / 图集缓存）| **bin2d 文字模块**（可选 `libbin2d_text`）| 与路径展平、覆盖率光栅同一性质：纯绘制语义，不认 CSS/节点/布局。2026-11-21 统一口径（原写"归 binUI"，与 binUI `docs/backend_layering.md:48` 相反；提案见 binUI `docs/issues/12`）|
 | 窗口 / 事件 / IME / 拖拽 | binUI 外壳 | bin2d 不碰 Win32 |
 | 设备 / 交换链 / present | binGPU | 见 binGPU `layering.md` §3 |
 | 3D | bin3d | 横向库，不是 bin2d 的子集 |
@@ -93,7 +93,7 @@ binUI 现在自带一份"半成品 bin2d"：路径几何在 `include/binui_path.
 | `include/binui_path.h`（扫描线填充 + AA + 掩码） | 1112 | **删**（填充/描边换成 bin2d `Path + raster`；只留"把节点转成路径"的那层壳） |
 | `binui_paint.h`（变换与绘制工具） | — | 与 `bin2d/transform.h`、`bin2d/path.h` **收敛成一份**；收敛前两边各一份是明确的临时状态 |
 | `binui_draw_nodes.h`（节点 → 原语） | 1788 | **留**（它不是几何，是"节点语义") |
-| `binui_glyph_atlas.h`（字形图集） | 1169 | **留**（bin2d 只接收位图） |
+| `binui_glyph_atlas.h`（字形图集） | 1169 | **待迁**（归 bin2d 文字模块，见 binUI `docs/issues/12` §5 步 3；bin2d 0.22.3 的外部纹理通道已经接上，剩下的只是"从字符串到字形"那一层） |
 | `binui_gl.*` / `binui_vk.*` / `binui_d3d11.*` 的离屏图层实现 | 三份 | 图层语义统一到 `Canvas::pushLayer/popLayer` 之后，三份可退休（后端只负责"把 Surface 或四边形刷到屏幕"） |
 
 **每步的删除条件**（沿用 binGPU §5 的"替换不并存"）：
@@ -193,7 +193,7 @@ bin2d 想少写代码，而是**圆角的 AA 数学不该跑在 CPU 上**：0.16
 
 | 不做 | 理由 |
 |---|---|
-| 文本排版 / 字形光栅 | 归 UI 库；见 §3 |
+| CSS 排版语义（`line-height` / `white-space` / 对齐 / 装饰 / 省略号 / bidi）| 归 UI 库；见 §3。**字形光栅化与整形反而归 bin2d 文字模块**（2026-11-21 统一，见 §3 第一张表）|
 | 布局 / 事件 / 窗口 | 同上 |
 | 3D | 归 bin3d |
 | RHI（着色器 / 任意管线状态） | 那是 binGPU 明确不做的东西，bin2d 更不该有 |
