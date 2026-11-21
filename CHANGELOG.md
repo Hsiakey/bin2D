@@ -3,7 +3,7 @@
 本文件记录 bin2d 的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布] - 2026-11-21
+## [0.22.10] - 2026-11-21
 
 **测试通道：`GpuExec` 的后端与 MSAA 档位可以用环境变量覆盖**（不改默认行为）。
 
