@@ -214,6 +214,27 @@ bool GpuExec::create(void* window, int width, int height, BgpuBackendKind backen
         plan.backend = backend;   // 计划拿不到就退回"让设备自己解析"
         plan.msaa_samples = 1;
     }
+    /* 测试通道（0.31.x）：让 `make pixels-bin2d-gpu` 能指定"哪个后端、哪个质量档"，
+     * 否则这条链永远只跑 plan 选中的那一组（AUTO → VULKAN 4×），GL 的档位从来没被
+     * 像素门禁看过。两个变量都读不到时**完全走 plan**，AUTO 语义一个字节没变：
+     *   BIN2D_BGPU_BACKEND = gl | vulkan | d3d11 | cpu   （覆盖 AUTO 解析出来的后端）
+     *   BIN2D_BGPU_MSAA    = 1 | 4                       （覆盖 plan 给的质量档） */
+    BgpuBackendKind envBackend = BGPU_BACKEND_AUTO;
+    if (const char* e = std::getenv("BIN2D_BGPU_BACKEND")) {
+        if (!std::strcmp(e, "gl")) envBackend = BGPU_BACKEND_GL;
+        else if (!std::strcmp(e, "vulkan")) envBackend = BGPU_BACKEND_VULKAN;
+        else if (!std::strcmp(e, "d3d11")) envBackend = BGPU_BACKEND_D3D11;
+        else if (!std::strcmp(e, "cpu")) envBackend = BGPU_BACKEND_CPU;
+    }
+    if (envBackend != BGPU_BACKEND_AUTO) {
+        plan.backend = envBackend;
+        plan.msaa_samples = (envBackend == BGPU_BACKEND_VULKAN) ? 4u : 1u;
+    }
+    if (const char* e = std::getenv("BIN2D_BGPU_MSAA")) {
+        const int n = std::atoi(e);
+        if (n == 1 || n == 4 || n == 8) plan.msaa_samples = static_cast<uint32_t>(n);
+    }
+
     const BgpuBackendKind planBackend =
         (backend == BGPU_BACKEND_AUTO) ? plan.backend : backend;
 

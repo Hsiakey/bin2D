@@ -3,6 +3,24 @@
 本文件记录 bin2d 的版本变化。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布] - 2026-11-21
+
+**测试通道：`GpuExec` 的后端与 MSAA 档位可以用环境变量覆盖**（不改默认行为）。
+
+背景：`pixels-bin2d-gpu` 这条门禁走 `BingUIGpu`→`GpuExec`，后端一直是 `BGPU_BACKEND_AUTO`
+（实际解析成 VULKAN 4×），于是 GL 的档位从来没被像素门禁看过 —— binGPU 的欠账 12
+（GL 4× 在"离屏纹理被采样"这条路上丢内容）就是这么漏过去的。
+
+`GpuExec::create` 里加两个**只在读得到时才生效**的开关：
+
+- `BIN2D_BGPU_BACKEND = gl | vulkan | d3d11 | cpu` —— 覆盖 AUTO 解析出来的后端
+  （顺带把 plan 的档位按后端给一遍：VULKAN 4×，其余 1×）；
+- `BIN2D_BGPU_MSAA = 1 | 4 | 8` —— 覆盖 plan 给的质量档。
+
+两个都读不到时**完全走 plan**，AUTO 语义一个字节没变。用法（GL 4× 复现）：
+
+    BINUI2D_GPU=1 BIN2D_BGPU_BACKEND=gl BIN2D_BGPU_MSAA=4 bin2d_shot <page>.html out.png
+
 ## [0.22.9] - 2026-11-21
 
 **字形图集页从 1024² 降到 512²**：每页 4 MB → 1 MB。字形像素与 UV **逐位不变**
